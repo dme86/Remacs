@@ -41,9 +41,9 @@ shows incomplete sequences.
 | --- | --- |
 | Insert mode | **`i`**, **`a`**, **`I`**, **`A`**, **`o`**, **`O`** |
 | Normal mode | **`Esc`** |
-| Move | **`h` / `j` / `k` / `l`**, arrows, **`w` / `b`** |
+| Move | **`h` / `j` / `k` / `l`**, arrows, **`w` / `b`**, optional count (e.g. **`5j`**, **`12k`**) |
 | Beginning / end of line | **`0` / `$`** |
-| First / last line | **`gg` / `G`** |
+| First / last line | **`gg` / `G`**, absolute jump via **`42G`** or **`42gg`** |
 | Delete character / line | **`x` / `dd`** |
 | Yank line / paste | **`yy` / `p`** |
 | Undo / redo | **`u` / `Ctrl+R`** |
@@ -71,6 +71,18 @@ From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
 Opening another file requires saving or discarding your current unsaved changes
 first. Start an empty document with `remacs` and save it via `SPC f s`.
 
+## Line numbers and cursor line
+
+**Enabled by default:** a narrow left gutter displays *hybrid relative line numbers*:
+the active line shows its absolute line number, while other lines show their
+distance from it. For example, a row labeled `7` below the cursor can be
+reached with `7j`, or use `7k` for a row seven lines above. Enter
+`245G` or `245gg` to jump to absolute line 245.
+
+The current line has a subtle full-width background tint, including empty
+space to the right of the text. Both features are integrated with the
+incremental renderer so moving between lines does not clear the screen.
+
 ## Syntax highlighting
 
 **Enabled by default**, with no plugin installation or configuration. Remacs uses
@@ -96,7 +108,8 @@ The embedded grammars have their own third-party licenses; see
 
 **Included in v0.1:** opening, editing, and saving text; Vim-style Normal/Insert
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
-Doom-inspired leader shortcuts, built-in syntax highlighting, status line, and minibuffer.
+Doom-inspired leader shortcuts, hybrid relative line numbers, current-line highlighting,
+built-in syntax highlighting, status line, and minibuffer.
 
 **Not yet included:** Lua, LSP, tree view, search,
 multiple buffers, tabs, splits, mouse support, or menus. This release is not

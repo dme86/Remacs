@@ -17,10 +17,15 @@ use crossterm::{
 };
 use document::Document;
 use syntax::{Span, SyntaxEngine};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TAB_WIDTH: usize = 4;
 const MAX_UNDO: usize = 100;
+// Subtle current-line tint. The normal terminal background is unchanged.
+const CURRENT_LINE_BG: Color = Color::Rgb { r: 49, g: 50, b: 57 };
+const GUTTER_BG: Color = Color::Rgb { r: 35, g: 36, b: 42 };
+const GUTTER_FG: Color = Color::Rgb { r: 116, g: 119, b: 132 };
+const CURRENT_NUMBER_FG: Color = Color::Rgb { r: 223, g: 211, b: 255 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -90,6 +95,8 @@ struct ScreenCache {
 struct PaintedLine {
     index: usize,
     content: Option<Vec<char>>,
+    gutter: String,
+    active: bool,
 }
 
 struct Editor {
@@ -101,6 +108,7 @@ struct Editor {
     mode: Mode,
     sequence: Sequence,
     control_x: bool,
+    count: Option<usize>,
     prompt: Option<Prompt>,
     message: String,
     register: Option<Register>,
@@ -122,6 +130,7 @@ impl Editor {
             mode: Mode::Normal,
             sequence: Sequence::None,
             control_x: false,
+            count: None,
             prompt: None,
             message: "NORMAL | i Insert | Space f f Open | Space f s Save | Space q q Quit".into(),
             register: None,
@@ -200,6 +209,7 @@ impl Editor {
                 self.syntax = SyntaxEngine::new(&self.doc);
                 self.scroll_row = 0;
                 self.scroll_col = 0;
+                self.count = None;
                 self.mode = Mode::Normal;
                 self.undo.clear();
                 self.redo.clear();
@@ -326,6 +336,7 @@ impl Editor {
             }
             self.sequence = Sequence::None;
             self.control_x = false;
+            self.count = None;
             return;
         }
         if self.control_x {
@@ -343,7 +354,7 @@ impl Editor {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('x') => self.control_x = true,
-                KeyCode::Char('g') => { self.sequence = Sequence::None; self.message = "Cancelled".into(); }
+                KeyCode::Char('g') => { self.sequence = Sequence::None; self.count = None; self.message = "Cancelled".into(); }
                 KeyCode::Char('r') if self.mode == Mode::Normal => self.redo(),
                 KeyCode::Char('v') if self.mode == Mode::Normal => self.page_down(page_height),
                 _ => {},
@@ -383,6 +394,7 @@ impl Editor {
     fn normal_key(&mut self, key: KeyEvent, page_height: usize) {
         if self.sequence != Sequence::None {
             let sequence = std::mem::take(&mut self.sequence);
+            let count = self.count.take();
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
@@ -397,11 +409,28 @@ impl Editor {
                     self.register = Some(Register::Line(self.doc.line().to_vec()));
                     self.message = "Line yanked".into();
                 }
-                (Sequence::Go, KeyCode::Char('g')) => { self.doc.row = 0; self.doc.home(); }
+                (Sequence::Go, KeyCode::Char('g')) => {
+                    self.doc.row = count.unwrap_or(1).saturating_sub(1).min(self.doc.lines.len() - 1);
+                    self.doc.home();
+                }
                 _ => self.message = "Unknown key sequence".into(),
             }
             return;
         }
+        // Vim-style numeric prefixes: 5j, 12k, 120G, 42gg.
+        // Zero alone still means beginning of line.
+        if let KeyCode::Char(digit @ '0'..='9') = key.code {
+            if digit != '0' || self.count.is_some() {
+                self.count = Some(
+                    self.count.unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add((digit as u8 - b'0') as usize),
+                );
+                return;
+            }
+        }
+        let explicit_count = self.count.take();
+        let count = explicit_count.unwrap_or(1);
         match key.code {
             KeyCode::Char(' ') => self.sequence = Sequence::Leader,
             KeyCode::Char('i') => self.begin_insert(),
@@ -424,23 +453,39 @@ impl Editor {
                 self.insert_changed = true;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.doc.col = self.doc.col.saturating_sub(1);
+                self.doc.col = self.doc.col.saturating_sub(count);
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                if self.doc.col + 1 < self.doc.line().len() { self.doc.col += 1; }
+                if !self.doc.line().is_empty() { self.doc.col = self.doc.col.saturating_add(count).min(self.doc.line().len() - 1); }
             }
-            KeyCode::Char('j') | KeyCode::Down => self.doc.down(),
-            KeyCode::Char('k') | KeyCode::Up => self.doc.up(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.doc.row = self.doc.row.saturating_add(count).min(self.doc.lines.len() - 1);
+                self.doc.col = self.doc.col.min(self.doc.line().len());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.doc.row = self.doc.row.saturating_sub(count);
+                self.doc.col = self.doc.col.min(self.doc.line().len());
+            },
             KeyCode::Char('0') | KeyCode::Home => self.doc.home(),
             KeyCode::Char('$') | KeyCode::End => {
                 self.doc.end();
                 self.doc.col = self.doc.col.saturating_sub(1);
             }
-            KeyCode::Char('w') => self.doc.word_forward(),
-            KeyCode::Char('b') => self.doc.word_backward(),
-            KeyCode::Char('g') => self.sequence = Sequence::Go,
+            KeyCode::Char('w') => {
+                for _ in 0..count.min(100_000) { self.doc.word_forward(); }
+            }
+            KeyCode::Char('b') => {
+                for _ in 0..count.min(100_000) { self.doc.word_backward(); }
+            }
+            KeyCode::Char('g') => {
+                self.count = explicit_count;
+                self.sequence = Sequence::Go;
+            },
             KeyCode::Char('G') => {
-                self.doc.row = self.doc.lines.len() - 1;
+                self.doc.row = explicit_count.map_or(
+                    self.doc.lines.len() - 1,
+                    |line| line.saturating_sub(1).min(self.doc.lines.len() - 1),
+                );
                 self.doc.home();
             }
             KeyCode::Char('d') => self.sequence = Sequence::Delete,
@@ -509,7 +554,9 @@ impl Editor {
 
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
-        self.ensure_visible(width, height);
+        let gutter_width = gutter_width(width, self.doc.lines.len());
+        let text_width = width - gutter_width;
+        self.ensure_visible(text_width, height);
 
         let size_changed = self.screen.size != Some((cols, rows));
         let viewport_changed = self.screen.origin != Some((self.scroll_row, self.scroll_col));
@@ -527,31 +574,68 @@ impl Editor {
             let index = y + self.scroll_row;
             let line = self.doc.lines.get(index);
             let content = line.map(Vec::as_slice);
-            let stale = self.screen.lines[y].as_ref().is_none_or(|painted| {
+            let active = index == self.doc.row && line.is_some();
+            let number = gutter_number(index, self.doc.row, self.doc.lines.len(), gutter_width);
+
+            let old = self.screen.lines[y].as_ref();
+            let text_stale = old.is_none_or(|painted| {
                 painted.index != index || painted.content.as_deref() != content
             });
-            let syntax_stale = self.syntax.enabled() && syntax_invalid.is_some_and(|first| index >= first);
+            let highlight_changed = old.is_none_or(|painted| painted.active != active);
+            let gutter_changed = old.is_none_or(|painted| painted.gutter != number);
+            let syntax_stale = self.syntax.enabled()
+                && syntax_invalid.is_some_and(|first| index >= first);
+            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale;
 
-            if !repaint_all && !syntax_stale && !stale {
+            if !paint_text && !gutter_changed {
                 continue;
             }
-            queue!(output, MoveTo(0, y as u16), ResetColor)?;
-            if let Some(line) = line {
-                if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
-                    for (color, text) in render_color_line(line, spans, self.scroll_col, width) {
-                        queue!(output, SetForegroundColor(color), Print(text))?;
+            if gutter_width > 0 && (paint_text || gutter_changed) {
+                queue!(output,
+                    MoveTo(0, y as u16),
+                    SetBackgroundColor(GUTTER_BG),
+                    SetForegroundColor(if active { CURRENT_NUMBER_FG } else { GUTTER_FG }),
+                    Print(&number),
+                    ResetColor
+                )?;
+            }
+            if paint_text {
+                queue!(output, MoveTo(gutter_width as u16, y as u16), ResetColor)?;
+                if active {
+                    queue!(output, SetBackgroundColor(CURRENT_LINE_BG))?;
+                }
+
+                let mut visible_width = 0;
+                if let Some(line) = line {
+                    if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
+                        for (color, text) in render_color_line(line, spans, self.scroll_col, text_width) {
+                            visible_width += UnicodeWidthStr::width(text.as_str());
+                            queue!(output, SetForegroundColor(color), Print(text))?;
+                        }
+                    } else {
+                        let text = render_line(line, self.scroll_col, text_width);
+                        visible_width = UnicodeWidthStr::width(text.as_str());
+                        queue!(output, Print(text))?;
                     }
-                    queue!(output, ResetColor)?;
+                }
+                if active {
+                    // Fill to the right edge without clearing the terminal.
+                    // This also highlights empty lines and trailing whitespace.
+                    queue!(output,
+                        SetForegroundColor(Color::Reset),
+                        Print(" ".repeat(text_width.saturating_sub(visible_width))),
+                        ResetColor
+                    )?;
                 } else {
-                    queue!(output, Print(render_line(line, self.scroll_col, width)))?;
+                    // Remove any tail left by a previously longer line.
+                    queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
                 }
             }
-            // Remove any characters remaining from a previously longer row
-            // *after* overwriting the new text; never blank the whole frame.
-            queue!(output, Clear(ClearType::UntilNewLine))?;
             self.screen.lines[y] = Some(PaintedLine {
                 index,
                 content: line.cloned(),
+                gutter: number,
+                active,
             });
         }
 
@@ -587,7 +671,7 @@ impl Editor {
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
                     Sequence::Go => "g → g First line".into(),
-                    Sequence::None => self.message.clone(),
+                    Sequence::None => self.count.map_or_else(|| self.message.clone(), |n| n.to_string()),
                 },
             };
             let message = fit_cells(&message, width);
@@ -602,7 +686,7 @@ impl Editor {
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None => (
-                visual_column(&self.doc.line()[..self.doc.col]).saturating_sub(self.scroll_col),
+                gutter_width + visual_column(&self.doc.line()[..self.doc.col]).saturating_sub(self.scroll_col),
                 self.doc.row.saturating_sub(self.scroll_row) as u16,
             ),
         };
@@ -614,6 +698,23 @@ impl Editor {
         self.screen.syntax_enabled = Some(self.syntax.enabled());
         output.flush()
     }
+}
+
+
+fn gutter_width(columns: usize, total_lines: usize) -> usize {
+    // Never sacrifice the entire text area when the terminal is narrow.
+    if columns < 5 { 0 } else { (total_lines.to_string().len().max(2) + 2).min(columns - 1) }
+}
+
+fn gutter_number(index: usize, cursor: usize, total_lines: usize, width: usize) -> String {
+    if width == 0 { return String::new(); }
+    if index >= total_lines { return " ".repeat(width); }
+    let number = if index == cursor { index + 1 } else { index.abs_diff(cursor) };
+    let digits = number.to_string();
+    let available = width.saturating_sub(2);
+    // On exceptionally narrow screens, keep the gutter inside the viewport.
+    let display = &digits[digits.len().saturating_sub(available)..];
+    format!("{display:>available$}  ")
 }
 
 fn char_width(c: char, column: usize) -> usize {
@@ -776,18 +877,18 @@ mod tests {
         let mut editor = Editor::new(Document::from_text("Unique first line\nUnique second line\nUnique third line"));
         let first = paint(&mut editor);
         assert!(first.contains("Unique first line"));
-        // Cursor-only update should contain a changed status, but no body redraw
-        // and no destructive clear sequence.
+        // Only old and new active rows repaint. Other text stays untouched.
         press(&mut editor, KeyCode::Char('j'));
         let next = paint(&mut editor);
-        assert!(!next.contains("Unique first line"));
-        assert!(!next.contains("Unique second line"));
+        assert!(next.contains("Unique first line"));
+        assert!(next.contains("Unique second line"));
+        assert!(!next.contains("Unique third line"));
         assert!(!next.contains("\x1b[2J"));
         assert!(!next.contains("\x1b[0J"));
         assert!(next.contains("Ln 2"));
         press(&mut editor, KeyCode::Char('k'));
         let previous = paint(&mut editor);
-        assert!(!previous.contains("Unique first line"));
+        assert!(!previous.contains("Unique third line"));
         assert!(previous.contains("Ln 1"));
     }
 
@@ -837,6 +938,71 @@ mod tests {
         let repainted = paint(&mut editor);
         assert!(repainted.contains("# A heading"));
         assert!(!repainted.contains("\x1b[2J"));
+    }
+
+
+    #[test]
+    fn relative_numbers_keep_absolute_cursor_position() {
+        assert_eq!(gutter_width(80, 12_000), 7);
+        assert_eq!(gutter_number(42, 42, 12_000, 7), "   43  ");
+        assert_eq!(gutter_number(38, 42, 12_000, 7), "    4  ");
+        assert_eq!(gutter_number(52, 42, 12_000, 7), "   10  ");
+        assert_eq!(gutter_number(12_000, 42, 12_000, 7), "       ");
+    }
+
+    #[test]
+    fn relative_numbers_and_highlight_are_visible_by_default() {
+        let mut editor = Editor::new(Document::from_text("alpha\nbeta\ngamma"));
+        let first = paint(&mut editor);
+        assert!(first.contains("\x1b[48;2;49;50;57m"));
+        assert!(first.contains(" 1  "));
+        press(&mut editor, KeyCode::Char('j'));
+        let next = paint(&mut editor);
+        assert!(next.contains("beta"));
+        assert!(next.contains("alpha"));
+        assert!(!next.contains("gamma"));
+        assert!(!next.contains("\x1b[2J"));
+        assert!(next.contains(" 2  "));
+    }
+
+    #[test]
+    fn counted_vertical_jumps_work_on_large_files() {
+        let mut editor = Editor::new(Document::from_text(
+            &(0..500).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n")
+        ));
+        for c in "125j".chars() { press(&mut editor, KeyCode::Char(c)); }
+        assert_eq!(editor.doc.row, 125);
+        for c in "40k".chars() { press(&mut editor, KeyCode::Char(c)); }
+        assert_eq!(editor.doc.row, 85);
+        for c in "420G".chars() { press(&mut editor, KeyCode::Char(c)); }
+        assert_eq!(editor.doc.row, 419);
+        for c in "17gg".chars() { press(&mut editor, KeyCode::Char(c)); }
+        assert_eq!(editor.doc.row, 16);
+        press(&mut editor, KeyCode::Char('G'));
+        assert_eq!(editor.doc.row, 499);
+        for c in "gg".chars() { press(&mut editor, KeyCode::Char(c)); }
+        assert_eq!(editor.doc.row, 0);
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_space_for_text() {
+        assert_eq!(gutter_width(4, 2_000_000), 0);
+        assert!(gutter_width(9, 2_000_000) < 9);
+        let mut editor = Editor::new(Document::from_text("hello\nworld"));
+        let mut output = Vec::new();
+        editor.draw_at(&mut output, 4, 5).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("hell"));
+    }
+
+    #[test]
+    fn horizontal_movement_does_not_repaint_other_rows() {
+        let mut editor = Editor::new(Document::from_text("abcdef\nsecond\nthird"));
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char('l'));
+        let output = paint(&mut editor);
+        assert!(!output.contains("abcdef"));
+        assert!(!output.contains("second"));
+        assert!(!output.contains("\x1b[2J"));
     }
 
     #[test]
