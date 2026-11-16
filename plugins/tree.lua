@@ -1,6 +1,6 @@
--- Remacs' first bundled Lua plugin: a minimal nvim-tree-like explorer.
--- Only filesystem metadata is exposed by the host; opening files is an action
--- returned to Rust. The plugin owns the selection and expansion state.
+-- Remacs file explorer / fuzzy finder (first bundled Lua plugin).
+-- Filesystem listing is provided by the Rust host. Tree and search state are
+-- managed in Lua; no filesystem writes or editor buffer mutations happen here.
 
 local tree = {
   root = ".",
@@ -9,24 +9,45 @@ local tree = {
   selected = 1,
   top = 1,
   show_hidden = false,
+  searching = false,
+  query = "",
+  files = nil,
+  results = {},
+  search_selected = 1,
+  search_top = 1,
+}
+
+local MAX_NODES = 10000
+local MAX_SEARCH_FILES = 20000
+local MAX_SEARCH_DEPTH = 32
+local MAX_RESULTS = 150
+local skipped_directories = {
+  [".git"] = true,
+  [".hg"] = true,
+  [".svn"] = true,
+  ["node_modules"] = true,
+  ["target"] = true,
+  ["dist"] = true,
+  ["build"] = true,
+  [".next"] = true,
+  [".venv"] = true,
+  ["venv"] = true,
 }
 
 local function name_of(path)
   return path:match("([^/]+)/*$") or path
 end
 
-local function refresh()
-  local selected_path = tree.nodes[tree.selected] and tree.nodes[tree.selected].path
+local function refresh_tree()
+  local previous = tree.nodes[tree.selected] and tree.nodes[tree.selected].path
   local nodes = {}
-  local max_depth = 32
-  local max_nodes = 10000
 
   local function walk(directory, depth)
-    if depth > max_depth or #nodes >= max_nodes then return end
+    if depth > MAX_SEARCH_DEPTH or #nodes >= MAX_NODES then return end
     local ok, entries = pcall(remacs.fs.list, directory)
     if not ok then return end
     for _, entry in ipairs(entries) do
-      if #nodes >= max_nodes then return end
+      if #nodes >= MAX_NODES then return end
       if tree.show_hidden or entry.name:sub(1, 1) ~= "." then
         nodes[#nodes + 1] = {
           name = entry.name,
@@ -44,15 +65,117 @@ local function refresh()
   walk(tree.root, 0)
   tree.nodes = nodes
   tree.selected = math.max(1, math.min(tree.selected, #nodes))
-  if selected_path then
+  if previous then
     for i, node in ipairs(nodes) do
-      if node.path == selected_path then
+      if node.path == previous then
         tree.selected = i
         break
       end
     end
   end
   tree.top = math.max(1, math.min(tree.top, math.max(#nodes, 1)))
+end
+
+-- Lazily enumerate project files once when '/' opens the finder.
+-- Scans are bounded and skip huge generated/dependency directories.
+local function scan_files()
+  local files = {}
+  local function walk(directory, prefix, depth)
+    if depth > MAX_SEARCH_DEPTH or #files >= MAX_SEARCH_FILES then return end
+    local ok, entries = pcall(remacs.fs.list, directory)
+    if not ok then return end
+    for _, entry in ipairs(entries) do
+      if #files >= MAX_SEARCH_FILES then return end
+      if tree.show_hidden or entry.name:sub(1, 1) ~= "." then
+        local relative = prefix .. entry.name
+        if entry.is_dir then
+          if not skipped_directories[entry.name] then
+            walk(entry.path, relative .. "/", depth + 1)
+          end
+        else
+          files[#files + 1] = {
+            name = relative,
+            path = entry.path,
+            dir = false,
+            depth = 0,
+          }
+        end
+      end
+    end
+  end
+  walk(tree.root, "", 0)
+  tree.files = files
+end
+
+-- Ordered-subsequence score, with bonuses for contiguous matches, word
+-- boundaries, filename matches and early positions. nil = no match.
+local function fuzzy_score(value, query)
+  local haystack = value:lower()
+  local needle = query:lower()
+  local offset = 1
+  local score = 0
+  local previous = 0
+  for i = 1, #needle do
+    local ch = needle:sub(i, i)
+    local pos = haystack:find(ch, offset, true)
+    if not pos then return nil end
+    score = score + 10
+    if pos == previous + 1 then score = score + 8 end
+    if pos == 1 or haystack:sub(pos - 1, pos - 1):find("[/_%.%- ]") then
+      score = score + 12
+    end
+    if pos <= 4 then score = score + 4 end
+    previous = pos
+    offset = pos + 1
+  end
+  local basename = name_of(haystack)
+  if basename:find(needle, 1, true) then score = score + 24 end
+  return score - math.floor(#value / 12)
+end
+
+local function update_results()
+  if not tree.files then scan_files() end
+  local results = {}
+  for _, node in ipairs(tree.files) do
+    if tree.query == "" then
+      -- Avoid dumping a huge unfiltered project list on opening '/'.
+      -- The visible tree remains available by pressing Escape.
+      break
+    end
+    local score = fuzzy_score(node.name, tree.query)
+    if score then
+      results[#results + 1] = { node = node, score = score }
+    end
+  end
+  table.sort(results, function(a, b)
+    if a.score ~= b.score then return a.score > b.score end
+    return a.node.name:lower() < b.node.name:lower()
+  end)
+  tree.results = {}
+  for i = 1, math.min(#results, MAX_RESULTS) do
+    tree.results[i] = results[i].node
+  end
+  tree.search_selected = 1
+  tree.search_top = 1
+end
+
+local function start_search()
+  tree.searching = true
+  tree.query = ""
+  tree.files = nil
+  tree.results = {}
+  tree.search_selected = 1
+  tree.search_top = 1
+  scan_files()
+end
+
+local function cancel_search()
+  tree.searching = false
+  tree.query = ""
+  tree.results = {}
+  tree.files = nil
+  tree.search_selected = 1
+  tree.search_top = 1
 end
 
 function tree.setup(root)
@@ -62,7 +185,8 @@ function tree.setup(root)
   tree.selected = 1
   tree.top = 1
   tree.show_hidden = false
-  refresh()
+  cancel_search()
+  refresh_tree()
 end
 
 local function selected_node()
@@ -76,13 +200,42 @@ local function toggle_dir(node, expand)
   else
     tree.expanded[node.path] = expand
   end
-  refresh()
+  refresh_tree()
 end
 
 function tree.on_key(key)
-  local node = selected_node()
+  if tree.searching then
+    if key == "esc" then
+      cancel_search()
+    elseif key == "enter" then
+      local node = tree.results[tree.search_selected]
+      if node then
+        cancel_search()
+        return { action = "open", path = node.path }
+      end
+    elseif key == "down" or key == "tab" or key == "ctrl-n" then
+      tree.search_selected = math.min(#tree.results, tree.search_selected + 1)
+      tree.search_selected = math.max(1, tree.search_selected)
+    elseif key == "up" or key == "backtab" or key == "ctrl-p" then
+      tree.search_selected = math.max(1, tree.search_selected - 1)
+    elseif key == "backspace" then
+      local last = utf8.offset(tree.query, -1)
+      if last then tree.query = tree.query:sub(1, last - 1) end
+      update_results()
+    elseif key == "ctrl-u" then
+      tree.query = ""
+      update_results()
+    elseif utf8.len(key) == 1 and #tree.query < 128 then
+      tree.query = tree.query .. key
+      update_results()
+    end
+    return { action = "none" }
+  end
 
-  if key == "j" or key == "down" then
+  local node = selected_node()
+  if key == "/" or key == "f" then
+    start_search()
+  elseif key == "j" or key == "down" then
     tree.selected = math.min(#tree.nodes, tree.selected + 1)
   elseif key == "k" or key == "up" then
     tree.selected = math.max(1, tree.selected - 1)
@@ -118,10 +271,12 @@ function tree.on_key(key)
       end
     end
   elseif key == "r" then
-    refresh()
+    refresh_tree()
+    tree.files = nil
   elseif key == "." or key == "H" then
     tree.show_hidden = not tree.show_hidden
-    refresh()
+    refresh_tree()
+    tree.files = nil
   elseif key == "tab" or key == "esc" then
     return { action = "editor" }
   elseif key == "q" then
@@ -132,39 +287,55 @@ end
 
 function tree.render(height)
   height = math.max(0, height)
-  if tree.selected < tree.top then
-    tree.top = tree.selected
+  local searching = tree.searching
+  local nodes = searching and tree.results or tree.nodes
+  local selected = searching and tree.search_selected or tree.selected
+  local top = searching and tree.search_top or tree.top
+  if selected < top then top = selected end
+  if selected >= top + height and height > 0 then
+    top = selected - height + 1
   end
-  if tree.selected >= tree.top + height and height > 0 then
-    tree.top = tree.selected - height + 1
-  end
+  if searching then tree.search_top = top else tree.top = top end
 
   local rows = {}
   for row = 1, height do
-    local node = tree.nodes[tree.top + row - 1]
+    local node = nodes[top + row - 1]
     if node then
-      local indent = string.rep("  ", math.min(node.depth, 24))
-      local symbol
-      if node.dir then
-        symbol = tree.expanded[node.path] and "▾ " or "▸ "
+      if searching then
+        rows[row] = "  " .. node.name
       else
-        symbol = "  "
+        local indent = string.rep("  ", math.min(node.depth, 24))
+        local symbol
+        if node.dir then
+          symbol = tree.expanded[node.path] and "▾ " or "▸ "
+        else
+          symbol = "  "
+        end
+        rows[row] = indent .. symbol .. node.name .. (node.dir and "/" or "")
       end
-      rows[row] = indent .. symbol .. node.name .. (node.dir and "/" or "")
     else
       rows[row] = ""
     end
   end
 
-  local selected_row = tree.selected - tree.top + 1
-  if not tree.nodes[tree.selected] or selected_row < 1 or selected_row > height then
+  local selected_row = selected - top + 1
+  if not nodes[selected] or selected_row < 1 or selected_row > height then
     selected_row = 0
+  end
+  local title
+  if searching then
+    title = " FIND / " .. tree.query .. " [" .. #tree.results .. "]"
+  else
+    title = " FILES  " .. name_of(tree.root)
   end
   return {
     rows = rows,
     selected = selected_row,
     root_name = name_of(tree.root),
-    count = #tree.nodes,
+    title = title,
+    searching = searching,
+    query = tree.query,
+    count = #nodes,
   }
 end
 

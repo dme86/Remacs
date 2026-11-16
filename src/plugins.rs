@@ -21,6 +21,8 @@ pub struct TreeView {
     pub lines: Vec<String>,
     /// 1-based index in the *visible* rows, or 0 when nothing is selected.
     pub selected: usize,
+    /// Column of the search input in the sidebar header, when searching.
+    pub search_cursor: Option<usize>,
 }
 
 pub struct TreePlugin {
@@ -139,10 +141,19 @@ impl TreePlugin {
         let rows: Table = result.get("rows")?;
         let lines = rows.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?;
         let root: String = result.get("root_name")?;
+        let searching: bool = result.get("searching")?;
+        let search_cursor = if searching {
+            let query: String = result.get("query")?;
+            // " FIND / " is eight terminal cells; leave the final column for the divider.
+            Some(8 + unicode_width::UnicodeWidthStr::width(query.as_str()))
+        } else {
+            None
+        };
         Ok(TreeView {
-            title: format!(" FILES  {root}"),
+            title: result.get::<String>("title").unwrap_or_else(|_| format!(" FILES  {root}")),
             lines,
             selected: result.get("selected")?,
+            search_cursor,
         })
     }
 }
@@ -150,6 +161,81 @@ impl TreePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_finder_finds_collapsed_nested_files_and_opens_match() {
+        let temp = std::env::temp_dir().join(format!(
+            "remacs-fuzzy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(temp.join("src").join("deep")).unwrap();
+        fs::create_dir_all(temp.join("target")).unwrap();
+        fs::write(temp.join("src/deep/render_engine.rs"), "fn draw() {}").unwrap();
+        fs::write(temp.join("src/deep/render_readme.md"), "# hi").unwrap();
+        fs::write(temp.join("README.md"), "hello").unwrap();
+        fs::write(temp.join(".secret.md"), "hidden").unwrap();
+        fs::write(temp.join("target/generated.rs"), "excluded").unwrap();
+
+        let mut tree = TreePlugin::new(&temp).unwrap();
+        tree.toggle().unwrap();
+        tree.on_key("/").unwrap();
+        assert!(tree.view(10).unwrap().title.contains("FIND /"));
+        // Search the whole project, even before expanding the src folder.
+        for c in "renger".chars() {
+            tree.on_key(&c.to_string()).unwrap();
+        }
+        let view = tree.view(10).unwrap();
+        assert!(view.title.contains("renger"));
+        assert_eq!(view.search_cursor, Some(8 + "renger".len()));
+        assert!(view.lines.iter().any(|s| s.contains("render_engine.rs")));
+        assert!(!view.lines.iter().any(|s| s.contains("generated.rs")));
+        match tree.on_key("enter").unwrap() {
+            TreeAction::Open(path) => assert!(path.ends_with("render_engine.rs")),
+            _ => panic!("enter must open the best match"),
+        }
+        assert!(tree.view(10).unwrap().search_cursor.is_none());
+
+        tree.on_key("/").unwrap();
+        for c in "secret".chars() { tree.on_key(&c.to_string()).unwrap(); }
+        assert!(tree.view(10).unwrap().lines.iter().all(|s| !s.contains(".secret.md")));
+        tree.on_key("esc").unwrap();
+        tree.on_key(".").unwrap();
+        tree.on_key("/").unwrap();
+        for c in "secret".chars() { tree.on_key(&c.to_string()).unwrap(); }
+        assert!(tree.view(10).unwrap().lines.iter().any(|s| s.contains(".secret.md")));
+        // Escape cancels finder but keeps the tree focused.
+        tree.on_key("esc").unwrap();
+        assert!(tree.view(10).unwrap().search_cursor.is_none());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn fuzzy_navigation_backspace_and_unicode_input() {
+        let temp = std::env::temp_dir().join(format!(
+            "remacs-fuzzy-unicode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("café.txt"), "text").unwrap();
+        fs::write(temp.join("camel.txt"), "text").unwrap();
+        let tree = TreePlugin::new(&temp).unwrap();
+        tree.on_key("/").unwrap();
+        for c in "ca".chars() { tree.on_key(&c.to_string()).unwrap(); }
+        assert_eq!(tree.view(10).unwrap().selected, 1);
+        tree.on_key("down").unwrap();
+        assert_eq!(tree.view(10).unwrap().selected, 2);
+        tree.on_key("up").unwrap();
+        assert_eq!(tree.view(10).unwrap().selected, 1);
+        tree.on_key("é").unwrap();
+        assert!(tree.view(10).unwrap().title.contains("caé"));
+        tree.on_key("backspace").unwrap();
+        assert!(tree.view(10).unwrap().title.contains("FIND / ca "));
+        tree.on_key("ctrl-u").unwrap();
+        assert!(tree.view(10).unwrap().lines.iter().all(String::is_empty));
+        let _ = fs::remove_dir_all(temp);
+    }
 
     #[test]
     fn lua_tree_navigates_folders_and_returns_file_action() {
