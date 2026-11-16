@@ -77,9 +77,25 @@ enum Register {
     Line(Vec<char>),
 }
 
+#[derive(Default)]
+struct ScreenCache {
+    size: Option<(u16, u16)>,
+    origin: Option<(usize, usize)>,
+    syntax_enabled: Option<bool>,
+    lines: Vec<Option<PaintedLine>>,
+    status: Option<String>,
+    message: Option<String>,
+}
+
+struct PaintedLine {
+    index: usize,
+    content: Option<Vec<char>>,
+}
+
 struct Editor {
     doc: Document,
     syntax: SyntaxEngine,
+    screen: ScreenCache,
     scroll_row: usize,
     scroll_col: usize,
     mode: Mode,
@@ -100,6 +116,7 @@ impl Editor {
         Self {
             doc,
             syntax,
+            screen: ScreenCache::default(),
             scroll_row: 0,
             scroll_col: 0,
             mode: Mode::Normal,
@@ -476,16 +493,50 @@ impl Editor {
     }
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
-        self.syntax.refresh(&mut self.doc);
         let (cols, rows) = terminal::size()?;
+        self.draw_at(output, cols, rows)
+    }
+
+    // Compare the current viewport with the last painted frame. A simple j/k
+    // movement only updates the cursor and status line: no screen clear or
+    // syntax-aware body repaint is sent to the terminal.
+    fn draw_at(&mut self, output: &mut impl Write, cols: u16, rows: u16) -> io::Result<()> {
+        let syntax_invalid = self.syntax.refresh(&mut self.doc);
+        if cols == 0 || rows == 0 {
+            self.screen = ScreenCache::default();
+            return Ok(());
+        }
+
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
         self.ensure_visible(width, height);
-        queue!(output, Hide, ResetColor, MoveTo(0, 0), Clear(ClearType::All))?;
+
+        let size_changed = self.screen.size != Some((cols, rows));
+        let viewport_changed = self.screen.origin != Some((self.scroll_row, self.scroll_col));
+        let syntax_changed = self.screen.syntax_enabled != Some(self.syntax.enabled());
+        let repaint_all = size_changed || viewport_changed || syntax_changed;
+
+        // Clear only on the first frame and when the terminal is resized.
+        if size_changed {
+            queue!(output, ResetColor, MoveTo(0, 0), Clear(ClearType::All))?;
+            self.screen = ScreenCache::default();
+        }
+        self.screen.lines.resize_with(height, || None);
+
         for y in 0..height {
             let index = y + self.scroll_row;
-            if let Some(line) = self.doc.lines.get(index) {
-                queue!(output, MoveTo(0, y as u16))?;
+            let line = self.doc.lines.get(index);
+            let content = line.map(Vec::as_slice);
+            let stale = self.screen.lines[y].as_ref().is_none_or(|painted| {
+                painted.index != index || painted.content.as_deref() != content
+            });
+            let syntax_stale = self.syntax.enabled() && syntax_invalid.is_some_and(|first| index >= first);
+
+            if !repaint_all && !syntax_stale && !stale {
+                continue;
+            }
+            queue!(output, MoveTo(0, y as u16), ResetColor)?;
+            if let Some(line) = line {
                 if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
                     for (color, text) in render_color_line(line, spans, self.scroll_col, width) {
                         queue!(output, SetForegroundColor(color), Print(text))?;
@@ -495,7 +546,15 @@ impl Editor {
                     queue!(output, Print(render_line(line, self.scroll_col, width)))?;
                 }
             }
+            // Remove any characters remaining from a previously longer row
+            // *after* overwriting the new text; never blank the whole frame.
+            queue!(output, Clear(ClearType::UntilNewLine))?;
+            self.screen.lines[y] = Some(PaintedLine {
+                index,
+                content: line.cloned(),
+            });
         }
+
         if rows >= 2 {
             let filename = self.doc.path.as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -504,11 +563,15 @@ impl Editor {
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let status = format!(" {mark} Remacs [{mode}] | {filename} | {language} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
-            queue!(output,
-                MoveTo(0, rows - 2),
-                SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White),
-                Print(fit_cells(&status, width)), ResetColor
-            )?;
+            let status = fit_cells(&status, width);
+            if self.screen.status.as_deref() != Some(status.as_str()) {
+                queue!(output,
+                    MoveTo(0, rows - 2),
+                    SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White),
+                    Print(&status), ResetColor
+                )?;
+                self.screen.status = Some(status);
+            }
         }
         if rows >= 1 {
             let message = match &self.prompt {
@@ -527,7 +590,11 @@ impl Editor {
                     Sequence::None => self.message.clone(),
                 },
             };
-            queue!(output, MoveTo(0, rows - 1), Print(fit_cells(&message, width)))?;
+            let message = fit_cells(&message, width);
+            if self.screen.message.as_deref() != Some(message.as_str()) {
+                queue!(output, MoveTo(0, rows - 1), ResetColor, Print(&message))?;
+                self.screen.message = Some(message);
+            }
         }
         let (x, y) = match &self.prompt {
             Some(Prompt::SaveAs(name)) => ("Save file: ".len() + name.chars().count(), rows.saturating_sub(1)),
@@ -542,6 +609,9 @@ impl Editor {
         if cols > 0 && rows > 0 {
             queue!(output, MoveTo((x.min(width - 1)) as u16, y.min(rows - 1)), Show)?;
         }
+        self.screen.size = Some((cols, rows));
+        self.screen.origin = Some((self.scroll_row, self.scroll_col));
+        self.screen.syntax_enabled = Some(self.syntax.enabled());
         output.flush()
     }
 }
@@ -692,6 +762,81 @@ mod tests {
 
     fn press(editor: &mut Editor, key: KeyCode) {
         editor.key(KeyEvent::new(key, KeyModifiers::NONE), 10);
+    }
+
+
+    fn paint(editor: &mut Editor) -> String {
+        let mut output = Vec::new();
+        editor.draw_at(&mut output, 80, 18).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn moving_up_and_down_never_repaints_the_file() {
+        let mut editor = Editor::new(Document::from_text("Unique first line\nUnique second line\nUnique third line"));
+        let first = paint(&mut editor);
+        assert!(first.contains("Unique first line"));
+        // Cursor-only update should contain a changed status, but no body redraw
+        // and no destructive clear sequence.
+        press(&mut editor, KeyCode::Char('j'));
+        let next = paint(&mut editor);
+        assert!(!next.contains("Unique first line"));
+        assert!(!next.contains("Unique second line"));
+        assert!(!next.contains("\x1b[2J"));
+        assert!(!next.contains("\x1b[0J"));
+        assert!(next.contains("Ln 2"));
+        press(&mut editor, KeyCode::Char('k'));
+        let previous = paint(&mut editor);
+        assert!(!previous.contains("Unique first line"));
+        assert!(previous.contains("Ln 1"));
+    }
+
+    #[test]
+    fn inserting_changes_only_the_edited_row() {
+        let mut editor = Editor::new(Document::from_text("first row\nsecond row\nthird row"));
+        // With syntax disabled, changing one line must not touch other lines.
+        // With syntax enabled, following lines may need a reparse because
+        // multi-line string/comment contexts can change.
+        editor.syntax.set_enabled(false);
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char('j'));
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char('i'));
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char('X'));
+        let output = paint(&mut editor);
+        assert!(output.contains("Xsecond row"));
+        assert!(!output.contains("first row"));
+        assert!(!output.contains("third row"));
+        assert!(!output.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn scrolling_and_resize_refresh_visible_content() {
+        let mut editor = Editor::new(Document::from_text(
+            &(0..30).map(|i| format!("row number {i}")).collect::<Vec<_>>().join("\n")
+        ));
+        paint(&mut editor);
+        for _ in 0..20 {
+            press(&mut editor, KeyCode::Char('j'));
+        }
+        let scrolled = paint(&mut editor);
+        assert!(scrolled.contains("row number"));
+        assert!(!scrolled.contains("\x1b[2J"));
+        let mut resized = Vec::new();
+        editor.draw_at(&mut resized, 60, 10).unwrap();
+        assert!(String::from_utf8(resized).unwrap().contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn turning_highlighting_off_forces_repaint() {
+        let mut editor = Editor::new(Document::from_text("# A heading"));
+        editor.doc.path = Some(PathBuf::from("README.md"));
+        paint(&mut editor);
+        editor.command("syntax off");
+        let repainted = paint(&mut editor);
+        assert!(repainted.contains("# A heading"));
+        assert!(!repainted.contains("\x1b[2J"));
     }
 
     #[test]
