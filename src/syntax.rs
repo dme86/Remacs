@@ -89,12 +89,13 @@ impl SyntaxEngine {
         self.enabled = enabled;
     }
 
-    pub fn refresh(&mut self, doc: &mut Document) {
+    pub fn refresh(&mut self, doc: &mut Document) -> Option<usize> {
         let from = doc.take_syntax_invalidation();
         if self.path != doc.path {
             self.path = doc.path.clone();
             self.name = Self::detect(&self.syntaxes, doc).name.to_owned();
             self.cached.clear();
+            return Some(0);
         } else if let Some(row) = from {
             // A shebang on the first line may change the language in unnamed files.
             if row == 0 {
@@ -105,7 +106,9 @@ impl SyntaxEngine {
                 }
             }
             self.cached.truncate(row);
+            return Some(row);
         }
+        None
     }
 
     pub fn spans(&mut self, doc: &Document, row: usize) -> Option<&[Span]> {
