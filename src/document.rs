@@ -131,6 +131,90 @@ impl Document {
         } else { None }
     }
 
+    pub fn delete_line(&mut self) -> Vec<char> {
+        let deleted = if self.lines.len() > 1 {
+            let line = self.lines.remove(self.row);
+            self.row = self.row.min(self.lines.len() - 1);
+            line
+        } else {
+            std::mem::take(&mut self.lines[0])
+        };
+        self.col = 0;
+        self.dirty = true;
+        deleted
+    }
+
+    pub fn insert_line_below(&mut self, line: Vec<char>) {
+        self.row += 1;
+        self.lines.insert(self.row, line);
+        self.col = 0;
+        self.dirty = true;
+    }
+
+    pub fn insert_line_above(&mut self, line: Vec<char>) {
+        self.lines.insert(self.row, line);
+        self.col = 0;
+        self.dirty = true;
+    }
+
+    pub fn word_forward(&mut self) {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut row = self.row;
+        let mut col = self.col;
+        if col < self.lines[row].len() && is_word(self.lines[row][col]) {
+            while col < self.lines[row].len() && is_word(self.lines[row][col]) { col += 1; }
+        }
+        loop {
+            while col < self.lines[row].len() {
+                if is_word(self.lines[row][col]) {
+                    self.row = row;
+                    self.col = col;
+                    return;
+                }
+                col += 1;
+            }
+            if row + 1 >= self.lines.len() {
+                self.row = row;
+                self.col = self.lines[row].len().saturating_sub(1);
+                return;
+            }
+            row += 1;
+            col = 0;
+        }
+    }
+
+    pub fn word_backward(&mut self) {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut row = self.row;
+        let mut col = self.col;
+        loop {
+            if col == 0 {
+                if row == 0 {
+                    self.row = row;
+                    self.col = col;
+                    return;
+                }
+                row -= 1;
+                col = self.lines[row].len();
+                continue;
+            }
+            col -= 1;
+            while col > 0 && !is_word(self.lines[row][col]) { col -= 1; }
+            if is_word(self.lines[row][col]) {
+                while col > 0 && is_word(self.lines[row][col - 1]) { col -= 1; }
+                self.row = row;
+                self.col = col;
+                return;
+            }
+            if row == 0 {
+                self.row = 0;
+                self.col = 0;
+                return;
+            }
+            col = 0;
+        }
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         for ch in text.chars() { self.insert(ch); }
     }
