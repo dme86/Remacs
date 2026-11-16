@@ -98,7 +98,7 @@ impl SyntaxEngine {
         } else if let Some(row) = from {
             // A shebang on the first line may change the language in unnamed files.
             if row == 0 {
-                let name = Self::detect(&self.syntaxes, doc).name;
+                let name = &Self::detect(&self.syntaxes, doc).name;
                 if name != self.name {
                     self.name = name.to_owned();
                     self.cached.clear();
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn defaults_to_highlighting_and_parses_markdown() {
-        let doc = doc_named("README.md", "# Hello\n\n**bold**\n\n\`\`\`rust\nfn main() {}\n\`\`\`");
+        let doc = doc_named("README.md", "# Hello\n\n**bold**\n\n```rust\nfn main() {}\n```");
         let mut engine = SyntaxEngine::new(&doc);
         assert!(engine.enabled());
         assert!(engine.spans(&doc, 5).is_some());
