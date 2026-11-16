@@ -1,5 +1,6 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
 mod document;
+mod plugins;
 mod syntax;
 
 use std::{
@@ -16,6 +17,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use document::Document;
+use plugins::{TreeAction, TreePlugin, TreeView};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -39,6 +41,7 @@ enum Sequence {
     None,
     Leader,
     File,
+    Panel,
     Quit,
     Delete,
     Yank,
@@ -87,9 +90,18 @@ struct ScreenCache {
     size: Option<(u16, u16)>,
     origin: Option<(usize, usize)>,
     syntax_enabled: Option<bool>,
+    sidebar_width: usize,
+    sidebar_lines: Vec<Option<SidebarPaint>>,
     lines: Vec<Option<PaintedLine>>,
     status: Option<String>,
     message: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SidebarPaint {
+    text: String,
+    active: bool,
+    focused: bool,
 }
 
 struct PaintedLine {
@@ -102,6 +114,7 @@ struct PaintedLine {
 struct Editor {
     doc: Document,
     syntax: SyntaxEngine,
+    tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
     scroll_col: usize,
@@ -124,6 +137,7 @@ impl Editor {
         Self {
             doc,
             syntax,
+            tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
             scroll_col: 0,
@@ -187,6 +201,71 @@ impl Editor {
         self.sequence = Sequence::None;
     }
 
+    fn toggle_tree(&mut self) {
+        if self.tree.is_none() {
+            let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match TreePlugin::new(&root) {
+                Ok(tree) => self.tree = Some(tree),
+                Err(error) => {
+                    self.message = format!("Cannot load Lua tree plugin: {error}");
+                    return;
+                }
+            }
+        }
+        if let Some(tree) = &mut self.tree {
+            if let Err(error) = tree.toggle() {
+                self.message = format!("Tree plugin error: {error}");
+            } else if tree.visible {
+                self.message = "Tree: j/k move  l/Enter open  h collapse  Tab/Esc editor  q close".into();
+            }
+        }
+        self.sequence = Sequence::None;
+    }
+
+    fn tree_key(&mut self, key: KeyEvent) {
+        let name = match key.code {
+            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                c.to_string(),
+            KeyCode::Enter => "enter".into(),
+            KeyCode::Esc => "esc".into(),
+            KeyCode::Tab => "tab".into(),
+            KeyCode::Backspace => "backspace".into(),
+            KeyCode::Left => "left".into(),
+            KeyCode::Right => "right".into(),
+            KeyCode::Up => "up".into(),
+            KeyCode::Down => "down".into(),
+            _ => return,
+        };
+        let action = match self.tree.as_ref().map(|tree| tree.on_key(&name)) {
+            Some(Ok(action)) => action,
+            Some(Err(error)) => {
+                self.message = format!("Lua file tree error: {error}");
+                return;
+            }
+            None => return,
+        };
+        match action {
+            TreeAction::None => {}
+            TreeAction::Editor => {
+                if let Some(tree) = &mut self.tree { tree.leave(); }
+            }
+            TreeAction::Close => {
+                if let Some(tree) = &mut self.tree { tree.close(); }
+            }
+            TreeAction::Open(path) => {
+                if !self.doc.dirty {
+                    let filename = path.to_string_lossy().into_owned();
+                    self.open(filename);
+                    if self.doc.path.as_ref() == Some(&path) {
+                        if let Some(tree) = &mut self.tree { tree.leave(); }
+                    }
+                } else {
+                    self.message = "Unsaved changes: save before opening a tree file".into();
+                }
+            }
+        }
+    }
+
     fn save(&mut self) {
         if self.doc.path.is_none() {
             self.prompt = Some(Prompt::SaveAs(String::new()));
@@ -240,6 +319,7 @@ impl Editor {
                 self.syntax.set_enabled(false);
                 self.message = "Syntax highlighting disabled".into();
             }
+            "tree" | "tree toggle" => self.toggle_tree(),
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
@@ -330,6 +410,22 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
+        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_tree();
+            return;
+        }
+        if self.tree.as_ref().is_some_and(|tree| tree.focused) {
+            self.tree_key(key);
+            return;
+        }
+        if self.mode == Mode::Normal && key.code == KeyCode::Tab {
+            if let Some(tree) = &mut self.tree {
+                if tree.visible {
+                    tree.focus();
+                    return;
+                }
+            }
+        }
         if key.code == KeyCode::Esc {
             if self.mode == Mode::Insert {
                 self.leave_insert();
@@ -397,7 +493,10 @@ impl Editor {
             let count = self.count.take();
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
+                (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
+                (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
+                (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('f')) => self.prompt = Some(Prompt::Open(String::new())),
                 (Sequence::File, KeyCode::Char('s')) => self.save(),
                 (Sequence::Quit, KeyCode::Char('q')) => self.quit(),
@@ -554,21 +653,77 @@ impl Editor {
 
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
-        let gutter_width = gutter_width(width, self.doc.lines.len());
-        let text_width = width - gutter_width;
+        let sidebar_width = tree_sidebar_width(width, self.tree.as_ref().is_some_and(|tree| tree.visible));
+        let editor_width = width - sidebar_width;
+        let gutter_width = gutter_width(editor_width, self.doc.lines.len());
+        let text_width = editor_width - gutter_width;
         self.ensure_visible(text_width, height);
 
         let size_changed = self.screen.size != Some((cols, rows));
         let viewport_changed = self.screen.origin != Some((self.scroll_row, self.scroll_col));
         let syntax_changed = self.screen.syntax_enabled != Some(self.syntax.enabled());
-        let repaint_all = size_changed || viewport_changed || syntax_changed;
+        let sidebar_changed = self.screen.sidebar_width != sidebar_width;
+        let repaint_all = size_changed || viewport_changed || syntax_changed || sidebar_changed;
 
-        // Clear only on the first frame and when the terminal is resized.
-        if size_changed {
+        // Initial frame, resize or a changed split geometry requires a full repaint.
+        // Normal navigation in either pane still only changes the affected rows.
+        if size_changed || sidebar_changed {
             queue!(output, ResetColor, MoveTo(0, 0), Clear(ClearType::All))?;
             self.screen = ScreenCache::default();
         }
         self.screen.lines.resize_with(height, || None);
+
+        let mut selected_tree_row = 0;
+        if sidebar_width > 0 {
+            let view = match self.tree.as_ref().map(|tree| tree.view(height.saturating_sub(1))) {
+                Some(Ok(view)) => Some(view),
+                Some(Err(error)) => {
+                    self.message = format!("Tree render error: {error}");
+                    None
+                }
+                None => None,
+            };
+            if let Some(view) = view {
+                selected_tree_row = view.selected;
+                let focused = self.tree.as_ref().is_some_and(|tree| tree.focused);
+                self.screen.sidebar_lines.resize_with(height, || None);
+                for y in 0..height {
+                    let text = if y == 0 {
+                        view.title.clone()
+                    } else {
+                        view.lines.get(y - 1).cloned().unwrap_or_default()
+                    };
+                    let active = y > 0 && y == view.selected;
+                    let cell = SidebarPaint { text, active, focused };
+                    if self.screen.sidebar_lines[y].as_ref() == Some(&cell) {
+                        continue;
+                    }
+                    let background = if active && focused {
+                        Color::Rgb { r: 65, g: 64, b: 78 }
+                    } else if active {
+                        Color::Rgb { r: 49, g: 48, b: 59 }
+                    } else {
+                        Color::Rgb { r: 34, g: 35, b: 42 }
+                    };
+                    let foreground = if active {
+                        Color::Rgb { r: 226, g: 213, b: 255 }
+                    } else {
+                        Color::Rgb { r: 174, g: 179, b: 194 }
+                    };
+                    queue!(output,
+                        MoveTo(0, y as u16),
+                        SetBackgroundColor(background),
+                        SetForegroundColor(foreground),
+                        Print(fit_cells(&cell.text, sidebar_width.saturating_sub(1))),
+                        ResetColor,
+                        SetForegroundColor(Color::Rgb { r: 82, g: 84, b: 96 }),
+                        Print("│"),
+                        ResetColor
+                    )?;
+                    self.screen.sidebar_lines[y] = Some(cell);
+                }
+            }
+        }
 
         for y in 0..height {
             let index = y + self.scroll_row;
@@ -592,7 +747,7 @@ impl Editor {
             }
             if gutter_width > 0 && (paint_text || gutter_changed) {
                 queue!(output,
-                    MoveTo(0, y as u16),
+                    MoveTo(sidebar_width as u16, y as u16),
                     SetBackgroundColor(GUTTER_BG),
                     SetForegroundColor(if active { CURRENT_NUMBER_FG } else { GUTTER_FG }),
                     Print(&number),
@@ -600,7 +755,7 @@ impl Editor {
                 )?;
             }
             if paint_text {
-                queue!(output, MoveTo(gutter_width as u16, y as u16), ResetColor)?;
+                queue!(output, MoveTo((sidebar_width + gutter_width) as u16, y as u16), ResetColor)?;
                 if active {
                     queue!(output, SetBackgroundColor(CURRENT_LINE_BG))?;
                 }
@@ -646,7 +801,8 @@ impl Editor {
             let mark = if self.doc.dirty { "**" } else { "--" };
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
-            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
+            let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
+            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
             let status = fit_cells(&status, width);
             if self.screen.status.as_deref() != Some(status.as_str()) {
                 queue!(output,
@@ -664,9 +820,12 @@ impl Editor {
                 Some(Prompt::Command(command)) => format!(":{command}"),
                 Some(Prompt::Quit) => "Discard changes and quit? (y/n)".into(),
                 None if self.control_x => "C-x".into(),
+                None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
+                    "TREE  j/k Move  l/Enter Open  h Collapse  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → f Files | q Quit".into(),
-                    Sequence::File => "SPC f → f Find file | s Save".into(),
+                    Sequence::Leader => "SPC → f Files | o Panels | q Quit".into(),
+                    Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
+                    Sequence::Panel => "SPC o → p Project tree".into(),
                     Sequence::Quit => "SPC q → q Quit".into(),
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
@@ -685,8 +844,13 @@ impl Editor {
             Some(Prompt::Open(name)) => ("Find file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
+            None if sidebar_width > 0 && self.tree.as_ref().is_some_and(|tree| tree.focused) => (
+                2,
+                selected_tree_row as u16,
+            ),
             None => (
-                gutter_width + visual_column(&self.doc.line()[..self.doc.col]).saturating_sub(self.scroll_col),
+                sidebar_width + gutter_width
+                    + visual_column(&self.doc.line()[..self.doc.col]).saturating_sub(self.scroll_col),
                 self.doc.row.saturating_sub(self.scroll_row) as u16,
             ),
         };
@@ -696,10 +860,16 @@ impl Editor {
         self.screen.size = Some((cols, rows));
         self.screen.origin = Some((self.scroll_row, self.scroll_col));
         self.screen.syntax_enabled = Some(self.syntax.enabled());
+        self.screen.sidebar_width = sidebar_width;
         output.flush()
     }
 }
 
+
+fn tree_sidebar_width(columns: usize, visible: bool) -> usize {
+    if !visible || columns < 48 { return 0; }
+    (columns / 3).clamp(24, 34).min(columns - 20)
+}
 
 fn gutter_width(columns: usize, total_lines: usize) -> usize {
     // Never sacrifice the entire text area when the terminal is narrow.
@@ -942,6 +1112,14 @@ mod tests {
 
 
     #[test]
+    fn tree_layout_preserves_text_width() {
+        assert_eq!(tree_sidebar_width(80, false), 0);
+        assert_eq!(tree_sidebar_width(80, true), 26);
+        assert_eq!(tree_sidebar_width(40, true), 0);
+        assert!(tree_sidebar_width(120, true) + gutter_width(86, 100) < 120);
+    }
+
+    #[test]
     fn relative_numbers_keep_absolute_cursor_position() {
         assert_eq!(gutter_width(80, 12_000), 7);
         assert_eq!(gutter_number(42, 42, 12_000, 7), "   43  ");
@@ -1003,6 +1181,28 @@ mod tests {
         assert!(!output.contains("abcdef"));
         assert!(!output.contains("second"));
         assert!(!output.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn opening_tree_keeps_editor_buffer_and_renders_sidebar() {
+        let mut editor = Editor::new(Document::from_text("UNCHANGED-EDITOR-CONTENT"));
+        editor.toggle_tree();
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        let mut output = Vec::new();
+        editor.draw_at(&mut output, 90, 18).unwrap();
+        let first = String::from_utf8(output).unwrap();
+        assert!(first.contains("FILES"));
+        assert!(first.contains("UNCHANGED-EDITOR-CONTENT"));
+        let mut output = Vec::new();
+        editor.draw_at(&mut output, 90, 18).unwrap();
+        // No unnecessary repaint of the sidebar or editor content.
+        let second = String::from_utf8(output).unwrap();
+        assert!(!second.contains("UNCHANGED-EDITOR-CONTENT"));
+        editor.tree_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && !tree.focused));
+        editor.toggle_tree();
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible));
+        assert_eq!(editor.doc.line().iter().collect::<String>(), "UNCHANGED-EDITOR-CONTENT");
     }
 
     #[test]
