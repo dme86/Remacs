@@ -530,7 +530,7 @@ impl Editor {
             let stale = self.screen.lines[y].as_ref().is_none_or(|painted| {
                 painted.index != index || painted.content.as_deref() != content
             });
-            let syntax_stale = syntax_invalid.is_some_and(|first| index >= first);
+            let syntax_stale = self.syntax.enabled() && syntax_invalid.is_some_and(|first| index >= first);
 
             if !repaint_all && !syntax_stale && !stale {
                 continue;
@@ -794,6 +794,10 @@ mod tests {
     #[test]
     fn inserting_changes_only_the_edited_row() {
         let mut editor = Editor::new(Document::from_text("first row\nsecond row\nthird row"));
+        // With syntax disabled, changing one line must not touch other lines.
+        // With syntax enabled, following lines may need a reparse because
+        // multi-line string/comment contexts can change.
+        editor.syntax.set_enabled(false);
         paint(&mut editor);
         press(&mut editor, KeyCode::Char('j'));
         paint(&mut editor);
