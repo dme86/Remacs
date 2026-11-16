@@ -102,6 +102,28 @@ The plugin source is embedded in the executable so it works after cargo
 install without copying any plugin files. This is the first plugin host
 prototype, not yet a general-purpose plugin manager or configuration loader.
 
+### Fuzzy file finding in the tree
+
+Focus the tree, then press **`/`** (or **`f`**) to search the *whole project*,
+including files inside collapsed folders. Type a filename or any subsequence,
+for example `rdme` to find `README.md`, or `rndr` to find
+`src/render_engine.rs`. Matching paths are ranked live (filename and
+consecutive matches receive higher scores).
+
+In search mode, use **Up/Down** or **Tab/Shift+Tab** to choose a match,
+**Enter** to open it, **Backspace** to edit the query, **Ctrl+U** to clear it,
+and **Esc** to cancel the search while keeping the tree open. You can type
+`j` and `k` as part of the search query; they are ordinary letters *during*
+search mode. Outside search mode, `j/k` remain navigation keys.
+
+The project file list is scanned **once when search starts**, cached while
+typing, and limited to 20,000 files / 32 levels to avoid uncontrolled
+recursion. Generated/dependency directories such as `.git`, `node_modules`
+and `target` are skipped in searches. Hidden files follow the tree's
+dotfile visibility setting (`.` toggles it *outside* search mode). The
+finder is synchronous in this first iteration; very large project trees may
+cause a brief pause on the initial scan.
+
 The sidebar is hidden by default. The editor automatically adjusts the
 gutter, horizontal scrolling and cursor coordinates when the tree is shown.
 
