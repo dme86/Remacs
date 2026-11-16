@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none"><defs>
+  <linearGradient id="core" x1="0" x2="1" y1="0" y2="1">
+    <stop offset="0" stop-color="#B39AFF"/>
+    <stop offset="0.54" stop-color="#896BF3"/>
+    <stop offset="1" stop-color="#6754D6"/>
+  </linearGradient>
+  <linearGradient id="ember" x1="0" x2="1" y1="0" y2="1">
+    <stop offset="0" stop-color="#FFC078"/>
+    <stop offset="0.55" stop-color="#F58B63"/>
+    <stop offset="1" stop-color="#E66C5B"/>
+  </linearGradient>
+  <linearGradient id="accent" x1="0" x2="1" y1="0" y2="1">
+    <stop offset="0" stop-color="#A895FF"/>
+    <stop offset="1" stop-color="#775EE7"/>
+  </linearGradient>
+</defs>
+<g>
+  <!-- Open terminal brackets reference the minimal Emacs TUI. -->
+  <path d="M 139 95 L 97 135 Q 88 144 88 157 L 88 352 Q 88 366 99 376 L 139 417" fill="none" stroke="url(#accent)" stroke-width="17" stroke-linecap="square" stroke-linejoin="round" opacity=".68"/>
+  <path d="M 379 95 L 419 135 Q 429 145 429 157 L 429 352 Q 429 366 419 376 L 379 417" fill="none" stroke="url(#accent)" stroke-width="17" stroke-linecap="square" stroke-linejoin="round" opacity=".68"/>
+  <!-- R: strong geometric stem and precise circular shoulder. -->
+  <path d="M 161 125 H 267 C 340 125 379 166 379 224 C 379 271 354 302 313 313 L 282 267 C 306 265 322 250 322 225 C 322 194 302 181 265 181 H 220 V 386 H 161 Z" fill="url(#core)"/>
+  <!-- Rust-orange forward leg: code arrow and R leg in one line. -->
+  <path d="M 258 280 L 316 280 L 395 386 H 326 Z" fill="url(#ember)"/>
+  <!-- Thin underline cursor, deliberately separate from the R. -->
+  <path d="M 397 413 H 434" stroke="url(#ember)" stroke-width="15" stroke-linecap="square"/>
+</g></svg>

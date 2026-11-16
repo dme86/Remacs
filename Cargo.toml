@@ -1,0 +1,11 @@
+[package]
+name = "remacs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A tiny Rust terminal editor with Emacs-inspired keybindings"
+repository = "https://github.com/dme86/Remacs"
+
+[dependencies]
+crossterm = "0.28"
+unicode-width = "0.2"
