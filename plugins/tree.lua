@@ -219,12 +219,13 @@ function tree.on_key(key)
     elseif key == "up" or key == "backtab" or key == "ctrl-p" then
       tree.search_selected = math.max(1, tree.search_selected - 1)
     elseif key == "backspace" then
-      tree.query = tree.query:sub(1, -2)
+      local last = utf8.offset(tree.query, -1)
+      if last then tree.query = tree.query:sub(1, last - 1) end
       update_results()
     elseif key == "ctrl-u" then
       tree.query = ""
       update_results()
-    elseif #key == 1 and #tree.query < 128 then
+    elseif utf8.len(key) == 1 and #tree.query < 128 then
       tree.query = tree.query .. key
       update_results()
     end
