@@ -216,7 +216,7 @@ impl Editor {
             if let Err(error) = tree.toggle() {
                 self.message = format!("Tree plugin error: {error}");
             } else if tree.visible {
-                self.message = "Tree: j/k move  l/Enter open  h collapse  Tab/Esc editor  q close".into();
+                self.message = "Tree: / or f fuzzy find  j/k move  Enter open  Tab/Esc editor".into();
             }
         }
         self.sequence = Sequence::None;
@@ -229,6 +229,10 @@ impl Editor {
             KeyCode::Enter => "enter".into(),
             KeyCode::Esc => "esc".into(),
             KeyCode::Tab => "tab".into(),
+            KeyCode::BackTab => "backtab".into(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-u".into(),
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-n".into(),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-p".into(),
             KeyCode::Backspace => "backspace".into(),
             KeyCode::Left => "left".into(),
             KeyCode::Right => "right".into(),
@@ -410,12 +414,14 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
-        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.toggle_tree();
-            return;
-        }
+        // The explorer owns its keys when focused, including Ctrl+N for
+        // moving through fuzzy results. Outside it, Ctrl+N toggles the pane.
         if self.tree.as_ref().is_some_and(|tree| tree.focused) {
             self.tree_key(key);
+            return;
+        }
+        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_tree();
             return;
         }
         if self.mode == Mode::Normal && key.code == KeyCode::Tab {
@@ -674,6 +680,7 @@ impl Editor {
         self.screen.lines.resize_with(height, || None);
 
         let mut selected_tree_row = 0;
+        let mut search_cursor: Option<usize> = None;
         if sidebar_width > 0 {
             let view = match self.tree.as_ref().map(|tree| tree.view(height.saturating_sub(1))) {
                 Some(Ok(view)) => Some(view),
@@ -685,6 +692,7 @@ impl Editor {
             };
             if let Some(view) = view {
                 selected_tree_row = view.selected;
+                search_cursor = view.search_cursor;
                 let focused = self.tree.as_ref().is_some_and(|tree| tree.focused);
                 self.screen.sidebar_lines.resize_with(height, || None);
                 for y in 0..height {
@@ -821,7 +829,7 @@ impl Editor {
                 Some(Prompt::Quit) => "Discard changes and quit? (y/n)".into(),
                 None if self.control_x => "C-x".into(),
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
-                    "TREE  j/k Move  l/Enter Open  h Collapse  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
+                    "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
                     Sequence::Leader => "SPC → f Files | o Panels | q Quit".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
@@ -845,8 +853,8 @@ impl Editor {
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if sidebar_width > 0 && self.tree.as_ref().is_some_and(|tree| tree.focused) => (
-                2,
-                selected_tree_row as u16,
+                search_cursor.map_or(2, |x| x.min(sidebar_width.saturating_sub(2))),
+                if search_cursor.is_some() { 0 } else { selected_tree_row as u16 },
             ),
             None => (
                 sidebar_width + gutter_width
