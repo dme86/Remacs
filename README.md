@@ -48,6 +48,7 @@ shows incomplete sequences.
 | Yank line / paste | **`yy` / `p`** |
 | Undo / redo | **`u` / `Ctrl+R`** |
 | Open file | **`SPC f f`** |
+| Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
 | Save file | **`SPC f s`** |
 | Quit (prompts if modified) | **`SPC q q`** |
 | Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, or `w FILE` |
@@ -83,6 +84,27 @@ The current line has a subtle full-width background tint, including empty
 space to the right of the text. Both features are integrated with the
 incremental renderer so moving between lines does not clear the screen.
 
+## File tree — first Lua plugin
+
+Open the project explorer using **SPC o p** (Space, o, p), **SPC f t**,
+**Ctrl+N**, or **:tree**. The tree appears in a narrow left sidebar and
+starts at the working directory you launched Remacs from. You can navigate it
+with j/k or arrow keys, expand and collapse directories using l/h, and open
+a selected file with Enter. Tab or Esc returns focus to the editor; q
+closes the sidebar. Press . to show/hide dotfiles, r to refresh, and g/G
+to jump to the first/last entry. Unsaved editor changes block opening
+a different file so nothing is lost.
+
+The tree is implemented in **plugins/tree.lua** and executed by the
+bundled Lua 5.4 runtime (mlua). Rust provides a small host API
+(remacs.fs.list), paints the sidebar, and processes file-open actions.
+The plugin source is embedded in the executable so it works after cargo
+install without copying any plugin files. This is the first plugin host
+prototype, not yet a general-purpose plugin manager or configuration loader.
+
+The sidebar is hidden by default. The editor automatically adjusts the
+gutter, horizontal scrolling and cursor coordinates when the tree is shown.
+
 ## Syntax highlighting
 
 **Enabled by default**, with no plugin installation or configuration. Remacs uses
@@ -109,9 +131,9 @@ The embedded grammars have their own third-party licenses; see
 **Included in v0.1:** opening, editing, and saving text; Vim-style Normal/Insert
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
 Doom-inspired leader shortcuts, hybrid relative line numbers, current-line highlighting,
-built-in syntax highlighting, status line, and minibuffer.
+built-in syntax highlighting, a bundled Lua file-tree plugin, status line, and minibuffer.
 
-**Not yet included:** Lua, LSP, tree view, search,
+**Not yet included:** LSP, search,
 multiple buffers, tabs, splits, mouse support, or menus. This release is not
 intended to replace a full-featured editor yet. Undo currently keeps up to 100 in-memory whole-document snapshots;
 some complex Unicode grapheme clusters and control sequences need more work.
