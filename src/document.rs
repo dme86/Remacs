@@ -8,6 +8,7 @@ pub struct Document {
     pub col: usize,
     pub dirty: bool,
     newline: &'static str,
+    syntax_invalid_from: Option<usize>,
 }
 
 impl Document {
@@ -20,7 +21,7 @@ impl Document {
         let lines = text.split('\n')
             .map(|line| line.strip_suffix('\r').unwrap_or(line).chars().collect())
             .collect();
-        Self { lines, path: None, row: 0, col: 0, dirty: false, newline }
+        Self { lines, path: None, row: 0, col: 0, dirty: false, newline, syntax_invalid_from: None }
     }
 
     pub fn open(path: PathBuf) -> io::Result<Self> {
@@ -82,7 +83,16 @@ impl Document {
     pub fn home(&mut self) { self.col = 0; }
     pub fn end(&mut self) { self.col = self.line().len(); }
 
+    pub fn invalidate_syntax_from(&mut self, row: usize) {
+        self.syntax_invalid_from = Some(self.syntax_invalid_from.map_or(row, |old| old.min(row)));
+    }
+
+    pub fn take_syntax_invalidation(&mut self) -> Option<usize> {
+        self.syntax_invalid_from.take()
+    }
+
     pub fn insert(&mut self, ch: char) {
+        self.invalidate_syntax_from(self.row);
         if ch == '\n' {
             let tail = self.lines[self.row].split_off(self.col);
             self.row += 1;
@@ -97,9 +107,11 @@ impl Document {
 
     pub fn backspace(&mut self) {
         if self.col > 0 {
+            self.invalidate_syntax_from(self.row);
             self.col -= 1;
             self.lines[self.row].remove(self.col);
         } else if self.row > 0 {
+            self.invalidate_syntax_from(self.row - 1);
             let tail = self.lines.remove(self.row);
             self.row -= 1;
             self.col = self.line().len();
@@ -110,8 +122,10 @@ impl Document {
 
     pub fn delete(&mut self) {
         if self.col < self.line().len() {
+            self.invalidate_syntax_from(self.row);
             self.lines[self.row].remove(self.col);
         } else if self.row + 1 < self.lines.len() {
+            self.invalidate_syntax_from(self.row);
             let tail = self.lines.remove(self.row + 1);
             self.lines[self.row].extend(tail);
         } else { return; }
@@ -120,10 +134,12 @@ impl Document {
 
     pub fn kill_to_end(&mut self) -> Option<String> {
         if self.col < self.line().len() {
+            self.invalidate_syntax_from(self.row);
             let text: String = self.lines[self.row].drain(self.col..).collect();
             self.dirty = true;
             Some(text)
         } else if self.row + 1 < self.lines.len() {
+            self.invalidate_syntax_from(self.row);
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].extend(next);
             self.dirty = true;
@@ -132,6 +148,7 @@ impl Document {
     }
 
     pub fn delete_line(&mut self) -> Vec<char> {
+        self.invalidate_syntax_from(self.row.min(self.lines.len().saturating_sub(2)));
         let deleted = if self.lines.len() > 1 {
             let line = self.lines.remove(self.row);
             self.row = self.row.min(self.lines.len() - 1);
@@ -145,6 +162,7 @@ impl Document {
     }
 
     pub fn insert_line_below(&mut self, line: Vec<char>) {
+        self.invalidate_syntax_from(self.row + 1);
         self.row += 1;
         self.lines.insert(self.row, line);
         self.col = 0;
@@ -152,6 +170,7 @@ impl Document {
     }
 
     pub fn insert_line_above(&mut self, line: Vec<char>) {
+        self.invalidate_syntax_from(self.row);
         self.lines.insert(self.row, line);
         self.col = 0;
         self.dirty = true;
