@@ -99,7 +99,7 @@ impl SyntaxEngine {
             // A shebang on the first line may change the language in unnamed files.
             if row == 0 {
                 let name = &Self::detect(&self.syntaxes, doc).name;
-                if name != self.name {
+                if name != &self.name {
                     self.name = name.to_owned();
                     self.cached.clear();
                 }
