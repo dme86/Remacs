@@ -71,13 +71,34 @@ From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
 Opening another file requires saving or discarding your current unsaved changes
 first. Start an empty document with `remacs` and save it via `SPC f s`.
 
+## Syntax highlighting
+
+**Enabled by default**, with no plugin installation or configuration. Remacs uses
+[Syntect](https://github.com/trishume/syntect) plus the extended language
+grammars from [two-face](https://docs.rs/two-face/latest/two_face/) (derived
+from bat). This covers Markdown (including fenced code), Rust, C/C++, Python,
+Go, JavaScript/TypeScript, Java, Kotlin, Swift, Lua, Shell, Fish, YAML, TOML,
+JSON, Dockerfile, Terraform, Nix, SQL, HTML/CSS and many more. The active
+language appears in the status line; unknown files use plain text.
+
+Colors use 24-bit ANSI foregrounds with the embedded `base16-ocean.dark`
+theme. The terminal's existing background remains unchanged. Use
+`:syntax off` and `:syntax on` to toggle highlighting within a session.
+
+Parsing is cached incrementally across lines; editing invalidates the affected
+line and subsequent parser state. No external syntax files or language servers
+are required. Syntax highlighting is lexical, not semantic LSP highlighting.
+
+The embedded grammars have their own third-party licenses; see
+[two-face's acknowledgments](https://docs.rs/two-face/latest/two_face/acknowledgement/index.html).
+
 ## Scope
 
 **Included in v0.1:** opening, editing, and saving text; Vim-style Normal/Insert
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
-Doom-inspired leader shortcuts, status line, and minibuffer.
+Doom-inspired leader shortcuts, built-in syntax highlighting, status line, and minibuffer.
 
-**Not yet included:** Lua, LSP, tree view, syntax highlighting, search,
+**Not yet included:** Lua, LSP, tree view, search,
 multiple buffers, tabs, splits, mouse support, or menus. This release is not
 intended to replace a full-featured editor yet. Undo currently keeps up to 100 in-memory whole-document snapshots;
 some complex Unicode grapheme clusters and control sequences need more work.

@@ -9,3 +9,4 @@ repository = "https://github.com/dme86/Remacs"
 [dependencies]
 crossterm = "0.28"
 unicode-width = "0.2"
+two-face = { version = "0.5.2", features = ["syntect-default-onig"] }

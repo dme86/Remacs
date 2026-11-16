@@ -1,5 +1,6 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
 mod document;
+mod syntax;
 
 use std::{
     env,
@@ -15,6 +16,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use document::Document;
+use syntax::{Span, SyntaxEngine};
 use unicode_width::UnicodeWidthChar;
 
 const TAB_WIDTH: usize = 4;
@@ -65,6 +67,7 @@ impl Snapshot {
         doc.row = self.row;
         doc.col = self.col;
         doc.dirty = true; // Never report an undo/redo buffer as safely saved.
+        doc.invalidate_syntax_from(0);
     }
 }
 
@@ -76,6 +79,7 @@ enum Register {
 
 struct Editor {
     doc: Document,
+    syntax: SyntaxEngine,
     scroll_row: usize,
     scroll_col: usize,
     mode: Mode,
@@ -92,8 +96,10 @@ struct Editor {
 
 impl Editor {
     fn new(doc: Document) -> Self {
+        let syntax = SyntaxEngine::new(&doc);
         Self {
             doc,
+            syntax,
             scroll_row: 0,
             scroll_col: 0,
             mode: Mode::Normal,
@@ -174,6 +180,7 @@ impl Editor {
         match Document::open(PathBuf::from(&name)) {
             Ok(doc) => {
                 self.doc = doc;
+                self.syntax = SyntaxEngine::new(&self.doc);
                 self.scroll_row = 0;
                 self.scroll_col = 0;
                 self.mode = Mode::Normal;
@@ -198,6 +205,14 @@ impl Editor {
             "w" => self.save(),
             "q" => self.quit(),
             "q!" => self.running = false,
+            "syntax on" => {
+                self.syntax.set_enabled(true);
+                self.message = "Syntax highlighting enabled".into();
+            }
+            "syntax off" => {
+                self.syntax.set_enabled(false);
+                self.message = "Syntax highlighting disabled".into();
+            }
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
@@ -461,6 +476,7 @@ impl Editor {
     }
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
+        self.syntax.refresh(&mut self.doc);
         let (cols, rows) = terminal::size()?;
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
@@ -469,7 +485,15 @@ impl Editor {
         for y in 0..height {
             let index = y + self.scroll_row;
             if let Some(line) = self.doc.lines.get(index) {
-                queue!(output, MoveTo(0, y as u16), Print(render_line(line, self.scroll_col, width)))?;
+                queue!(output, MoveTo(0, y as u16))?;
+                if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
+                    for (color, text) in render_color_line(line, spans, self.scroll_col, width) {
+                        queue!(output, SetForegroundColor(color), Print(text))?;
+                    }
+                    queue!(output, ResetColor)?;
+                } else {
+                    queue!(output, Print(render_line(line, self.scroll_col, width)))?;
+                }
             }
         }
         if rows >= 2 {
@@ -478,7 +502,8 @@ impl Editor {
                 .unwrap_or_else(|| "[No Name]".into());
             let mark = if self.doc.dirty { "**" } else { "--" };
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT" };
-            let status = format!(" {mark} Remacs [{mode}] | {filename} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
+            let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
+            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
             queue!(output,
                 MoveTo(0, rows - 2),
                 SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White),
@@ -555,6 +580,45 @@ fn render_line(line: &[char], start: usize, width: usize) -> String {
         column += size;
     }
     output
+}
+
+fn render_color_line(line: &[char], spans: &[Span], start: usize, width: usize) -> Vec<(Color, String)> {
+    let mut runs: Vec<(Color, String)> = Vec::new();
+    let mut column = 0;
+    let end = start.saturating_add(width);
+    for span in spans {
+        for &c in &line[span.start..span.end] {
+            if column >= end { break; }
+            let size = char_width(c, column);
+            let mut visible = String::new();
+            if c == '\t' || c.is_control() {
+                for i in 0..size.max(usize::from(c.is_control())) {
+                    if column + i >= start && column + i < end { visible.push(' '); }
+                }
+            } else if size == 0 {
+                if column > start && column <= end { visible.push(c); }
+            } else if column >= start && column + size <= end {
+                visible.push(c);
+            } else {
+                for i in 0..size {
+                    if column + i >= start && column + i < end { visible.push(' '); }
+                }
+            }
+            if !visible.is_empty() {
+                if let Some((last_color, text)) = runs.last_mut() {
+                    if *last_color == span.foreground {
+                        text.push_str(&visible);
+                    } else {
+                        runs.push((span.foreground, visible));
+                    }
+                } else {
+                    runs.push((span.foreground, visible));
+                }
+            }
+            column += size;
+        }
+    }
+    runs
 }
 
 fn fit_cells(input: &str, width: usize) -> String {
@@ -669,6 +733,20 @@ mod tests {
     fn tab_expansion() {
         assert_eq!(visual_column(&"a\tb".chars().collect::<Vec<_>>()), 5);
         assert_eq!(render_line(&"a\tb".chars().collect::<Vec<_>>(), 0, 8), "a   b");
+    }
+
+    #[test]
+    fn colored_lines_preserve_tabs_and_wide_characters() {
+        let line: Vec<char> = "a\t界x".chars().collect();
+        let spans = vec![
+            Span { start: 0, end: 2, foreground: Color::Blue },
+            Span { start: 2, end: 4, foreground: Color::Red },
+        ];
+        let runs = render_color_line(&line, &spans, 0, 9);
+        assert_eq!(runs, vec![
+            (Color::Blue, "a   ".into()),
+            (Color::Red, "界x".into()),
+        ]);
     }
 
     #[test]
