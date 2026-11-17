@@ -4,11 +4,15 @@ mod finder_ui;
 mod function_select;
 mod jumps;
 mod plugins;
+mod popup_terminal;
 mod syntax;
+mod toggleterm_plugin;
 
 use std::{
+    collections::HashMap,
     env,
     io::{self, Write},
+    time::Duration,
     path::{Path, PathBuf},
 };
 
@@ -24,6 +28,8 @@ use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cac
 use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
 use plugins::{FinderView, TreeAction, TreePlugin};
+use popup_terminal::{popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession};
+use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -115,6 +121,7 @@ struct ScreenCache {
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
     finder: FinderCache,
+    terminal: TerminalPopupCache,
     lines: Vec<Option<PaintedLine>>,
     status: Option<String>,
     message: Option<String>,
@@ -183,6 +190,8 @@ struct Editor {
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
     jumps: JumpManager,
+    toggleterm: ToggleTermPlugin,
+    terminals: HashMap<String, TerminalSession>,
     tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
@@ -219,6 +228,8 @@ impl Editor {
             } else {
                 JumpManager::load_default()
             },
+            toggleterm: ToggleTermPlugin::new().expect("bundled toggleterm.lua plugin"),
+            terminals: HashMap::new(),
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -236,6 +247,95 @@ impl Editor {
             redo: Vec::new(),
             insert_changed: false,
             running: true,
+        }
+    }
+
+    fn project_root(&self) -> PathBuf {
+        let current = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let start = self.doc.path.as_ref()
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(current.as_path());
+        // Vim-like project discovery: prefer the enclosing Git repository.
+        // Cargo/npm/Go markers are fallbacks for a non-Git project.
+        let fallback = start.to_path_buf();
+        for dir in start.ancestors() {
+            if dir.join(".git").exists() { return dir.to_path_buf(); }
+        }
+        for dir in start.ancestors() {
+            if ["Cargo.toml", "go.mod", "package.json"]
+                .iter().any(|file| dir.join(file).exists()) {
+                return dir.to_path_buf();
+            }
+        }
+        fallback
+    }
+
+    fn terminal_binding(&mut self, binding: &str) {
+        let kind = match self.toggleterm.binding(binding) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return,
+            Err(error) => {
+                self.message = format!("toggleterm plugin: {error}");
+                return;
+            }
+        };
+        let root = self.project_root();
+        let action = match self.toggleterm.toggle(&kind, &root) {
+            Ok(action) => action,
+            Err(error) => {
+                self.message = format!("toggleterm: {error}");
+                return;
+            }
+        };
+        match action {
+            TerminalAction::Open { kind, command, cwd, title } => {
+                let (cols, rows) = terminal::size().unwrap_or((100, 35));
+                let Some(rect) = terminal_rect(cols, rows.saturating_sub(2) as usize) else {
+                    let _ = self.toggleterm.exited(&kind);
+                    self.message = "Terminal is too small for the floating popup".into();
+                    return;
+                };
+                match TerminalSession::spawn(&command, Path::new(&cwd), title, rect) {
+                    Ok(session) => {
+                        self.terminals.insert(kind, session);
+                        self.buffer_picker = None;
+                    }
+                    Err(error) => {
+                        let _ = self.toggleterm.exited(&kind);
+                        self.message = format!("Cannot launch {command}: {error}. Install it first.");
+                    }
+                }
+            }
+            TerminalAction::Show { kind } => {
+                if !self.terminals.contains_key(&kind) {
+                    let _ = self.toggleterm.exited(&kind);
+                    self.message = "Terminal session exited; reopen to start a new one".into();
+                } else {
+                    self.buffer_picker = None;
+                }
+            }
+            TerminalAction::Hide => {}
+            TerminalAction::Error(error) => self.message = error,
+        }
+    }
+
+    fn poll_terminals(&mut self) {
+        let mut ended = Vec::new();
+        for (kind, session) in &mut self.terminals {
+            match session.poll() {
+                Ok(true) => ended.push(kind.clone()),
+                Ok(false) => {},
+                Err(error) => {
+                    self.message = format!("Terminal process error: {error}");
+                    ended.push(kind.clone());
+                }
+            }
+        }
+        for kind in ended {
+            self.terminals.remove(&kind);
+            let _ = self.toggleterm.exited(&kind);
+            self.message = format!("{kind} terminal exited");
         }
     }
 
@@ -992,6 +1092,8 @@ impl Editor {
                 self.message = "Syntax highlighting disabled".into();
             }
             "tree" | "tree toggle" => self.toggle_tree(),
+            "lazygit" => self.terminal_binding("space g"),
+            "terminal" => self.terminal_binding("space t"),
             "buffers" | "ls" => self.open_buffer_picker(),
             "bn" | "bnext" => self.cycle_buffer(true),
             "bp" | "bprev" => self.cycle_buffer(false),
@@ -1088,8 +1190,29 @@ impl Editor {
     }
 
     fn key(&mut self, key: KeyEvent, page_height: usize) {
+        // A visible terminal receives every key, including Escape, instead of
+        // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
+        // the PTY; the session continues while hidden.
+        if let Ok(Some(active)) = self.toggleterm.active() {
+            if key.code == KeyCode::Char('t')
+                && key.modifiers.contains(KeyModifiers::CONTROL) {
+                let _ = self.toggleterm.hide();
+                return;
+            }
+            if let Some(session) = self.terminals.get_mut(&active) {
+                if let Err(error) = session.input(key) {
+                    self.message = format!("PTY input: {error}");
+                }
+            }
+            return;
+        }
         if self.prompt.is_some() {
             self.prompt_key(key);
+            return;
+        }
+        if key.code == KeyCode::Char('t')
+            && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.terminal_binding("ctrl-t");
             return;
         }
         // Ctrl+P opens/closes the existing centered buffer search popup.
@@ -1241,6 +1364,8 @@ impl Editor {
                 (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
                 (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
+                (Sequence::Leader, KeyCode::Char('g')) => self.terminal_binding("space g"),
+                (Sequence::Leader, KeyCode::Char('t')) => self.terminal_binding("space t"),
                 (Sequence::Buffer, KeyCode::Char('b')) => self.open_buffer_picker(),
                 (Sequence::Buffer, KeyCode::Char('n')) => self.cycle_buffer(true),
                 (Sequence::Buffer, KeyCode::Char('p')) => self.cycle_buffer(false),
@@ -1642,7 +1767,7 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → b Buffers | f Files | o Panels | v Visual | q Quit".into(),
+                    Sequence::Leader => "SPC → b Buffers | f Files | g LazyGit | t Terminal | o Panels | v Visual | q Quit".into(),
                     Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | s Save All | d Close".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
