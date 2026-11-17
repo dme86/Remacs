@@ -223,11 +223,16 @@ impl JumpManager {
         let Some(parent) = path.parent() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid jump state path"));
         };
+        // Never chmod an existing parent directory. A custom state path
+        // may be directly under /tmp or an XDG shared directory; changing
+        // those permissions would be a serious bug.
+        let create_parent = !parent.exists();
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
-        {
+        if create_parent {
             use std::os::unix::fs::PermissionsExt;
-            // This directory is exclusively for Remacs metadata.
+            // The new app-specific directory is private; existing directories
+            // and their permissions are left untouched.
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
         let bytes = serde_json::to_vec(&self.saved)
@@ -327,6 +332,28 @@ mod tests {
         assert_eq!(store.mark('a', &place("one.rs", 1, 0).path), Some(source.clone()));
         assert_eq!(store.mark('a', &place("two.rs", 1, 0).path), None);
         assert_eq!(store.mark('A', &place("two.rs", 1, 0).path), Some(source));
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn state_save_never_chmods_existing_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "remacs-state-perms-{}-{}", std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("jumps.json");
+        let mut store = JumpManager::from_path(path.clone());
+        store.remember(place("one.rs", 1, 0)).unwrap();
+        let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "existing directory permissions must be preserved");
+        let file_mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "state file should be private");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
