@@ -103,9 +103,10 @@ discarding unsaved changes. `:q!` still exits without saving.
 Buffers are kept **in memory only**, with no session persistence or
 automatic disk swap. Switching uses Rust ownership moves (no document clone);
 the bundled syntax grammars and theme are loaded once and shared by all
-buffers. Individual undo histories still use the current snapshot-based
-implementation, so very large edited files can consume additional memory.
-Incremental/delta-based undo is planned for a later iteration.
+buffers. Undo histories still use snapshots, but the editor now limits retained
+history to **100 steps or roughly 32 MiB per buffer**, whichever is smaller.
+For very large files, at least one undo snapshot is preserved even if it
+exceeds the limit. Incremental/delta-based undo is planned later.
 
 ## Line numbers and cursor line
 
