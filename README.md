@@ -44,6 +44,9 @@ shows incomplete sequences.
 | Move | **`h` / `j` / `k` / `l`**, arrows, **`w` / `b`**, optional count (e.g. **`5j`**, **`12k`**) |
 | Beginning / end of line | **`0` / `$`** |
 | First / last line | **`gg` / `G`**, absolute jump via **`42G`** or **`42gg`** |
+| Select function (Tree-sitter) | **`vaf`** or **`SPC v f`** |
+| Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
+| Yank / delete selection | **`y` / `d`** in VISUAL mode |
 | Delete character / line | **`x` / `dd`** |
 | Yank line / paste | **`yy` / `p`** |
 | Undo / redo | **`u` / `Ctrl+R`** |
@@ -126,6 +129,28 @@ cause a brief pause on the initial scan.
 
 The sidebar is hidden by default. The editor automatically adjusts the
 gutter, horizontal scrolling and cursor coordinates when the tree is shown.
+
+## Syntax-aware function selection
+
+Move your cursor **anywhere inside a function**, press **`vaf`** (Visual,
+around function) or **`SPC v f`** (Space, v, f). Remacs highlights the whole
+function, from its declaration through its closing delimiter, even with
+nested braces or multiline definitions. The selection is real: press
+**`y`** to yank it into Remacs' internal register, **`d`** to delete it
+(undo with **`u`**), or **`Esc`** to cancel. You can also create a
+regular Visual selection with **`v`** and cursor motions.
+
+Function boundaries are resolved on demand using [Tree-sitter](https://tree-sitter.github.io/),
+not regex matching or brace counting. The first implementation supports
+Rust, Python, Go, JavaScript/JSX, TypeScript/TSX, C, C++, Java, Bash,
+Lua, Ruby, PHP, C#, and Swift. The innermost surrounding function is
+preferred, including methods and common closures. There is no LSP
+requirement, and parsing runs **only when selecting a function**.
+
+Unsupported file types (including Markdown itself) report a message rather
+than guessing. Embedded languages in Markdown code fences and very large
+files (above 12 MiB) are not yet supported for function selection; ordinary
+syntax highlighting is unaffected.
 
 ## Syntax highlighting
 

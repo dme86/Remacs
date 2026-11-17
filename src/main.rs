@@ -1403,6 +1403,61 @@ mod tests {
     }
 
     #[test]
+    fn visual_function_selection_and_yank() {
+        let mut doc = Document::from_text("pub fn from_text(text: &str) -> Self {\n  let v = { 42 };\n  Self { v }\n}\n");
+        doc.path = Some(PathBuf::from("src/document.rs"));
+        doc.row = 1;
+        doc.col = 5;
+        let mut editor = Editor::new(doc);
+        for key in ['v', 'a', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.mode, Mode::Visual);
+        let selected = editor.selection.unwrap();
+        assert_eq!(selected.start, Position { row: 0, col: 0 });
+        assert_eq!(selected.end, Position { row: 3, col: 1 });
+        let output = paint(&mut editor);
+        assert!(output.contains("\x1b[48;2;83;69;111m"));
+        press(&mut editor, KeyCode::Char('y'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.selection.is_none());
+        match editor.register.as_ref().unwrap() {
+            Register::Text(text) => assert!(text.starts_with("pub fn from_text")),
+            _ => panic!("expected selected function in register"),
+        }
+        assert_eq!(editor.doc.lines.len(), 5);
+    }
+
+    #[test]
+    fn doom_function_shortcut_delete_is_undoable() {
+        let mut doc = Document::from_text("fn f() {\n  println!(\"hi\");\n}\nfn g() {}\n");
+        doc.path = Some(PathBuf::from("src/lib.rs"));
+        doc.row = 1;
+        let mut editor = Editor::new(doc);
+        for key in [' ', 'v', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.mode, Mode::Visual);
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.doc.lines[0].is_empty());
+        assert!(editor.doc.lines[1].iter().collect::<String>().contains("fn g"));
+        press(&mut editor, KeyCode::Char('u'));
+        assert!(editor.doc.lines[0].iter().collect::<String>().starts_with("fn f"));
+    }
+
+    #[test]
+    fn visual_manual_motions_and_escape() {
+        let mut editor = Editor::new(Document::from_text("abcd\nsecond\nthird"));
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('l'));
+        let range = editor.selection.unwrap();
+        assert_eq!(range.columns(0, 4), Some((0, 2)));
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.mode, Mode::Normal);
+        let output = paint(&mut editor);
+        assert!(output.contains("abcd"));
+        assert!(!output.contains("\x1b[2J"));
+    }
+
+    #[test]
     fn modal_editing() {
         let mut editor = Editor::new(Document::from_text("abc"));
         press(&mut editor, KeyCode::Char('i'));
