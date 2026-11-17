@@ -217,7 +217,7 @@ function tree.on_key(key)
     elseif key == "down" or key == "tab" then
       tree.search_selected = math.min(#tree.results, tree.search_selected + 1)
       tree.search_selected = math.max(1, tree.search_selected)
-    elseif key == "up" or key == "backtab" or key == "ctrl-p" then
+    elseif key == "up" or key == "backtab" then
       tree.search_selected = math.max(1, tree.search_selected - 1)
     elseif key == "backspace" then
       local last = utf8.offset(tree.query, -1)
