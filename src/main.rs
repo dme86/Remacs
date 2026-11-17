@@ -276,11 +276,14 @@ impl Editor {
     }
 
     fn visit_location(&mut self, target: Location, linewise: bool) -> bool {
-        if !target.path.is_file() {
+        let slot = self.named_slot(&target.path);
+        // In-memory buffers take precedence: a file may have been deleted
+        // on disk while its modified contents remain open in Remacs.
+        if slot.is_none() && !target.path.is_file() {
             self.message = format!("Jump target missing: {}", target.path.display());
             return false;
         }
-        let Some(slot) = self.named_slot(&target.path) else {
+        let Some(slot) = slot else {
             // Open through the standard buffer API but without adding
             // the origin as another jump to this already-traversed history.
             let next = match Document::open(target.path.clone()) {
@@ -1135,7 +1138,8 @@ impl Editor {
             self.tree_key(key);
             return;
         }
-        if self.mode == Mode::Normal && key.code == KeyCode::Tab {
+        if self.mode == Mode::Normal && key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(tree) = &mut self.tree {
                 if tree.visible {
                     tree.focus();
