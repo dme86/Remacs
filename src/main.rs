@@ -4,11 +4,15 @@ mod finder_ui;
 mod function_select;
 mod jumps;
 mod plugins;
+mod popup_terminal;
 mod syntax;
+mod toggleterm_plugin;
 
 use std::{
+    collections::HashMap,
     env,
     io::{self, Write},
+    time::Duration,
     path::{Path, PathBuf},
 };
 
@@ -24,6 +28,8 @@ use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cac
 use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
 use plugins::{FinderView, TreeAction, TreePlugin};
+use popup_terminal::{popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession};
+use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -115,6 +121,7 @@ struct ScreenCache {
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
     finder: FinderCache,
+    terminal: TerminalPopupCache,
     lines: Vec<Option<PaintedLine>>,
     status: Option<String>,
     message: Option<String>,
@@ -183,6 +190,8 @@ struct Editor {
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
     jumps: JumpManager,
+    toggleterm: ToggleTermPlugin,
+    terminals: HashMap<String, TerminalSession>,
     tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
@@ -219,6 +228,8 @@ impl Editor {
             } else {
                 JumpManager::load_default()
             },
+            toggleterm: ToggleTermPlugin::new().expect("bundled toggleterm.lua plugin"),
+            terminals: HashMap::new(),
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -236,6 +247,95 @@ impl Editor {
             redo: Vec::new(),
             insert_changed: false,
             running: true,
+        }
+    }
+
+    fn project_root(&self) -> PathBuf {
+        let current = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let start = self.doc.path.as_ref()
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(current.as_path());
+        // Vim-like project discovery: prefer the enclosing Git repository.
+        // Cargo/npm/Go markers are fallbacks for a non-Git project.
+        let fallback = start.to_path_buf();
+        for dir in start.ancestors() {
+            if dir.join(".git").exists() { return dir.to_path_buf(); }
+        }
+        for dir in start.ancestors() {
+            if ["Cargo.toml", "go.mod", "package.json"]
+                .iter().any(|file| dir.join(file).exists()) {
+                return dir.to_path_buf();
+            }
+        }
+        fallback
+    }
+
+    fn terminal_binding(&mut self, binding: &str) {
+        let kind = match self.toggleterm.binding(binding) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return,
+            Err(error) => {
+                self.message = format!("toggleterm plugin: {error}");
+                return;
+            }
+        };
+        let root = self.project_root();
+        let action = match self.toggleterm.toggle(&kind, &root) {
+            Ok(action) => action,
+            Err(error) => {
+                self.message = format!("toggleterm: {error}");
+                return;
+            }
+        };
+        match action {
+            TerminalAction::Open { kind, command, cwd, title } => {
+                let (cols, rows) = terminal::size().unwrap_or((100, 35));
+                let Some(rect) = terminal_rect(cols, rows.saturating_sub(2) as usize) else {
+                    let _ = self.toggleterm.exited(&kind);
+                    self.message = "Terminal is too small for the floating popup".into();
+                    return;
+                };
+                match TerminalSession::spawn(&command, Path::new(&cwd), title, rect) {
+                    Ok(session) => {
+                        self.terminals.insert(kind, session);
+                        self.buffer_picker = None;
+                    }
+                    Err(error) => {
+                        let _ = self.toggleterm.exited(&kind);
+                        self.message = format!("Cannot launch {command}: {error}. Install it first.");
+                    }
+                }
+            }
+            TerminalAction::Show { kind } => {
+                if !self.terminals.contains_key(&kind) {
+                    let _ = self.toggleterm.exited(&kind);
+                    self.message = "Terminal session exited; reopen to start a new one".into();
+                } else {
+                    self.buffer_picker = None;
+                }
+            }
+            TerminalAction::Hide => {}
+            TerminalAction::Error(error) => self.message = error,
+        }
+    }
+
+    fn poll_terminals(&mut self) {
+        let mut ended = Vec::new();
+        for (kind, session) in &mut self.terminals {
+            match session.poll() {
+                Ok(true) => ended.push(kind.clone()),
+                Ok(false) => {},
+                Err(error) => {
+                    self.message = format!("Terminal process error: {error}");
+                    ended.push(kind.clone());
+                }
+            }
+        }
+        for kind in ended {
+            self.terminals.remove(&kind);
+            let _ = self.toggleterm.exited(&kind);
+            self.message = format!("{kind} terminal exited");
         }
     }
 
@@ -992,6 +1092,8 @@ impl Editor {
                 self.message = "Syntax highlighting disabled".into();
             }
             "tree" | "tree toggle" => self.toggle_tree(),
+            "lazygit" => self.terminal_binding("space g"),
+            "terminal" => self.terminal_binding("space t"),
             "buffers" | "ls" => self.open_buffer_picker(),
             "bn" | "bnext" => self.cycle_buffer(true),
             "bp" | "bprev" => self.cycle_buffer(false),
@@ -1088,9 +1190,33 @@ impl Editor {
     }
 
     fn key(&mut self, key: KeyEvent, page_height: usize) {
+        let shortcut = popup_shortcut(key);
+        // A visible terminal receives every key, including Escape, instead of
+        // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
+        // the PTY; the session continues while hidden.
+        if let Ok(Some(active)) = self.toggleterm.active() {
+            if shortcut.as_deref().is_some_and(|name| {
+                self.toggleterm.dismiss(name).unwrap_or(false)
+            }) {
+                let _ = self.toggleterm.hide();
+                return;
+            }
+            if let Some(session) = self.terminals.get_mut(&active) {
+                if let Err(error) = session.input(key) {
+                    self.message = format!("PTY input: {error}");
+                }
+            }
+            return;
+        }
         if self.prompt.is_some() {
             self.prompt_key(key);
             return;
+        }
+        if let Some(ref name) = shortcut {
+            if self.toggleterm.binding(name).ok().flatten().is_some() {
+                self.terminal_binding(name);
+                return;
+            }
         }
         // Ctrl+P opens/closes the existing centered buffer search popup.
         // Check it before the buffer picker and focused Lua tree so the
@@ -1234,6 +1360,17 @@ impl Editor {
         if self.sequence != Sequence::None {
             let sequence = std::mem::take(&mut self.sequence);
             let count = self.count.take();
+            // Lua owns the leader bindings. Any new "space x" mapping in
+            // plugins/toggleterm.lua works without changing this dispatcher.
+            if sequence == Sequence::Leader {
+                if let KeyCode::Char(c) = key.code {
+                    let binding = format!("space {}", c.to_ascii_lowercase());
+                    if self.toggleterm.binding(&binding).ok().flatten().is_some() {
+                        self.terminal_binding(&binding);
+                        return;
+                    }
+                }
+            }
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
@@ -1465,6 +1602,19 @@ impl Editor {
             }
         }
 
+        let active_terminal = self.toggleterm.active().ok().flatten();
+        let popup_rect = active_terminal.as_ref()
+            .filter(|kind| self.terminals.contains_key(kind.as_str()))
+            .and_then(|_| terminal_rect(cols, height));
+        if let Some(old) = self.screen.terminal.set_rect(popup_rect) {
+            // Repaint only the previously covered region when hiding.
+            for y in old.y as usize..old.y as usize + old.height as usize {
+                if let Some(line) = self.screen.lines.get_mut(y) { *line = None; }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) { *line = None; }
+                self.screen.finder.invalidate_underpaint(old.x as usize, y, old.width as usize);
+            }
+        }
+
         let mut selected_tree_row = 0;
         let mut search_cursor: Option<usize> = None;
         if sidebar_width > 0 {
@@ -1511,6 +1661,7 @@ impl Editor {
                     // sidebar just repainted it, the popup must redraw that
                     // portion even when its own text is unchanged.
                     self.screen.finder.invalidate_underpaint(0, y, sidebar_width);
+                    self.screen.terminal.invalidate_underpaint(0, y, sidebar_width);
                 }
             }
         }
@@ -1546,6 +1697,7 @@ impl Editor {
                     ResetColor
                 )?;
                 self.screen.finder.invalidate_underpaint(sidebar_width, y, gutter_width);
+                self.screen.terminal.invalidate_underpaint(sidebar_width, y, gutter_width);
             }
             if paint_text {
                 queue!(output, MoveTo((sidebar_width + gutter_width) as u16, y as u16), ResetColor)?;
@@ -1589,6 +1741,9 @@ impl Editor {
                     queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
                 }
                 self.screen.finder.invalidate_underpaint(
+                    sidebar_width + gutter_width, y, text_width
+                );
+                self.screen.terminal.invalidate_underpaint(
                     sidebar_width + gutter_width, y, text_width
                 );
             }
@@ -1642,7 +1797,7 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → b Buffers | f Files | o Panels | v Visual | q Quit".into(),
+                    Sequence::Leader => "SPC → b Buffers | f Files | g LazyGit | t Terminal | o Panels | v Visual | q Quit".into(),
                     Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | s Save All | d Close".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
@@ -1674,7 +1829,24 @@ impl Editor {
             }
         }
 
+        // The terminal is composed above both editor and fuzzy popups, and
+        // never forwards child cursor-control codes to the outer terminal.
+        if let (Some(rect), Some(kind)) = (popup_rect, active_terminal.as_ref()) {
+            if let Some(session) = self.terminals.get_mut(kind) {
+                if let Err(error) = session.resize(rect) {
+                    self.message = format!("PTY resize: {error}");
+                }
+                self.screen.terminal.paint(output, rect, session)?;
+            }
+        }
+
         let (x, y) = match &self.prompt {
+            _ if popup_rect.is_some() => {
+                let rect = popup_rect.unwrap();
+                let kind = active_terminal.as_ref().unwrap();
+                let (x, y) = self.terminals.get(kind).unwrap().cursor(rect);
+                (x as usize, y)
+            },
             Some(Prompt::SaveAs(name)) => ("Save file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Open(name)) => ("Find file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
@@ -1708,6 +1880,20 @@ impl Editor {
     }
 }
 
+
+// Convert terminal key events into Lua plugin binding names. This is a
+// generic dispatcher, not a hardcoded terminal-plugin shortcut table.
+fn popup_shortcut(key: KeyEvent) -> Option<String> {
+    let KeyCode::Char(c) = key.code else { return None };
+    let modifiers = key.modifiers;
+    if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+        Some(format!("ctrl-{}", c.to_ascii_lowercase()))
+    } else if modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL) {
+        Some(format!("alt-{}", c.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
 
 fn tree_sidebar_width(columns: usize, visible: bool) -> usize {
     if !visible || columns < 48 { return 0; }
@@ -1917,11 +2103,21 @@ fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
     let mut editor = Editor::new(doc);
     while editor.running {
+        // A PTY can produce output without key presses. Event polling
+        // ensures interactive TUI refreshes while keeping idle CPU low.
+        editor.poll_terminals();
         editor.draw(&mut stdout)?;
-        if let Event::Key(key) = event::read()? {
-            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                let height = terminal::size()?.1.saturating_sub(2) as usize;
-                editor.key(key, height);
+        let delay = if editor.terminals.is_empty() {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(24)
+        };
+        if event::poll(delay)? {
+            if let Event::Key(key) = event::read()? {
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    let height = terminal::size()?.1.saturating_sub(2) as usize;
+                    editor.key(key, height);
+                }
             }
         }
     }

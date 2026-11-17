@@ -60,6 +60,8 @@ shows incomplete sequences.
 | Toggle last buffer | **`SPC b l`** |
 | Close current buffer (only if saved) | **`SPC b d`** |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
+| Floating LazyGit (Lua toggleterm plugin) | **`SPC g`** |
+| Floating project shell | **`Ctrl+T`** or **`SPC t`** |
 | Save current buffer | **`SPC f s`** |
 | Save all modified named buffers | **`SPC b s`** or **`:wa`** / **`:wall`** |
 | Quit (prompts if modified) | **`SPC q q`** |
@@ -84,6 +86,36 @@ From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
 Opening another file does **not** require saving the current one: unsaved changes
 stay in their own buffer. Start an empty document with `remacs` and save it
 via `SPC f s`.
+
+## Floating terminal & LazyGit (Lua plugin)
+
+Remacs bundles **`plugins/toggleterm.lua`**, inspired by the configuration
+in `dme86/neovim/lua/plugins/toggleterm.lua`. Unlike a shell command that
+takes over the whole screen, it opens a centered popup with a real interactive
+PTY, an ANSI/VT100 renderer and a curved border.
+
+- **`SPC g`** opens **LazyGit** in the current project's Git root.
+- **`Ctrl+T`** (or **`SPC t`**) opens your `$SHELL` in the project root.
+- **`Ctrl+T` while a popup is active** hides it and returns to the editor.
+  The process continues in the background; reopening resumes its state.
+- Inside the popup, keys like arrows, Enter, Escape and Ctrl combinations
+  are sent directly to the child program. `q` exits LazyGit normally.
+
+The Lua plugin **owns the bindings, command selection, titles and lifecycle**.
+The small Rust host only supplies PTY sessions, keyboard input and drawing,
+as it does for other editor capabilities. The source is embedded at compile
+time so `cargo install --path .` works without shipping loose Lua files.
+Modify `plugins/toggleterm.lua` and rebuild to customize bindings.
+
+LazyGit is an **optional external program**, not bundled with Remacs. On macOS,
+for example: `brew install lazygit`. If it is missing, Remacs shows an error
+and continues editing normally.
+
+Each popup session keeps its own working directory and stays alive when hidden.
+Terminal output is buffered in a bounded channel; Rust repaints only changed
+popup lines and restores the editor after the popup closes. The terminal
+is deliberately separate from Remacs' file buffers and doesn't alter or
+automatically save modified documents. Restarting Remacs ends its PTY sessions.
 
 ## Persistent jumps and named marks
 
