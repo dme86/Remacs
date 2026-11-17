@@ -74,7 +74,8 @@ impl JumpManager {
         let saved = Saved {
             history: saved.history.into_iter()
                 .filter(|entry| entry.path.is_absolute())
-                .take(MAX_JUMPS).collect(),
+                .rev().take(MAX_JUMPS).collect::<Vec<_>>()
+                .into_iter().rev().collect(),
             cursor: None,
             changes: saved.changes.into_iter().filter(|entry| entry.path.is_absolute())
                 .rev().take(MAX_CHANGES).collect::<Vec<_>>()
@@ -88,7 +89,6 @@ impl JumpManager {
     }
 
     pub fn entries(&self) -> &[Location] { &self.saved.history }
-    pub fn cursor(&self) -> Option<usize> { self.saved.cursor }
     /// Whether a forward jump is possible after Ctrl+O. This is also used
     /// to interpret the ambiguous Tab/Ctrl+I byte in legacy terminals.
     pub fn can_forward(&self) -> bool {
@@ -96,29 +96,24 @@ impl JumpManager {
     }
     pub fn changes(&self) -> &[Location] { &self.saved.changes }
 
-    // History is a timeline, not a stream of every keystroke. Coalesce
-    // repeated edits/moves on the same line and discard forward history
-    // only when recording a *new* location after travelling backward.
+    // Explicit jumps preserve distinct columns, including same-line mark
+    // and definition jumps. Only consecutive identical origins coalesce.
     pub fn remember(&mut self, location: Location) -> io::Result<()> {
         if !location.path.is_absolute() { return Ok(()); }
-        if let Some(index) = self.saved.cursor {
+        // A new jump branches from the current history entry, even when
+        // its origin exactly matches that entry. Otherwise Ctrl+O from the
+        // new target would skip its origin and retain an unrelated future.
+        let truncated = self.saved.cursor.is_some_and(|index| {
             if index + 1 < self.saved.history.len() {
-                if self.saved.history[index] == location {
-                    return Ok(());
-                }
                 self.saved.history.truncate(index + 1);
+                true
+            } else {
+                false
             }
-        }
-        if let Some(last) = self.saved.history.last_mut() {
-            if last.path == location.path && last.row == location.row {
-                if *last == location {
-                    self.saved.cursor = self.saved.history.len().checked_sub(1);
-                    return Ok(());
-                }
-                *last = location;
-                self.saved.cursor = self.saved.history.len().checked_sub(1);
-                return self.persist();
-            }
+        });
+        if self.saved.history.last() == Some(&location) {
+            self.saved.cursor = self.saved.history.len().checked_sub(1);
+            return if truncated { self.persist() } else { Ok(()) };
         }
         self.saved.history.push(location);
         if self.saved.history.len() > MAX_JUMPS {
@@ -130,6 +125,8 @@ impl JumpManager {
 
     /// Return older jump; capture the live origin at the newest end so a
     /// later forward jump can return to exactly where the user started.
+    // Traversal cursors are session-only (load resets them), so moving
+    // through existing entries needs no disk write or synchronous fsync.
     pub fn back(&mut self, current: Option<Location>) -> io::Result<Option<Location>> {
         if self.saved.cursor == self.saved.history.len().checked_sub(1) {
             if let Some(current) = current { self.remember(current)?; }
@@ -137,7 +134,6 @@ impl JumpManager {
         let Some(index) = self.saved.cursor else { return Ok(None); };
         if index == 0 { return Ok(None); }
         self.saved.cursor = Some(index - 1);
-        self.persist()?;
         Ok(self.saved.history.get(index - 1).cloned())
     }
 
@@ -145,14 +141,13 @@ impl JumpManager {
         let Some(index) = self.saved.cursor else { return Ok(None); };
         if index + 1 >= self.saved.history.len() { return Ok(None); }
         self.saved.cursor = Some(index + 1);
-        self.persist()?;
         Ok(self.saved.history.get(index + 1).cloned())
     }
 
-    pub fn at(&mut self, index: usize) -> io::Result<Option<Location>> {
+    #[cfg(test)]
+    fn at(&mut self, index: usize) -> io::Result<Option<Location>> {
         if index >= self.saved.history.len() { return Ok(None); }
         self.saved.cursor = Some(index);
-        self.persist()?;
         Ok(self.saved.history.get(index).cloned())
     }
 
@@ -184,7 +179,6 @@ impl JumpManager {
     pub fn older_change(&mut self) -> io::Result<Option<Location>> {
         if self.change_cursor == 0 { return Ok(None); }
         self.change_cursor = self.change_cursor.saturating_sub(1);
-        self.persist()?;
         Ok(self.saved.changes.get(self.change_cursor).cloned())
     }
 
@@ -192,7 +186,6 @@ impl JumpManager {
     pub fn newer_change(&mut self) -> io::Result<Option<Location>> {
         if self.change_cursor + 1 >= self.saved.changes.len() { return Ok(None); }
         self.change_cursor += 1;
-        self.persist()?;
         Ok(self.saved.changes.get(self.change_cursor).cloned())
     }
 
@@ -338,11 +331,85 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_edits_same_line_are_coalesced() {
+    fn new_jump_from_exact_history_entry_discards_future_and_keeps_origin() {
+        let mut store = JumpManager::memory_only();
+        for row in [1, 12, 22] { store.remember(place("main.rs", row, 0)).unwrap(); }
+        assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 12, 0)));
+        store.remember(place("main.rs", 12, 0)).unwrap();
+        assert_eq!(store.entries().len(), 2);
+        assert!(!store.can_forward());
+        assert_eq!(store.back(Some(place("target.rs", 4, 2))).unwrap(),
+            Some(place("main.rs", 12, 0)));
+        assert_eq!(store.forward().unwrap(), Some(place("target.rs", 4, 2)));
+    }
+
+    #[test]
+    fn successive_same_line_jumps_retain_every_exact_column() {
+        let mut store = JumpManager::memory_only();
+        store.remember(place("main.rs", 8, 1)).unwrap();
+        store.remember(place("main.rs", 8, 30)).unwrap();
+        assert_eq!(store.back(Some(place("main.rs", 8, 50))).unwrap(),
+            Some(place("main.rs", 8, 30)));
+        assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 8, 1)));
+        assert_eq!(store.forward().unwrap(), Some(place("main.rs", 8, 30)));
+        assert_eq!(store.forward().unwrap(), Some(place("main.rs", 8, 50)));
+    }
+
+    #[test]
+    fn traversal_does_not_rewrite_persisted_history() {
+        let file = std::env::temp_dir().join(format!(
+            "remacs-jump-traversal-{}-{}.json", std::process::id(),
+            TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut store = JumpManager::from_path(file.clone());
+        for row in [1, 12, 22] {
+            store.remember(place("main.rs", row, 0)).unwrap();
+            store.record_change(place("main.rs", row, 0)).unwrap();
+        }
+        // Removing the file also catches rewrites whose bytes would be
+        // unchanged: navigating must neither recreate it nor touch disk.
+        fs::remove_file(&file).unwrap();
+        assert!(store.back(None).unwrap().is_some());
+        assert!(store.forward().unwrap().is_some());
+        assert!(store.at(0).unwrap().is_some());
+        assert!(store.older_change().unwrap().is_some());
+        assert!(store.older_change().unwrap().is_some());
+        assert!(store.newer_change().unwrap().is_some());
+        assert!(!file.exists());
+        // Branching must persist even when the origin exactly matches
+        // the historical entry and truncation is the only mutation.
+        store.remember(place("main.rs", 1, 0)).unwrap();
+        let restored = JumpManager::from_path(file.clone());
+        assert_eq!(restored.entries(), &[place("main.rs", 1, 0)]);
+        fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn loading_oversized_history_keeps_the_newest_locations() {
+        let file = std::env::temp_dir().join(format!(
+            "remacs-jump-bounds-{}-{}.json", std::process::id(),
+            TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let saved = Saved {
+            history: (0..350).map(|row| place("main.rs", row, 0)).collect(),
+            ..Saved::default()
+        };
+        fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let restored = JumpManager::from_path(file.clone());
+        assert_eq!(restored.entries().len(), MAX_JUMPS);
+        assert_eq!(restored.entries().first().unwrap().row, 150);
+        assert_eq!(restored.entries().last().unwrap().row, 349);
+        fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn consecutive_identical_jump_origins_are_deduplicated() {
         let mut store = JumpManager::memory_only();
         store.remember(place("lib.rs", 8, 1)).unwrap();
+        store.remember(place("lib.rs", 8, 1)).unwrap();
         store.remember(place("lib.rs", 8, 8)).unwrap();
-        assert_eq!(store.entries(), &[place("lib.rs", 8, 8)]);
+        store.remember(place("lib.rs", 8, 8)).unwrap();
+        assert_eq!(store.entries(), &[place("lib.rs", 8, 1), place("lib.rs", 8, 8)]);
     }
 
     #[test]

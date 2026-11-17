@@ -204,6 +204,22 @@ local function toggle_dir(node, expand)
   refresh_tree()
 end
 
+-- The host passes sanitized, single-line UTF-8. Append in one operation so
+-- a paste ranks matches once, and can never act as tree navigation commands.
+function tree.paste_query(text)
+  if not tree.searching then return end
+  local available = math.max(0, 128 - #tree.query)
+  local last = math.min(#text, available)
+  if last < #text then
+    -- Round a truncated prefix down to a complete Unicode character.
+    last = utf8.offset(text, 0, last + 1) - 1
+  end
+  if last > 0 then
+    tree.query = tree.query .. text:sub(1, last)
+    update_results()
+  end
+end
+
 function tree.on_key(key)
   if tree.searching then
     if key == "esc" then
@@ -226,7 +242,7 @@ function tree.on_key(key)
     elseif key == "ctrl-u" then
       tree.query = ""
       update_results()
-    elseif utf8.len(key) == 1 and #tree.query < 128 then
+    elseif utf8.len(key) == 1 and #tree.query + #key <= 128 then
       tree.query = tree.query .. key
       update_results()
     end

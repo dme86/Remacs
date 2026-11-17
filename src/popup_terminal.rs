@@ -15,7 +15,7 @@ use crossterm::{
     queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, PtySystem};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use unicode_width::UnicodeWidthChar;
 
 const BG: Color = Color::Rgb { r: 33, g: 34, b: 41 };

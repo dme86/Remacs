@@ -148,6 +148,15 @@ impl TreePlugin {
         self.key_action(key)
     }
 
+    /// Append literal, single-line text to an active finder query. Outside
+    /// search this is a no-op and never dispatches tree navigation shortcuts.
+    /// The host removes controls/newlines; Lua enforces the UTF-8 byte limit.
+    pub fn paste_query(&self, text: &str) -> mlua::Result<()> {
+        let plugin = self.plugin()?;
+        let paste: Function = plugin.get("paste_query")?;
+        paste.call(text)
+    }
+
     pub fn view(&self, height: usize) -> mlua::Result<TreeView> {
         let plugin = self.plugin()?;
         let render: Function = plugin.get("render")?;
@@ -271,6 +280,47 @@ mod tests {
         assert!(cleared.finder.as_ref().is_some_and(|finder| finder.query.is_empty()));
         assert!(cleared.lines.iter().any(|line| line.contains("camel.txt")),
             "clearing the query should restore initial suggestions");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn finder_paste_is_literal_unicode_and_bounded() {
+        let temp = std::env::temp_dir().join(format!(
+            "remacs-fuzzy-paste-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("café.txt"), "text").unwrap();
+        fs::write(temp.join("qj.txt"), "text").unwrap();
+        let mut tree = TreePlugin::new(&temp).unwrap();
+        tree.toggle().unwrap();
+        let selected = tree.view(10).unwrap().selected;
+        tree.paste_query("qj/f").unwrap();
+        assert!(tree.visible && tree.focused);
+        assert_eq!(tree.view(10).unwrap().selected, selected);
+        assert!(tree.view(10).unwrap().finder.is_none());
+
+        tree.on_key("/").unwrap();
+        tree.paste_query("café").unwrap();
+        let finder = tree.view(10).unwrap().finder.unwrap();
+        assert_eq!(finder.query, "café");
+        assert_eq!(finder.matches, vec!["café.txt"]);
+        tree.on_key("ctrl-u").unwrap();
+        tree.paste_query("qj").unwrap();
+        let finder = tree.view(10).unwrap().finder.unwrap();
+        assert_eq!(finder.query, "qj");
+        assert_eq!(finder.matches, vec!["qj.txt"]);
+        assert!(tree.visible && tree.focused);
+
+        tree.on_key("ctrl-u").unwrap();
+        tree.paste_query(&"é".repeat(63)).unwrap();
+        tree.paste_query("界x").unwrap();
+        assert_eq!(tree.view(10).unwrap().finder.unwrap().query, "é".repeat(63));
+        tree.paste_query("é界").unwrap();
+        assert_eq!(tree.view(10).unwrap().finder.unwrap().query, "é".repeat(64));
+        tree.paste_query("overflow").unwrap();
+        assert_eq!(tree.view(10).unwrap().finder.unwrap().query.len(), 128);
         let _ = fs::remove_dir_all(temp);
     }
 

@@ -42,19 +42,19 @@ impl Document {
         let path = self.path.as_ref().ok_or_else(|| io::Error::new(
             io::ErrorKind::InvalidInput, "no filename specified"
         ))?;
-        let contents = self.lines.iter()
-            .map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join(self.newline);
-        fs::write(path, contents)?;
+        fs::write(path, self.lsp_text())?;
         self.dirty = false;
         Ok(())
     }
 
     /// Serialize only when the LSP client observes a changed revision.
     pub fn lsp_text(&self) -> String {
-        self.lines.iter().map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>().join(self.newline)
+        let mut text = String::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            if row > 0 { text.push_str(self.newline); }
+            text.extend(line.iter());
+        }
+        text
     }
 
     pub fn line(&self) -> &[char] {
@@ -140,21 +140,6 @@ impl Document {
             self.lines[self.row].extend(tail);
         } else { return; }
         self.dirty = true;
-    }
-
-    pub fn kill_to_end(&mut self) -> Option<String> {
-        if self.col < self.line().len() {
-            self.invalidate_syntax_from(self.row);
-            let text: String = self.lines[self.row].drain(self.col..).collect();
-            self.dirty = true;
-            Some(text)
-        } else if self.row + 1 < self.lines.len() {
-            self.invalidate_syntax_from(self.row);
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].extend(next);
-            self.dirty = true;
-            Some("\n".to_string())
-        } else { None }
     }
 
     pub fn delete_line(&mut self) -> Vec<char> {
@@ -277,8 +262,29 @@ impl Document {
         self.invalidate_syntax_from(range.start.row);
     }
 
+    /// Insert a paste as one document change. Splice the surrounding text only
+    /// once so inserting a large paste before a long suffix stays linear.
     pub fn insert_text(&mut self, text: &str) {
-        for ch in text.chars() { self.insert(ch); }
+        if text.is_empty() { return; }
+        let mut inserted = text.split('\n').map(|line| line.chars().collect::<Vec<_>>());
+        let first = inserted.next().expect("split always yields a first line");
+        let first_len = first.len();
+        let mut following: Vec<Vec<char>> = inserted.collect();
+        let start_row = self.row;
+        if following.is_empty() {
+            self.lines[self.row].splice(self.col..self.col, first);
+            self.col += first_len;
+        } else {
+            let tail = self.lines[self.row].split_off(self.col);
+            self.lines[self.row].extend(first);
+            self.row += following.len();
+            let last = following.last_mut().expect("following lines are nonempty");
+            self.col = last.len();
+            last.extend(tail);
+            self.lines.splice(start_row + 1..start_row + 1, following);
+        }
+        self.dirty = true;
+        self.invalidate_syntax_from(start_row);
     }
 }
 
@@ -299,10 +305,51 @@ mod tests {
     }
 
     #[test]
-    fn delete_and_kill() {
+    fn bulk_insert_preserves_unicode_prefix_suffix_and_cursor() {
+        let mut doc = Document::from_text("α世界ω\nnext");
+        doc.col = 1;
+        doc.insert_text("hé\nλ\n");
+        assert_eq!(doc.lsp_text(), "αhé\nλ\n世界ω\nnext");
+        assert_eq!((doc.row, doc.col), (2, 0));
+        assert_eq!(doc.revision, 1);
+        assert_eq!(doc.take_syntax_invalidation(), Some(0));
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn bulk_insert_matches_character_edits() {
+        for text in ["hello", "世界", "\n", "a\nb", "\n\nlast", "end\n"] {
+            let mut bulk = Document::from_text("start\nprefixsuffix\nend");
+            bulk.row = 1;
+            bulk.col = 6;
+            let mut individual = Document::from_text("start\nprefixsuffix\nend");
+            individual.row = 1;
+            individual.col = 6;
+            bulk.insert_text(text);
+            for ch in text.chars() { individual.insert(ch); }
+            assert_eq!(bulk.lines, individual.lines, "{text:?}");
+            assert_eq!((bulk.row, bulk.col), (individual.row, individual.col), "{text:?}");
+            assert_eq!(bulk.revision, 1);
+        }
+    }
+
+    #[test]
+    fn empty_paste_leaves_document_unchanged() {
+        let mut doc = Document::from_text("abc");
+        doc.col = 1;
+        doc.insert_text("");
+        assert_eq!(doc.lsp_text(), "abc");
+        assert_eq!((doc.row, doc.col), (0, 1));
+        assert!(!doc.dirty);
+        assert_eq!(doc.revision, 0);
+        assert_eq!(doc.take_syntax_invalidation(), None);
+    }
+
+    #[test]
+    fn delete_joins_lines_and_removes_characters() {
         let mut doc = Document::from_text("abc\ndef");
         doc.end();
-        assert_eq!(doc.kill_to_end().as_deref(), Some("\n"));
+        doc.delete();
         assert_eq!(doc.lines[0].iter().collect::<String>(), "abcdef");
         doc.home();
         doc.delete();

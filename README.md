@@ -14,7 +14,8 @@ No GUI, no menus, no daemon, and no configuration required to start editing.
 The default keymap is **Vim-style modal editing** with a **Doom-inspired Space leader**.
 
 This is an independent implementation, **not** a port of MicroEmacs' C code.
-The first milestone focuses on the essentials; the Lua file-tree plugin is bundled and LSP is a future goal.
+It includes multiple buffers, Lua plugins, persistent jumps, native clipboard
+integration and asynchronous LSP navigation.
 
 ## Get started
 
@@ -83,11 +84,16 @@ clipboard, so you can copy text in a browser or another app and paste it into
 Remacs. If the clipboard is inaccessible (for example, on a headless machine),
 the internal register continues to work. The existing `yy` → `p` workflow
 retains its **linewise** behavior when the clipboard has not been replaced.
+An empty clipboard or one containing only an image inserts nothing; it never
+replays an older yank. The internal register is used when clipboard access fails.
 
 Terminal paste (e.g. **Cmd+V** in macOS terminals, or **Ctrl+Shift+V** on
 Linux) uses bracketed paste. Multi-line UTF-8 text is inserted literally,
 without triggering Normal-mode commands, and is one undoable edit when in
-Insert mode. Clipboard access is lazy; no GUI clipboard connection is needed
+Insert mode, with separate undo steps for text typed before and after the paste.
+In file/command prompts and all search pickers, paste inserts the first line
+as literal input; press Enter yourself to submit it. Clipboard access is lazy;
+no GUI clipboard connection is needed
 until the first copy or `p`. Linux Wayland support uses the compositor's
 `ext-data-control-v1` or `wlr-data-control` protocol (or XWayland fallback).
 
@@ -203,7 +209,13 @@ default); no LSP server is started for non-Rust files. After closing a buffer,
 Remacs informs the language server. External tools such as rust-analyzer are
 not bundled with Remacs.
 
-**Roadmap:** This PR establishes LSP Core (definition, hover and synchronization).
+Repeated navigation requests are deduplicated; superseded requests are canceled
+and outstanding requests have a timeout and a fixed queue limit. Failed or
+unresponsive initialization is reported instead of staying stuck at startup.
+Workspace configuration is cached, so idle ticks and cursor motions do not
+repeat filesystem root discovery. Mason updates invalidate the cache.
+
+**Roadmap:** LSP Core covers definition, hover and synchronization.
 Interactive completion, diagnostics and refactoring actions are follow-up
 milestones, not included in this implementation. Language servers and
 keybindings remain configured in Lua; add more languages to
@@ -258,7 +270,8 @@ either location with just a shortcut.
 **Example:** edit main.rs, switch to document.rs and edit again. Repeating
 **g;** visits the most recent edit locations even across files. **Ctrl+O**
 moves back through major navigation positions, **Alt+Right** moves forward.
-When a target file is closed, Remacs automatically reopens it. If it is
+When a target file is closed, Remacs automatically reopens it. Missing or
+unreadable files are skipped when traversing the jumplist. If a file is
 already open, Remacs reuses that exact buffer, including unsaved edits.
 
 Locations persist as a small JSON file:
@@ -269,7 +282,10 @@ Locations persist as a small JSON file:
 Only absolute file paths, line/column coordinates, and named marks are
 saved—not unsaved text, document buffers, or undo snapshots. The history
 holds at most **200 jumps and 200 edits**; repeated changes on the same
-line are collapsed. Removed files do not cause placeholder files to be
+line are collapsed. Distinct jump columns on the same line remain separate,
+and new jumps after going backward discard the previous forward branch.
+Traversing existing history does not rewrite the history file.
+Removed files do not cause placeholder files to be
 created.
 
 **Difference from Vim:** Vim's changelist is traditionally per buffer and
@@ -439,10 +455,12 @@ The embedded grammars have their own third-party licenses; see
 **Included in v0.1:** opening, editing, and saving text; Vim-style Normal/Insert
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
 Doom-inspired leader shortcuts, hybrid relative line numbers, current-line highlighting,
-built-in syntax highlighting, a bundled Lua file-tree plugin, status line, and minibuffer.
+built-in syntax highlighting, multiple buffers, persistent jumps and marks,
+native clipboard integration, asynchronous LSP definition/hover, a Lua server
+manager, a file finder, floating terminals, status line, and minibuffer.
 
-**Not yet included:** LSP, search,
-multiple buffers, tabs, splits, mouse support, or menus. This release is not
+**Not yet included:** in-buffer text search, LSP completion/diagnostics/refactoring,
+tabs, splits, mouse support, or menus. This release is not
 intended to replace a full-featured editor yet. Undo currently keeps up to 100 in-memory whole-document snapshots;
 some complex Unicode grapheme clusters and control sequences need more work.
 

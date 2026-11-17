@@ -33,7 +33,13 @@ impl Clipboard {
         }
         #[cfg(not(test))]
         {
-            self.system()?.get_text().map_err(|error| error.to_string())
+            match self.system()?.get_text() {
+                Ok(text) => Ok(text),
+                // A cleared clipboard or image is a successful read with no
+                // text, not a reason to replay the previous internal register.
+                Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+                Err(error) => Err(error.to_string()),
+            }
         }
     }
 

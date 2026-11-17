@@ -103,7 +103,6 @@ impl Manager {
 
     pub fn tools(&self) -> &[Tool] { &self.tools }
     pub fn log_path(&self) -> PathBuf { self.root.join("install.log") }
-    pub fn root(&self) -> &Path { &self.root }
 
     pub fn has(&self, tool: &Tool) -> bool {
         self.root.join("bin").join(&tool.command[0]).is_file()

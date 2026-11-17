@@ -92,21 +92,25 @@ struct Snapshot {
     lines: Vec<Vec<char>>,
     row: usize,
     col: usize,
+    bytes: usize,
 }
 
 impl Snapshot {
     fn capture(doc: &Document) -> Self {
+        let lines = doc.lines.clone();
+        let bytes = lines.iter().map(|line| {
+            std::mem::size_of::<Vec<char>>()
+                + line.capacity() * std::mem::size_of::<char>()
+        }).sum();
         Self {
-            lines: doc.lines.clone(),
+            lines,
             row: doc.row,
             col: doc.col,
+            bytes,
         }
     }
     fn approx_bytes(&self) -> usize {
-        self.lines.iter().map(|line| {
-            std::mem::size_of::<Vec<char>>()
-                + line.capacity() * std::mem::size_of::<char>()
-        }).sum()
+        self.bytes
     }
 
     fn restore(self, doc: &mut Document) {
@@ -219,10 +223,11 @@ struct Editor {
     buffer_picker: Option<BufferPicker>,
     mason_picker: Option<BufferPicker>,
     hover_popup: Option<String>,
-    mason_plugin: MasonPlugin,
     mason: MasonManager,
     lsp_plugin: LspPlugin,
     lsp: LspManager,
+    lsp_document_versions: Option<Vec<(PathBuf, u64)>>,
+    lsp_present: HashSet<PathBuf>,
     jumps: JumpManager,
     toggleterm: ToggleTermPlugin,
     terminals: HashMap<String, TerminalSession>,
@@ -265,10 +270,11 @@ impl Editor {
             buffer_picker: None,
             mason_picker: None,
             hover_popup: None,
-            mason_plugin,
             mason,
             lsp_plugin: LspPlugin::new().expect("bundled plugins/lsp.lua"),
             lsp: LspManager::default(),
+            lsp_document_versions: None,
+            lsp_present: HashSet::new(),
             // Unit tests must not write to the real user's persistent state
             // or race each other while modifying the global jump history.
             jumps: if cfg!(test) {
@@ -409,10 +415,23 @@ impl Editor {
     }
 
     fn sync_lsp_documents(&mut self) {
+        // Cursor movement and idle ticks do not change document identity or
+        // text. Keep polling requests, but avoid filesystem/Lua work entirely.
+        let versions: Vec<_> = std::iter::once(&self.doc)
+            .chain(self.slots.iter().flatten().map(|buffer| &buffer.doc))
+            .filter_map(|doc| doc.path.as_ref().map(|path| (path.clone(), doc.revision)))
+            .collect();
+        if self.lsp_document_versions.as_ref() == Some(&versions)
+            && !self.lsp.has_starting_servers()
+        {
+            self.lsp.flush(&self.lsp_present);
+            return;
+        }
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let docs = std::iter::once(&self.doc)
             .chain(self.slots.iter().filter_map(|entry| entry.as_ref().map(|b| &b.doc)));
         let mut present = HashSet::new();
+        let mut synced = true;
         for doc in docs {
             let Some(path) = doc.path.as_ref() else { continue };
             present.insert(lsp::absolute(path));
@@ -421,14 +440,21 @@ impl Editor {
                 Ok(None) => continue,
                 Err(error) => {
                     self.message = format!("LSP configuration error: {error}");
+                    synced = false;
                     continue;
                 }
             };
             if let Err(error) = self.lsp.sync(&config, path, doc.revision, ||doc.lsp_text()) {
                 self.message = format!("{} LSP: {error}", config.language);
+                synced = false;
             }
         }
         self.lsp.flush(&present);
+        self.lsp_present = present;
+        // A starting server has not received didOpen yet. Retry after its
+        // initialize response even when no text has changed in the meantime.
+        self.lsp_document_versions = (synced && !self.lsp.has_starting_servers())
+            .then_some(versions);
     }
 
     fn apply_lsp_definition(&mut self, target: lsp::Target) {
@@ -578,6 +604,8 @@ impl Editor {
         for event in self.mason.poll() {
             match event {
                 MasonEvent::Done { id, language, updated } => {
+                    self.lsp_plugin.clear_cache();
+                    self.lsp_document_versions = None;
                     self.lsp.reset_language(&language);
                     self.message = format!("Mason {} {id}; LSP ready to restart",
                         if updated { "updated" } else { "installed" });
@@ -682,18 +710,44 @@ impl Editor {
 
     fn jump_back(&mut self) {
         let current = self.current_location();
-        match self.jumps.back(current) {
-            Ok(Some(place)) => { self.visit_location(place, false); }
-            Ok(None) => self.message = "At oldest jump".into(),
-            Err(error) => self.message = format!("Jump history error: {error}"),
+        let mut result = self.jumps.back(current);
+        let mut skipped = false;
+        loop {
+            match result {
+                Ok(Some(place)) => {
+                    if self.visit_location(place, false) { return; }
+                    skipped = true;
+                    result = self.jumps.back(None);
+                }
+                Ok(None) => {
+                    if !skipped { self.message = "At oldest jump".into(); }
+                    return;
+                }
+                Err(error) => {
+                    self.message = format!("Jump history error: {error}");
+                    return;
+                }
+            }
         }
     }
 
     fn jump_forward(&mut self) {
-        match self.jumps.forward() {
-            Ok(Some(place)) => { self.visit_location(place, false); }
-            Ok(None) => self.message = "At newest jump".into(),
-            Err(error) => self.message = format!("Jump history error: {error}"),
+        let mut skipped = false;
+        loop {
+            match self.jumps.forward() {
+                Ok(Some(place)) => {
+                    if self.visit_location(place, false) { return; }
+                    skipped = true;
+                }
+                Ok(None) => {
+                    if !skipped { self.message = "At newest jump".into(); }
+                    return;
+                }
+                Err(error) => {
+                    self.message = format!("Jump history error: {error}");
+                    return;
+                }
+            }
         }
     }
 
@@ -1139,6 +1193,7 @@ impl Editor {
     }
 
     fn paste_value(&mut self, value: Register) {
+        if matches!(&value, Register::Text(text) if text.is_empty()) { return; }
         self.remember();
         match value {
             Register::Line(line) => self.doc.insert_line_below(line),
@@ -1155,13 +1210,14 @@ impl Editor {
     /// available (e.g. a remote/headless session), use Remacs' own register.
     fn paste_clipboard(&mut self) {
         let value = match self.clipboard.read() {
-            Ok(text) if !text.is_empty() => {
+            Ok(text) => {
+                if text.is_empty() { return; }
                 match self.register.as_ref() {
                     Some(register) if register.clipboard_text() == text => register.clone(),
                     _ => Register::Text(text),
                 }
             }
-            _ => match self.register.clone() {
+            Err(_) => match self.register.clone() {
                 Some(value) => value,
                 None => return,
             },
@@ -1181,17 +1237,49 @@ impl Editor {
             }
             return;
         }
-        if self.prompt.is_some() || self.buffer_picker.is_some()
-            || self.mason_picker.is_some()
-            || self.tree.as_ref().is_some_and(|tree| tree.focused)
-        {
+        // Paste into input fields literally. Newlines never execute commands
+        // or confirm a dialog; the user still presses Enter explicitly.
+        if let Some(prompt) = &mut self.prompt {
+            match prompt {
+                Prompt::Open(value) | Prompt::SaveAs(value) | Prompt::Command(value) => {
+                    value.extend(text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
+                        .filter(|ch| !ch.is_control()));
+                }
+                Prompt::Quit => {}
+            }
             return;
         }
+        if let Some(picker) = self.mason_picker.as_mut().or(self.buffer_picker.as_mut()) {
+            let remaining = 128usize.saturating_sub(picker.query.len());
+            let mut used = 0;
+            picker.query.extend(text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
+                .filter(|ch| !ch.is_control()).take_while(|ch| {
+                    used += ch.len_utf8();
+                    used <= remaining
+                }));
+            picker.selected = 0;
+            return;
+        }
+        if let Some(tree) = self.tree.as_ref().filter(|tree| tree.focused) {
+            let query: String = text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
+                .filter(|ch| !ch.is_control()).collect();
+            if let Err(error) = tree.paste_query(&query) {
+                self.message = format!("Tree paste: {error}");
+            }
+            return;
+        }
+        self.hover_popup = None;
+        self.sequence = Sequence::None;
+        self.count = None;
+        self.control_x = false;
         let text = normalize_pasted_text(text);
         match self.mode {
             Mode::Insert => {
-                self.insert_change();
+                self.remember();
                 self.doc.insert_text(&text);
+                // Both the paste and subsequent typing get their own undo
+                // group, even when the user was already inserting text.
+                self.insert_changed = false;
             }
             Mode::Visual => {
                 if let Some(range) = self.selection {
@@ -2221,7 +2309,7 @@ impl Editor {
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if finder_rect.is_some() => {
                 let rect = finder_rect.unwrap();
-                let query = mason_view.as_ref().or_else(|| buffer_view.as_ref()).or_else(|| {
+                let query = mason_view.as_ref().or(buffer_view.as_ref()).or_else(|| {
                     tree_view.as_ref().and_then(|view| view.finder.as_ref())
                 }).map_or("", |finder| finder.query.as_str());
                 let (x, y) = finder_cursor(rect, query);
@@ -3611,6 +3699,116 @@ mod tests {
         let mut editor = Editor::new(Document::from_text("two"));
         editor.pasted("hello");
         assert_eq!(editor.doc.lsp_text(), "thellowo");
+    }
+
+    #[test]
+    fn empty_clipboard_does_not_replay_stale_register() {
+        let mut editor = Editor::new(Document::from_text("one\ntwo"));
+        press(&mut editor, KeyCode::Char('y'));
+        press(&mut editor, KeyCode::Char('y'));
+        editor.clipboard.write("").unwrap();
+        press(&mut editor, KeyCode::Char('p'));
+        assert_eq!(editor.doc.lsp_text(), "one\ntwo");
+        assert!(!editor.doc.dirty);
+        assert!(editor.undo.is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_has_undo_boundaries_before_and_after() {
+        let mut editor = Editor::new(Document::empty());
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('a'));
+        editor.pasted("β\r\n世界");
+        press(&mut editor, KeyCode::Char('z'));
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.doc.lsp_text(), "aβ\n世界z");
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "aβ\n世界");
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "a");
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "");
+        editor.redo();
+        editor.redo();
+        editor.redo();
+        assert_eq!(editor.doc.lsp_text(), "aβ\n世界z");
+    }
+
+    #[test]
+    fn pasted_prompt_text_never_executes_commands_or_confirms_quit() {
+        let mut editor = Editor::new(Document::from_text("unchanged"));
+        editor.prompt = Some(Prompt::Command(String::new()));
+        editor.pasted("q!\r\nignored");
+        assert!(matches!(&editor.prompt, Some(Prompt::Command(value)) if value == "q!"));
+        assert!(editor.running);
+        editor.prompt = Some(Prompt::Open(String::new()));
+        editor.pasted("/tmp/世界.rs\nignored");
+        assert!(matches!(&editor.prompt, Some(Prompt::Open(value)) if value == "/tmp/世界.rs"));
+        editor.prompt = Some(Prompt::SaveAs(String::new()));
+        editor.pasted("/tmp/notes.txt");
+        assert!(matches!(&editor.prompt, Some(Prompt::SaveAs(value)) if value == "/tmp/notes.txt"));
+        editor.prompt = Some(Prompt::Quit);
+        editor.pasted("yes\n");
+        assert!(editor.running);
+        assert_eq!(editor.doc.lsp_text(), "unchanged");
+    }
+
+    #[test]
+    fn pasted_search_query_is_literal_bounded_and_selects_first_match() {
+        let mut editor = Editor::new(Document::empty());
+        editor.buffer_picker = Some(BufferPicker { query: "a".into(), selected: 4 });
+        editor.pasted("β\r\nignored");
+        let picker = editor.buffer_picker.as_ref().unwrap();
+        assert_eq!(picker.query, "aβ");
+        assert_eq!(picker.selected, 0);
+        editor.buffer_picker = None;
+        editor.mason_picker = Some(BufferPicker::default());
+        editor.pasted(&"世".repeat(100));
+        let picker = editor.mason_picker.as_ref().unwrap();
+        assert_eq!(picker.query.len(), 126);
+        assert!(!editor.doc.dirty);
+    }
+
+    #[test]
+    fn paste_cancels_pending_normal_command() {
+        let mut editor = Editor::new(Document::from_text("one"));
+        press(&mut editor, KeyCode::Char('d'));
+        editor.pasted("x");
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.doc.lsp_text(), "oxne");
+        assert_eq!(editor.sequence, Sequence::Delete);
+    }
+
+    #[test]
+    fn jump_navigation_skips_missing_files_in_both_directions() {
+        let root = std::fs::canonicalize(temporary_buffer_project()).unwrap();
+        let mut editor = Editor::new(Document::open(root.join("two.rs")).unwrap());
+        for name in ["one.rs", "missing.rs"] {
+            editor.jumps.remember(Location { path: root.join(name), row: 0, col: 0 }).unwrap();
+        }
+        editor.jump_back();
+        assert_eq!(editor.doc.path.as_deref(), Some(root.join("one.rs").as_path()));
+        editor.jump_forward();
+        assert_eq!(editor.doc.path.as_deref(), Some(root.join("two.rs").as_path()));
+        assert!(!root.join("missing.rs").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unchanged_documents_reuse_lsp_sync_state_until_revision_changes() {
+        let mut doc = Document::from_text("# title");
+        doc.path = Some(PathBuf::from("README.md"));
+        let mut editor = Editor::new(doc);
+        editor.sync_lsp_documents();
+        let versions = editor.lsp_document_versions.clone().unwrap();
+        let present = editor.lsp_present.clone();
+        editor.doc.right();
+        editor.sync_lsp_documents();
+        assert_eq!(editor.lsp_document_versions.as_ref(), Some(&versions));
+        assert_eq!(editor.lsp_present, present);
+        editor.doc.insert('x');
+        editor.sync_lsp_documents();
+        assert_ne!(editor.lsp_document_versions.as_ref(), Some(&versions));
     }
 
     #[test]

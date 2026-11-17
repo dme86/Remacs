@@ -2,27 +2,34 @@
 //! servers. One child per (workspace, language), never a child per buffer.
 //! Reader/writer threads own the blocking pipes, so the UI never blocks on
 //! server startup, indexing or IO. Calls are queued until initialized.
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
-use serde_json::{json, Value};
 use url::Url;
 
 use crate::lsp_plugin::ServerConfig;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+const MAX_HEADER: usize = 16 * 1024;
 const MAX_EVENTS_PER_TICK: usize = 128;
 const MAX_INITIAL_EMPTY_RETRIES: u8 = 6; // bounded async retries while rust-analyzer indexes
 const MAX_PENDING_REQUESTS: usize = 32;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Encoding { Utf8, Utf16, Utf32 }
+pub enum Encoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
 
 impl Encoding {
     fn from_server(capabilities: &Value) -> Self {
@@ -35,11 +42,14 @@ impl Encoding {
 }
 
 pub fn character_offset(line: &[char], col: usize, encoding: Encoding) -> usize {
-    line.iter().take(col).map(|ch| match encoding {
-        Encoding::Utf8 => ch.len_utf8(),
-        Encoding::Utf16 => ch.len_utf16(),
-        Encoding::Utf32 => 1
-    }).sum()
+    line.iter()
+        .take(col)
+        .map(|ch| match encoding {
+            Encoding::Utf8 => ch.len_utf8(),
+            Encoding::Utf16 => ch.len_utf16(),
+            Encoding::Utf32 => 1,
+        })
+        .sum()
 }
 
 pub fn char_index(line: &[char], offset: usize, encoding: Encoding) -> usize {
@@ -50,26 +60,34 @@ pub fn char_index(line: &[char], offset: usize, encoding: Encoding) -> usize {
             Encoding::Utf16 => ch.len_utf16(),
             Encoding::Utf32 => 1,
         };
-        if position + len > offset { return index; }
+        if position + len > offset {
+            return index;
+        }
         position += len;
     }
     line.len()
 }
 
 pub fn absolute(path: &Path) -> PathBuf {
-    if let Ok(found) = path.canonicalize() { return found; }
+    if let Ok(found) = path.canonicalize() {
+        return found;
+    }
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     };
-    path.parent().and_then(|parent| parent.canonicalize().ok())
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
         .and_then(|parent| path.file_name().map(|name| parent.join(name)))
         .unwrap_or(path)
 }
 
 fn uri(path: &Path) -> io::Result<String> {
-    Url::from_file_path(absolute(path)).map(|url| url.into())
+    Url::from_file_path(absolute(path))
+        .map(|url| url.into())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid file URI"))
 }
 
@@ -100,12 +118,16 @@ fn position_from_byte_offset(text: &str, byte_offset: usize, encoding: Encoding)
 pub fn incremental_change(old: &str, new: &str, encoding: Encoding) -> Value {
     let mut prefix = 0usize;
     for (before, after) in old.chars().zip(new.chars()) {
-        if before != after { break; }
+        if before != after {
+            break;
+        }
         prefix += before.len_utf8();
     }
     let mut suffix = 0usize;
     for (before, after) in old[prefix..].chars().rev().zip(new[prefix..].chars().rev()) {
-        if before != after { break; }
+        if before != after {
+            break;
+        }
         suffix += before.len_utf8();
     }
     let end_old = old.len() - suffix;
@@ -123,19 +145,34 @@ pub fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
     let mut size: Option<usize> = None;
     let mut total_header = 0usize;
     let mut saw_header = false;
+    let mut complete_header = false;
     for _ in 0..40 {
         let mut line = String::new();
-        let count = reader.read_line(&mut line)?;
+        // Bound the allocation itself, including servers that never send a newline.
+        let count = (&mut *reader)
+            .take((MAX_HEADER - total_header + 1) as u64)
+            .read_line(&mut line)?;
         if count == 0 {
-            if !saw_header { return Ok(None); }
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "LSP header truncated"));
+            if !saw_header {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "LSP header truncated",
+            ));
         }
         saw_header = true;
         total_header += count;
-        if total_header > 16 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "LSP header too large"));
+        if total_header > MAX_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LSP header too large",
+            ));
         }
-        if line.trim().is_empty() { break; }
+        if line.trim().is_empty() {
+            complete_header = true;
+            break;
+        }
         if let Some((header, value)) = line.trim().split_once(':') {
             if header.eq_ignore_ascii_case("Content-Length") {
                 size = Some(value.trim().parse::<usize>().map_err(|_| {
@@ -144,15 +181,25 @@ pub fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
             }
         }
     }
-    let size = size.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing LSP Content-Length")
-    })?;
+    if !complete_header {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LSP header missing separator",
+        ));
+    }
+    let size = size
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing LSP Content-Length"))?;
     if size > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "LSP frame exceeds 8 MiB"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LSP frame exceeds 8 MiB",
+        ));
     }
     let mut body = vec![0; size];
     reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map(Some).map_err(io::Error::other)
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
 fn trace_message(direction: &str, payload: &Value) {
@@ -171,7 +218,10 @@ pub fn write_frame(writer: &mut impl Write, message: &Value) -> io::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestKind { Definition, Hover }
+pub enum RequestKind {
+    Definition,
+    Hover,
+}
 
 #[derive(Clone, Debug)]
 pub struct Target {
@@ -183,12 +233,16 @@ pub struct Target {
 
 pub enum Event {
     Definition {
-        origin: PathBuf, revision: u64, cursor: (usize, usize),
-        target: Option<Target>
+        origin: PathBuf,
+        revision: u64,
+        cursor: (usize, usize),
+        target: Option<Target>,
     },
     Hover {
-        origin: PathBuf, revision: u64, cursor: (usize, usize),
-        text: Option<String>
+        origin: PathBuf,
+        revision: u64,
+        cursor: (usize, usize),
+        text: Option<String>,
     },
     Status(String),
 }
@@ -214,6 +268,7 @@ struct Requested {
     character: usize, // character offset in the editor's Vec<char>
     attempts: u8,
     retry_after: Option<Instant>,
+    sent_at: Option<Instant>,
 }
 
 struct Server {
@@ -221,6 +276,8 @@ struct Server {
     writer: SyncSender<Value>,
     reader: Receiver<io::Result<Value>>,
     ready: bool,
+    started_at: Instant,
+    initialization_failed: bool,
     sync_kind: u8,
     encoding: Encoding,
     documents: HashMap<PathBuf, Synced>,
@@ -239,45 +296,68 @@ impl Drop for Server {
 impl Server {
     fn start(config: &ServerConfig) -> io::Result<Self> {
         let mut command = Command::new(&config.command[0]);
-        command.args(&config.command[1..])
+        command
+            .args(&config.command[1..])
             .current_dir(&config.root)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = command.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| io::Error::other("LSP stdin unavailable"))?;
-        let stdout = child.stdout.take().ok_or_else(|| io::Error::other("LSP stdout unavailable"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("LSP stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("LSP stdout unavailable"))?;
         let (writer, outgoing) = mpsc::sync_channel::<Value>(256);
         let (incoming, reader) = mpsc::sync_channel::<io::Result<Value>>(256);
-        thread::Builder::new().name("remacs-lsp-writer".into()).spawn(move || {
-            let mut stdin = stdin;
-            while let Ok(value) = outgoing.recv() {
-                trace_message(">>>", &value);
-                if let Err(error) = write_frame(&mut stdin, &value) {
-                    eprintln!("remacs LSP writer stopped: {error}");
-                    break;
-                }
-            }
-        })?;
-        thread::Builder::new().name("remacs-lsp-reader".into()).spawn(move || {
-            let mut stdout = BufReader::new(stdout);
-            loop {
-                match read_frame(&mut stdout) {
-                    Ok(Some(value)) => {
-                        trace_message("<<<", &value);
-                        if incoming.send(Ok(value)).is_err() { break; }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = incoming.send(Err(error));
+        thread::Builder::new()
+            .name("remacs-lsp-writer".into())
+            .spawn(move || {
+                let mut stdin = stdin;
+                while let Ok(value) = outgoing.recv() {
+                    trace_message(">>>", &value);
+                    if let Err(error) = write_frame(&mut stdin, &value) {
+                        eprintln!("remacs LSP writer stopped: {error}");
                         break;
                     }
                 }
-            }
-        })?;
+            })?;
+        thread::Builder::new()
+            .name("remacs-lsp-reader".into())
+            .spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                loop {
+                    match read_frame(&mut stdout) {
+                        Ok(Some(value)) => {
+                            trace_message("<<<", &value);
+                            if incoming.send(Ok(value)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = incoming.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })?;
         let this = Self {
-            child, writer, reader, ready: false,
-            sync_kind: 2, encoding: Encoding::Utf16,
-            documents: HashMap::new(), deferred: Vec::new(),
-            waiting: HashMap::new(), next_id: 1,
+            child,
+            writer,
+            reader,
+            ready: false,
+            started_at: Instant::now(),
+            initialization_failed: false,
+            sync_kind: 2,
+            encoding: Encoding::Utf16,
+            documents: HashMap::new(),
+            deferred: Vec::new(),
+            waiting: HashMap::new(),
+            next_id: 1,
         };
         let root = uri(&config.root)?;
         this.send(json!({
@@ -304,7 +384,10 @@ impl Server {
 
     fn send(&self, payload: Value) -> io::Result<()> {
         self.writer.try_send(payload).map_err(|error| {
-            io::Error::new(io::ErrorKind::WouldBlock, format!("LSP queue full/disconnected: {error}"))
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("LSP queue full/disconnected: {error}"),
+            )
         })
     }
 
@@ -322,9 +405,70 @@ impl Server {
         let _ = self.send(json!({"jsonrpc":"2.0", "id":id, "result":result}));
     }
 
+    fn cancel_requests(&mut self, mut discard: impl FnMut(&Requested) -> bool) {
+        self.deferred.retain(|request| !discard(request));
+        let mut cancelled = Vec::new();
+        self.waiting.retain(|id, request| {
+            if discard(request) {
+                cancelled.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in cancelled {
+            // Cancellation is best effort; removed request IDs also prevent
+            // late responses from triggering stale navigation or retries.
+            let _ = self.send(json!({
+                "jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}
+            }));
+        }
+    }
+
+    fn queue_request(&mut self, request: Requested) {
+        let identical = |pending: &Requested| {
+            pending.origin == request.origin
+                && pending.kind == request.kind
+                && pending.revision == request.revision
+                && pending.row == request.row
+                && pending.character == request.character
+        };
+        if self
+            .deferred
+            .iter()
+            .chain(self.waiting.values())
+            .any(identical)
+        {
+            return;
+        }
+        self.cancel_requests(|pending| {
+            pending.origin == request.origin && pending.kind == request.kind
+        });
+        if self.deferred.len() >= MAX_PENDING_REQUESTS {
+            self.deferred.remove(0);
+        }
+        self.deferred.push(request);
+    }
+
+    fn expire_requests(&mut self) -> bool {
+        let now = Instant::now();
+        let expired = self.waiting.values().any(|request| {
+            request
+                .sent_at
+                .is_some_and(|sent| now.duration_since(sent) >= REQUEST_TIMEOUT)
+        });
+        self.cancel_requests(|request| {
+            request
+                .sent_at
+                .is_some_and(|sent| now.duration_since(sent) >= REQUEST_TIMEOUT)
+        });
+        expired
+    }
+
     fn defer_retry(&mut self, mut request: Requested) {
-        request.retry_after = Some(Instant::now()
-            + Duration::from_millis(300 * request.attempts as u64));
+        request.sent_at = None;
+        request.retry_after =
+            Some(Instant::now() + Duration::from_millis(300 * request.attempts as u64));
         if self.deferred.len() >= MAX_PENDING_REQUESTS {
             self.deferred.remove(0);
         }
@@ -334,31 +478,45 @@ impl Server {
     fn handle_message(&mut self, message: Value) -> Vec<Event> {
         let mut events = Vec::new();
         if message.get("method").is_some() {
-            if message.get("id").is_some() { self.respond_to_server(&message); }
+            if message.get("id").is_some() {
+                self.respond_to_server(&message);
+            }
             // Diagnostics rendering comes later. Never block on unsolicited messages.
             return events;
         }
-        let Some(id) = message["id"].as_i64() else { return events };
+        let Some(id) = message["id"].as_i64() else {
+            return events;
+        };
         if id == 1 && !self.ready {
             if let Some(error) = message.get("error") {
+                self.initialization_failed = true;
                 events.push(Event::Status(format!("LSP initialization failed: {error}")));
                 return events;
             }
             let cap = &message["result"]["capabilities"];
             self.encoding = Encoding::from_server(cap);
-            self.sync_kind = if let Some(n) = cap["textDocumentSync"].as_u64() {
-                n as u8
-            } else {
-                cap["textDocumentSync"]["change"].as_u64().unwrap_or(2) as u8
+            self.sync_kind = match cap["textDocumentSync"]
+                .as_u64()
+                .or_else(|| cap["textDocumentSync"]["change"].as_u64())
+            {
+                Some(1) => 1,
+                Some(2) => 2,
+                _ => 0, // None is also the default when change support is omitted.
             };
-            self.ready = true;
-            let _ = self.send(json!({
+            if let Err(error) = self.send(json!({
                 "jsonrpc": "2.0", "method": "initialized", "params": {}
-            }));
+            })) {
+                self.initialization_failed = true;
+                events.push(Event::Status(format!("LSP initialization failed: {error}")));
+                return events;
+            }
+            self.ready = true;
             events.push(Event::Status("Language server connected".into()));
             return events;
         }
-        let Some(request) = self.waiting.remove(&id) else { return events };
+        let Some(request) = self.waiting.remove(&id) else {
+            return events;
+        };
         let result = &message["result"];
         if let Some(error) = message.get("error") {
             // -32801 (ContentModified) means the server's semantic snapshot
@@ -377,44 +535,72 @@ impl Server {
         }
         let target = if request.kind == RequestKind::Definition {
             parse_definition(result, self.encoding)
-        } else { None };
+        } else {
+            None
+        };
         let hover = if request.kind == RequestKind::Hover {
             parse_hover(result)
-        } else { None };
+        } else {
+            None
+        };
         // rust-analyzer returns []/null if definition/hover is queried in
         // the milliseconds between didOpen and indexing the workspace.
         // A bounded, asynchronous retry avoids falsely claiming there is
         // no definition, without making the editor UI wait. Ordinary misses
         // eventually terminate; stale revisions are dropped in flush_requests.
-        if target.is_none() && hover.is_none()
-            && request.attempts < MAX_INITIAL_EMPTY_RETRIES
-        {
+        if target.is_none() && hover.is_none() && request.attempts < MAX_INITIAL_EMPTY_RETRIES {
             self.defer_retry(request);
             return events;
         }
         let cursor = (request.row, request.character);
         match request.kind {
             RequestKind::Definition => events.push(Event::Definition {
-                origin: request.origin, revision: request.revision, cursor,
+                origin: request.origin,
+                revision: request.revision,
+                cursor,
                 target,
             }),
             RequestKind::Hover => events.push(Event::Hover {
-                origin: request.origin, revision: request.revision, cursor,
+                origin: request.origin,
+                revision: request.revision,
+                cursor,
                 text: hover,
             }),
         }
         events
     }
 
-    fn sync_document(&mut self, path: &Path, revision: u64, text: impl FnOnce() -> String,
-        language: &str) -> io::Result<()> {
-        if !self.ready { return Ok(()) }
+    fn sync_document(
+        &mut self,
+        path: &Path,
+        revision: u64,
+        text: impl FnOnce() -> String,
+        language: &str,
+    ) -> io::Result<()> {
+        if !self.ready {
+            return Ok(());
+        }
         let path = absolute(path);
         let uri = uri(&path)?;
         if let Some(previous) = self.documents.get(&path) {
-            if previous.revision == revision { return Ok(()); }
+            if previous.revision == revision {
+                return Ok(());
+            }
         }
         let new_text = text();
+        if self.sync_kind == 0 {
+            if let Some(previous) = self.documents.get_mut(&path) {
+                // Servers can opt out of changes. Keep the local snapshot for
+                // request coordinates and stale-response checks without
+                // inventing a server version or sending an unwanted change.
+                previous.revision = revision;
+                previous.text = new_text;
+                self.cancel_requests(|request| {
+                    request.origin == path && request.revision != revision
+                });
+                return Ok(());
+            }
+        }
         let (version, msg) = match self.documents.get(&path) {
             Some(old) if self.sync_kind == 2 => (
                 old.version + 1,
@@ -439,18 +625,36 @@ impl Server {
                     "params":{"textDocument":{"uri":uri,"languageId":language,
                         "version":1,"text":new_text}}
                 }),
-            )
+            ),
         };
         self.send(msg)?;
-        self.documents.insert(path, Synced { revision, version, text: new_text });
+        self.cancel_requests(|request| request.origin == path && request.revision != revision);
+        self.documents.insert(
+            path,
+            Synced {
+                revision,
+                version,
+                text: new_text,
+            },
+        );
         Ok(())
     }
 
     fn flush_requests(&mut self) -> io::Result<()> {
-        if !self.ready { return Ok(()) }
-        let mut pending = std::mem::take(&mut self.deferred);
-        for mut request in pending.drain(..) {
-            if request.retry_after.is_some_and(|when| Instant::now() < when) {
+        if !self.ready {
+            return Ok(());
+        }
+        let mut pending = std::mem::take(&mut self.deferred).into_iter();
+        while let Some(mut request) = pending.next() {
+            if self.waiting.len() >= MAX_PENDING_REQUESTS {
+                self.deferred.push(request);
+                self.deferred.extend(pending);
+                break;
+            }
+            if request
+                .retry_after
+                .is_some_and(|when| Instant::now() < when)
+            {
                 self.deferred.push(request);
                 continue;
             }
@@ -460,15 +664,22 @@ impl Server {
                 continue;
             };
             // Ignore an outdated request if the user has edited meanwhile.
-            if doc.revision != request.revision { continue; }
+            if doc.revision != request.revision {
+                continue;
+            }
             self.next_id += 1;
             let id = self.next_id;
-            let line: Vec<char> = doc.text.split('\n').nth(request.row)
-                .unwrap_or("").chars().collect();
+            let line: Vec<char> = doc
+                .text
+                .split('\n')
+                .nth(request.row)
+                .unwrap_or("")
+                .chars()
+                .collect();
             let character = character_offset(&line, request.character, self.encoding);
             let method = match request.kind {
                 RequestKind::Definition => "textDocument/definition",
-                RequestKind::Hover => "textDocument/hover"
+                RequestKind::Hover => "textDocument/hover",
             };
             let payload = json!({
                 "jsonrpc":"2.0", "id":id, "method":method,
@@ -481,10 +692,12 @@ impl Server {
                 Ok(()) => {
                     request.attempts += 1;
                     request.retry_after = None;
+                    request.sent_at = Some(Instant::now());
                     self.waiting.insert(id, request);
                 }
                 Err(error) => {
                     self.deferred.push(request);
+                    self.deferred.extend(pending);
                     return Err(error);
                 }
             }
@@ -493,18 +706,20 @@ impl Server {
     }
 }
 
+#[derive(Default)]
 pub struct Manager {
     servers: HashMap<ServerKey, Server>,
     failed: HashSet<ServerKey>,
 }
 
-impl Default for Manager {
-    fn default() -> Self {
-        Self { servers: HashMap::new(), failed: HashSet::new() }
-    }
-}
-
 impl Manager {
+    /// Initialization is asynchronous; documents must be retried until ready.
+    pub fn has_starting_servers(&self) -> bool {
+        self.servers
+            .values()
+            .any(|server| !server.ready && !server.initialization_failed)
+    }
+
     /// Called after a Mason installer finishes: retry formerly missing
     /// executables and replace old language-server processes on next sync.
     pub fn reset_language(&mut self, language: &str) {
@@ -517,40 +732,63 @@ impl Manager {
             root: absolute(&config.root),
             language: config.language.clone(),
         };
-        if self.failed.contains(&key) { return Ok(None); }
+        if self.failed.contains(&key) {
+            return Ok(None);
+        }
         if !self.servers.contains_key(&key) {
             match Server::start(config) {
-                Ok(server) => { self.servers.insert(key.clone(), server); }
+                Ok(server) => {
+                    self.servers.insert(key.clone(), server);
+                }
                 Err(error) => {
                     self.failed.insert(key);
-                    return Err(io::Error::new(error.kind(),
-                        format!("{}: {error} (install the language server)",
-                            config.command[0])));
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{}: {error} (install the language server)",
+                            config.command[0]
+                        ),
+                    ));
                 }
             }
         }
         Ok(self.servers.get_mut(&key))
     }
 
-    pub fn sync(&mut self, config: &ServerConfig, path: &Path, revision: u64,
-        text: impl FnOnce() -> String) -> io::Result<()> {
+    pub fn sync(
+        &mut self,
+        config: &ServerConfig,
+        path: &Path,
+        revision: u64,
+        text: impl FnOnce() -> String,
+    ) -> io::Result<()> {
         if let Some(server) = self.ensure(config)? {
             server.sync_document(path, revision, text, &config.language)?;
         }
         Ok(())
     }
 
-    pub fn request(&mut self, config: &ServerConfig, path: &Path, revision: u64,
-        row: usize, col: usize, kind: RequestKind) -> io::Result<bool> {
-        let Some(server) = self.ensure(config)? else { return Ok(false); };
-        // Bounded pending operations: repeating gd while indexing must
-        // never grow memory indefinitely.
-        if server.deferred.len() >= MAX_PENDING_REQUESTS {
-            server.deferred.remove(0);
-        }
-        server.deferred.push(Requested {
-            origin: absolute(path), revision, row, character: col, kind,
-            attempts: 0, retry_after: None,
+    pub fn request(
+        &mut self,
+        config: &ServerConfig,
+        path: &Path,
+        revision: u64,
+        row: usize,
+        col: usize,
+        kind: RequestKind,
+    ) -> io::Result<bool> {
+        let Some(server) = self.ensure(config)? else {
+            return Ok(false);
+        };
+        server.queue_request(Requested {
+            origin: absolute(path),
+            revision,
+            row,
+            character: col,
+            kind,
+            attempts: 0,
+            retry_after: None,
+            sent_at: None,
         });
         Ok(true)
     }
@@ -559,19 +797,38 @@ impl Manager {
         let mut result = Vec::new();
         let mut expired = Vec::new();
         for (key, server) in &mut self.servers {
+            if server.expire_requests() {
+                result.push(Event::Status(format!(
+                    "{} LSP request timed out",
+                    key.language
+                )));
+            }
             for _ in 0..MAX_EVENTS_PER_TICK {
                 match server.reader.try_recv() {
                     Ok(Ok(value)) => result.extend(server.handle_message(value)),
-                    Ok(Err(error)) => result.push(Event::Status(format!(
-                        "LSP protocol error: {error}"
-                    ))),
+                    Ok(Err(error)) => {
+                        result.push(Event::Status(format!("LSP protocol error: {error}")))
+                    }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
+            }
+            if server.initialization_failed {
+                expired.push(key.clone());
+                continue;
+            }
+            if !server.ready && server.started_at.elapsed() >= STARTUP_TIMEOUT {
+                result.push(Event::Status(format!(
+                    "{} LSP initialization timed out",
+                    key.language
+                )));
+                expired.push(key.clone());
+                continue;
             }
             match server.child.try_wait() {
                 Ok(Some(status)) => {
                     result.push(Event::Status(format!(
-                        "{} LSP exited ({status})", key.language
+                        "{} LSP exited ({status})",
+                        key.language
                     )));
                     expired.push(key.clone());
                 }
@@ -591,15 +848,23 @@ impl Manager {
 
     pub fn flush(&mut self, present: &HashSet<PathBuf>) {
         for server in self.servers.values_mut() {
+            server.cancel_requests(|request| !present.contains(&request.origin));
             if server.ready {
-                let missing: Vec<_> = server.documents.keys().filter(|path| !present.contains(*path))
-                    .cloned().collect();
+                let missing: Vec<_> = server
+                    .documents
+                    .keys()
+                    .filter(|path| !present.contains(*path))
+                    .cloned()
+                    .collect();
                 for path in missing {
                     if let Ok(uri) = uri(&path) {
-                        if server.send(json!({
-                            "jsonrpc":"2.0","method":"textDocument/didClose",
-                            "params":{"textDocument":{"uri":uri}}
-                        })).is_ok() {
+                        if server
+                            .send(json!({
+                                "jsonrpc":"2.0","method":"textDocument/didClose",
+                                "params":{"textDocument":{"uri":uri}}
+                            }))
+                            .is_ok()
+                        {
                             server.documents.remove(&path);
                         }
                     }
@@ -608,21 +873,17 @@ impl Manager {
             }
         }
     }
-
-    pub fn state(&self, config: &ServerConfig) -> &'static str {
-        let key = ServerKey { root: absolute(&config.root), language: config.language.clone() };
-        if self.failed.contains(&key) { return "error"; }
-        match self.servers.get(&key) {
-            Some(server) if server.ready => "ready",
-            Some(_) => "starting",
-            None => "idle"
-        }
-    }
 }
 
 fn parse_definition(result: &Value, encoding: Encoding) -> Option<Target> {
-    let item = if let Some(items) = result.as_array() { items.first()? } else { result };
-    if item.is_null() { return None; }
+    let item = if let Some(items) = result.as_array() {
+        items.first()?
+    } else {
+        result
+    };
+    if item.is_null() {
+        return None;
+    }
     let (uri, range) = if item.get("targetUri").is_some() {
         (item["targetUri"].as_str()?, &item["targetSelectionRange"])
     } else {
@@ -637,25 +898,308 @@ fn parse_definition(result: &Value, encoding: Encoding) -> Option<Target> {
 }
 
 fn parse_hover(result: &Value) -> Option<String> {
-    if result.is_null() { return None; }
+    if result.is_null() {
+        return None;
+    }
     let contents = &result["contents"];
     let text = if let Some(value) = contents.as_str() {
         value.to_owned()
     } else if let Some(value) = contents["value"].as_str() {
         value.to_owned()
-    } else if let Some(items) = contents.as_array() {
-        items.iter().filter_map(|item| item.as_str()
-            .or_else(|| item["value"].as_str()))
-            .collect::<Vec<_>>().join("\n")
-    } else { return None };
+    } else {
+        contents
+            .as_array()?
+            .iter()
+            .filter_map(|item| item.as_str().or_else(|| item["value"].as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let text: String = text.chars().take(5000).collect();
-    if text.trim().is_empty() { None } else { Some(text) }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn test_server(capacity: usize) -> (Server, Receiver<Value>) {
+        // A quiet child keeps process lifecycle real without an installed LSP.
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (writer, outgoing) = mpsc::sync_channel(capacity);
+        let (_, reader) = mpsc::channel();
+        (
+            Server {
+                child,
+                writer,
+                reader,
+                ready: true,
+                started_at: Instant::now(),
+                initialization_failed: false,
+                sync_kind: 2,
+                encoding: Encoding::Utf16,
+                documents: HashMap::new(),
+                deferred: Vec::new(),
+                waiting: HashMap::new(),
+                next_id: 1,
+            },
+            outgoing,
+        )
+    }
+
+    fn requested(number: usize) -> Requested {
+        Requested {
+            origin: absolute(&std::env::temp_dir().join(format!("remacs-request-{number}.rs"))),
+            revision: 1,
+            kind: RequestKind::Definition,
+            row: 0,
+            character: 0,
+            attempts: 0,
+            retry_after: None,
+            sent_at: None,
+        }
+    }
+
+    fn open_request_document(server: &mut Server, request: &Requested) {
+        server.documents.insert(
+            request.origin.clone(),
+            Synced {
+                revision: request.revision,
+                version: 1,
+                text: "fn example() {}".into(),
+            },
+        );
+    }
+
+    fn manager_with_server(server: Server) -> (Manager, ServerConfig) {
+        let config = ServerConfig {
+            language: "rust".into(),
+            command: vec!["unused-test-server".into()],
+            root: absolute(&std::env::temp_dir()),
+        };
+        let mut manager = Manager::default();
+        manager.servers.insert(
+            ServerKey {
+                root: config.root.clone(),
+                language: config.language.clone(),
+            },
+            server,
+        );
+        (manager, config)
+    }
+
+    #[test]
+    fn silent_initialization_times_out_and_rejects_requests_until_reset() {
+        let (mut server, _outgoing) = test_server(16);
+        server.ready = false;
+        server.started_at = Instant::now() - STARTUP_TIMEOUT;
+        server.queue_request(requested(0));
+        let (mut manager, config) = manager_with_server(server);
+        assert!(manager.has_starting_servers());
+        let events = manager.poll();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Status(message) if message.contains("initialization timed out"))));
+        assert!(manager.servers.is_empty());
+        assert!(!manager.has_starting_servers());
+        let request = requested(0);
+        assert!(!manager
+            .request(&config, &request.origin, 1, 0, 0, RequestKind::Definition)
+            .unwrap());
+        manager.reset_language("rust");
+        assert!(manager.failed.is_empty());
+    }
+
+    #[test]
+    fn initialize_error_is_terminal_and_removes_pending_work() {
+        let (mut server, _outgoing) = test_server(16);
+        server.ready = false;
+        server.queue_request(requested(0));
+        let (incoming, reader) = mpsc::channel();
+        server.reader = reader;
+        incoming
+            .send(Ok(json!({"id":1,
+            "error":{"code":-32603,"message":"initialization rejected"}})))
+            .unwrap();
+        let (mut manager, _) = manager_with_server(server);
+        let events = manager.poll();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Status(message) if message.contains("initialization rejected"))));
+        assert!(manager.servers.is_empty());
+        assert_eq!(manager.failed.len(), 1);
+        assert!(!manager.has_starting_servers());
+    }
+
+    #[test]
+    fn buffered_initialization_response_is_processed_before_startup_timeout() {
+        let (mut server, _outgoing) = test_server(16);
+        server.ready = false;
+        server.started_at = Instant::now() - STARTUP_TIMEOUT;
+        let (incoming, reader) = mpsc::channel();
+        server.reader = reader;
+        incoming
+            .send(Ok(json!({"id":1,
+            "result":{"capabilities":{"textDocumentSync":2}}})))
+            .unwrap();
+        let (mut manager, _) = manager_with_server(server);
+        manager.poll();
+        assert_eq!(manager.servers.len(), 1);
+        assert!(manager.failed.is_empty());
+        assert!(!manager.has_starting_servers());
+    }
+
+    #[test]
+    fn failed_initialized_notification_does_not_report_a_ready_server() {
+        let (mut server, _outgoing) = test_server(0);
+        server.ready = false;
+        server.handle_message(json!({"id":1,"result":{"capabilities":{}}}));
+        assert!(server.initialization_failed);
+        assert!(!server.ready);
+    }
+
+    #[test]
+    fn synchronization_capabilities_default_to_none() {
+        for (capabilities, expected) in [
+            (json!({}), 0),
+            (json!({"textDocumentSync":0}), 0),
+            (json!({"textDocumentSync":{"openClose":true}}), 0),
+            (json!({"textDocumentSync":{"change":1}}), 1),
+            (json!({"textDocumentSync":2}), 2),
+            (json!({"textDocumentSync":258}), 0),
+        ] {
+            let (mut server, _outgoing) = test_server(16);
+            server.ready = false;
+            server.handle_message(json!({"id":1,"result":{"capabilities":capabilities}}));
+            assert!(server.ready);
+            assert_eq!(server.sync_kind, expected);
+        }
+    }
+
+    #[test]
+    fn sync_none_keeps_current_request_coordinates_without_sending_changes() {
+        let (mut server, outgoing) = test_server(16);
+        server.sync_kind = 0;
+        let mut request = requested(0);
+        open_request_document(&mut server, &request);
+        server
+            .sync_document(&request.origin, 2, || "🦀target".into(), "rust")
+            .unwrap();
+        assert!(outgoing.try_recv().is_err(), "no didChange for sync None");
+        let document = &server.documents[&request.origin];
+        assert_eq!(document.revision, 2);
+        assert_eq!(document.version, 1);
+        assert_eq!(document.text, "🦀target");
+        request.revision = 2;
+        request.character = 1;
+        server.queue_request(request);
+        server.flush_requests().unwrap();
+        let navigation = outgoing.try_recv().unwrap();
+        assert_eq!(navigation["method"], "textDocument/definition");
+        assert_eq!(navigation["params"]["position"]["character"], 2);
+    }
+
+    #[test]
+    fn repeated_navigation_is_deduplicated_and_superseded_requests_are_cancelled() {
+        let (mut server, outgoing) = test_server(16);
+        let request = requested(0);
+        open_request_document(&mut server, &request);
+        server.queue_request(request.clone());
+        server.queue_request(request.clone());
+        assert_eq!(server.deferred.len(), 1);
+        server.flush_requests().unwrap();
+        let first = outgoing.try_recv().unwrap();
+        server.queue_request(request.clone());
+        assert!(
+            server.deferred.is_empty(),
+            "do not duplicate an in-flight gd"
+        );
+        let mut newer = request;
+        newer.character = 3;
+        server.queue_request(newer);
+        assert!(server.waiting.is_empty());
+        let cancellation = outgoing.try_recv().unwrap();
+        assert_eq!(cancellation["method"], "$/cancelRequest");
+        assert_eq!(cancellation["params"]["id"], first["id"]);
+        // A late response cannot navigate back to the superseded target.
+        assert!(server
+            .handle_message(json!({"id":first["id"], "result":null}))
+            .is_empty());
+        assert_eq!(server.deferred.len(), 1);
+    }
+
+    #[test]
+    fn unanswered_requests_are_bounded_and_timeout_releases_capacity() {
+        let (mut server, _outgoing) = test_server(256);
+        for number in 0..MAX_PENDING_REQUESTS * 2 {
+            let request = requested(number);
+            open_request_document(&mut server, &request);
+            server.queue_request(request);
+            server.flush_requests().unwrap();
+        }
+        assert_eq!(server.waiting.len(), MAX_PENDING_REQUESTS);
+        assert_eq!(server.deferred.len(), MAX_PENDING_REQUESTS);
+        for request in server.waiting.values_mut() {
+            request.sent_at = Some(Instant::now() - REQUEST_TIMEOUT);
+        }
+        assert!(server.expire_requests());
+        assert!(server.waiting.is_empty());
+        server.flush_requests().unwrap();
+        assert_eq!(server.waiting.len(), MAX_PENDING_REQUESTS);
+        assert!(server.deferred.is_empty());
+    }
+
+    #[test]
+    fn writer_backpressure_preserves_all_deferred_requests() {
+        let (mut server, _outgoing) = test_server(0);
+        for number in 0..3 {
+            let request = requested(number);
+            open_request_document(&mut server, &request);
+            server.queue_request(request);
+        }
+        assert!(server.flush_requests().is_err());
+        assert_eq!(server.deferred.len(), 3);
+        for (number, request) in server.deferred.iter().enumerate() {
+            assert_eq!(request.origin, requested(number).origin);
+        }
+    }
+
+    #[test]
+    fn edited_documents_cancel_requests_for_the_old_revision() {
+        let (mut server, outgoing) = test_server(16);
+        let request = requested(0);
+        open_request_document(&mut server, &request);
+        server.queue_request(request.clone());
+        server.flush_requests().unwrap();
+        outgoing.try_recv().unwrap();
+        server
+            .sync_document(&request.origin, 2, || "fn edited() {}".into(), "rust")
+            .unwrap();
+        assert!(server.waiting.is_empty());
+        assert_eq!(
+            outgoing.try_recv().unwrap()["method"],
+            "textDocument/didChange"
+        );
+        assert_eq!(outgoing.try_recv().unwrap()["method"], "$/cancelRequest");
+    }
+
+    #[test]
+    fn framing_bounds_header_allocation_and_requires_a_separator() {
+        let mut oversized = Cursor::new(vec![b'x'; MAX_HEADER * 4]);
+        assert!(read_frame(&mut oversized).is_err());
+        assert_eq!(oversized.position(), (MAX_HEADER + 1) as u64);
+        let header = format!(
+            "Content-Length: 2\r\n{}{{}}",
+            "X-Test: value\r\n".repeat(39)
+        );
+        assert!(read_frame(&mut Cursor::new(header)).is_err());
+    }
 
     #[test]
     fn content_modified_error_code_matches_lsp_specification() {
@@ -675,6 +1219,7 @@ mod tests {
             character: 3,
             attempts: 1,
             retry_after: Some(Instant::now() + Duration::from_millis(300)),
+            sent_at: None,
         };
         assert_eq!(retry.attempts, 1);
         assert!(retry.retry_after.is_some_and(|when| when > Instant::now()));
@@ -684,13 +1229,22 @@ mod tests {
     #[test]
     fn successful_mason_install_releases_failed_server_state() {
         let mut manager = Manager::default();
-        let rust = ServerKey { root: PathBuf::from("/tmp"), language: "rust".into() };
-        let lua = ServerKey { root: PathBuf::from("/tmp"), language: "lua".into() };
+        let rust = ServerKey {
+            root: PathBuf::from("/tmp"),
+            language: "rust".into(),
+        };
+        let lua = ServerKey {
+            root: PathBuf::from("/tmp"),
+            language: "lua".into(),
+        };
         manager.failed.insert(rust.clone());
         manager.failed.insert(lua.clone());
         manager.reset_language("rust");
         assert!(!manager.failed.contains(&rust));
-        assert!(manager.failed.contains(&lua), "unrelated LSP stays unchanged");
+        assert!(
+            manager.failed.contains(&lua),
+            "unrelated LSP stays unchanged"
+        );
     }
 
     #[test]
@@ -704,7 +1258,8 @@ mod tests {
         assert_eq!(read_frame(&mut input).unwrap(), None);
         assert!(read_frame(&mut BufReader::new(Cursor::new(
             b"Content-Length: 99999999\r\n\r\n".to_vec()
-        ))).is_err());
+        )))
+        .is_err());
     }
 
     #[test]
@@ -726,10 +1281,10 @@ mod tests {
             "range":{"start":{"line":3,"character":6}}});
         let result = parse_definition(&json!([first]), Encoding::Utf16).unwrap();
         assert!(result.path.ends_with("lib.rs"));
-        assert_eq!((result.row,result.character),(3,6));
+        assert_eq!((result.row, result.character), (3, 6));
         let link = json!({"targetUri":"file:///tmp/main.rs",
             "targetSelectionRange":{"start":{"line":5,"character":2}}});
-        assert_eq!(parse_definition(&link,Encoding::Utf16).unwrap().row,5);
+        assert_eq!(parse_definition(&link, Encoding::Utf16).unwrap().row, 5);
         assert!(parse_definition(&Value::Null, Encoding::Utf16).is_none());
     }
 
@@ -738,13 +1293,19 @@ mod tests {
     fn actual_rust_analyzer_resolves_definition() {
         use std::time::{Duration, Instant};
         let root = std::env::temp_dir().join(format!(
-            "remacs-ra-integration-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap().as_nanos()
+            "remacs-ra-integration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("Cargo.toml"),
-            "[package]\nname = \"remacs-lsp-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"remacs-lsp-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
         let text = "pub fn target() -> u32 { 42 }\npub fn caller() -> u32 { target() }\n";
         let source = root.join("src/lib.rs");
         std::fs::write(&source, text).unwrap();
@@ -756,8 +1317,9 @@ mod tests {
         let reference = text.lines().nth(1).unwrap();
         let column = reference.find("target()").unwrap();
         let mut manager = Manager::default();
-        assert!(manager.request(&config, &source, 0, 1, column,
-            RequestKind::Definition).unwrap());
+        assert!(manager
+            .request(&config, &source, 0, 1, column, RequestKind::Definition)
+            .unwrap());
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let present = HashSet::from([absolute(&source)]);
@@ -769,18 +1331,27 @@ mod tests {
                     eprintln!("LSP EVENT: {status}");
                 }
                 match event {
-                    Event::Definition { target: Some(target), .. } => {
+                    Event::Definition {
+                        target: Some(target),
+                        ..
+                    } => {
                         assert_eq!(absolute(&target.path), absolute(&source));
                         assert_eq!(target.row, 0);
                         found = true;
                     }
-                    Event::Status(status) if status.contains("error")
-                        || status.contains("exited") || status.contains("failed") =>
-                        failure = Some(status),
+                    Event::Status(status)
+                        if status.contains("error")
+                            || status.contains("exited")
+                            || status.contains("failed") =>
+                    {
+                        failure = Some(status)
+                    }
                     _ => {}
                 }
             }
-            if found || failure.is_some() { break; }
+            if found || failure.is_some() {
+                break;
+            }
             manager.sync(&config, &source, 0, || text.into()).unwrap();
             manager.flush(&present);
             std::thread::sleep(Duration::from_millis(100));
@@ -788,14 +1359,20 @@ mod tests {
         drop(manager);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(failure.is_none(), "rust-analyzer failed: {failure:?}");
-        assert!(found, "rust-analyzer did not resolve a real definition before timeout");
+        assert!(
+            found,
+            "rust-analyzer did not resolve a real definition before timeout"
+        );
     }
 
     #[test]
     fn hover_parses_markdown_and_plaintext() {
-        assert_eq!(parse_hover(&json!({
-            "contents":{"kind":"markdown","value":"**struct** Example"}
-        })),Some("**struct** Example".into()));
+        assert_eq!(
+            parse_hover(&json!({
+                "contents":{"kind":"markdown","value":"**struct** Example"}
+            })),
+            Some("**struct** Example".into())
+        );
         assert!(parse_hover(&Value::Null).is_none());
     }
 }
