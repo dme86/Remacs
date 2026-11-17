@@ -267,7 +267,10 @@ mod tests {
         tree.on_key("backspace").unwrap();
         assert!(tree.view(10).unwrap().title.contains("FIND / ca "));
         tree.on_key("ctrl-u").unwrap();
-        assert!(tree.view(10).unwrap().lines.iter().all(String::is_empty));
+        let cleared = tree.view(10).unwrap();
+        assert!(cleared.finder.as_ref().is_some_and(|finder| finder.query.is_empty()));
+        assert!(cleared.lines.iter().any(|line| line.contains("camel.txt")),
+            "clearing the query should restore initial suggestions");
         let _ = fs::remove_dir_all(temp);
     }
 
