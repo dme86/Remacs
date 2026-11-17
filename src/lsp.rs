@@ -355,7 +355,7 @@ impl Server {
             let _ = self.send(json!({
                 "jsonrpc": "2.0", "method": "initialized", "params": {}
             }));
-            events.push(Event::Status("rust-analyzer connected".into()));
+            events.push(Event::Status("Language server connected".into()));
             return events;
         }
         let Some(request) = self.waiting.remove(&id) else { return events };
@@ -505,6 +505,13 @@ impl Default for Manager {
 }
 
 impl Manager {
+    /// Called after a Mason installer finishes: retry formerly missing
+    /// executables and replace old language-server processes on next sync.
+    pub fn reset_language(&mut self, language: &str) {
+        self.failed.retain(|key| key.language != language);
+        self.servers.retain(|key, _| key.language != language);
+    }
+
     fn ensure(&mut self, config: &ServerConfig) -> io::Result<Option<&mut Server>> {
         let key = ServerKey {
             root: absolute(&config.root),
@@ -672,6 +679,18 @@ mod tests {
         assert_eq!(retry.attempts, 1);
         assert!(retry.retry_after.is_some_and(|when| when > Instant::now()));
         assert!(MAX_INITIAL_EMPTY_RETRIES <= MAX_PENDING_REQUESTS as u8);
+    }
+
+    #[test]
+    fn successful_mason_install_releases_failed_server_state() {
+        let mut manager = Manager::default();
+        let rust = ServerKey { root: PathBuf::from("/tmp"), language: "rust".into() };
+        let lua = ServerKey { root: PathBuf::from("/tmp"), language: "lua".into() };
+        manager.failed.insert(rust.clone());
+        manager.failed.insert(lua.clone());
+        manager.reset_language("rust");
+        assert!(!manager.failed.contains(&rust));
+        assert!(manager.failed.contains(&lua), "unrelated LSP stays unchanged");
     }
 
     #[test]
