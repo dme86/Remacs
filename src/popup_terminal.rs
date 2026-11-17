@@ -304,7 +304,7 @@ impl PopupCache {
             .rows_formatted(0, rect.width - 2)
             .collect();
         let title = format!("─ {} ", session.title);
-        for i in 0..rect.height as usize {
+        for (i, painted) in self.rows.iter_mut().enumerate() {
             let line = if i == 0 {
                 let text = fit(&title, interior);
                 format!("╭{text}╮")
@@ -313,7 +313,7 @@ impl PopupCache {
             } else {
                 content.get(i - 1).cloned().unwrap_or_default()
             };
-            if self.rows[i].as_ref() == Some(&line) {
+            if painted.as_ref() == Some(&line) {
                 continue;
             }
             let y = rect.y + i as u16;
@@ -347,7 +347,7 @@ impl PopupCache {
                     ResetColor
                 )?;
             }
-            self.rows[i] = Some(line);
+            *painted = Some(line);
         }
         Ok(())
     }

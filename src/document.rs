@@ -261,11 +261,16 @@ impl Document {
             return String::new();
         }
         let mut output = String::new();
-        for row in range.start.row..=range.end.row {
+        for (row, line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .take(range.end.row + 1)
+            .skip(range.start.row)
+        {
             if row > range.start.row {
                 output.push('\n');
             }
-            let line = &self.lines[row];
             let from = if row == range.start.row {
                 range.start.col
             } else {

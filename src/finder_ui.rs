@@ -177,7 +177,7 @@ impl Cache {
             .saturating_sub(available)
             .min(finder.matches.len().saturating_sub(available));
 
-        for row in 0..rect.height {
+        for (row, painted) in self.painted.iter_mut().enumerate() {
             let (line, style) = if row == 0 {
                 let title = match kind {
                     PickerKind::Files => "─ FIND FILES ",
@@ -255,7 +255,9 @@ impl Cache {
                     },
                 )
             };
-            if self.painted[row].as_ref() == Some(&(line.clone(), style)) {
+            if painted.as_ref().is_some_and(|(previous, previous_style)| {
+                previous == &line && *previous_style == style
+            }) {
                 continue;
             }
             let (background, foreground) = match style {
@@ -273,7 +275,7 @@ impl Cache {
                 Print(&line),
                 ResetColor
             )?;
-            self.painted[row] = Some((line, style));
+            *painted = Some((line, style));
         }
         Ok(())
     }
