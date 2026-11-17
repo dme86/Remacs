@@ -425,9 +425,10 @@ impl Editor {
         for event in self.lsp.poll() {
             match event {
                 LspEvent::Status(text) => self.message = text,
-                LspEvent::Definition { origin, revision, target } => {
+                LspEvent::Definition { origin, revision, cursor, target } => {
                     let still_current = self.doc.path.as_ref().is_some_and(|path|
-                        lsp::absolute(path) == origin) && self.doc.revision == revision;
+                        lsp::absolute(path) == origin) && self.doc.revision == revision
+                        && (self.doc.row, self.doc.col) == cursor;
                     if !still_current { continue; }
                     if let Some(target) = target {
                         self.apply_lsp_definition(target);
@@ -435,9 +436,10 @@ impl Editor {
                         self.message = "No definition found".into();
                     }
                 }
-                LspEvent::Hover { origin, revision, text } => {
+                LspEvent::Hover { origin, revision, cursor, text } => {
                     let still_current = self.doc.path.as_ref().is_some_and(|path|
-                        lsp::absolute(path) == origin) && self.doc.revision == revision;
+                        lsp::absolute(path) == origin) && self.doc.revision == revision
+                        && (self.doc.row, self.doc.col) == cursor;
                     if !still_current { continue; }
                     if let Some(text) = text {
                         self.hover_popup = Some(text);
