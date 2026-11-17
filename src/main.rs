@@ -1269,7 +1269,7 @@ impl Editor {
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
-            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Buf {}/{} ({} modified) | Ln {}, Col {} ",
+            let status = format!(" {mark} Remacs [{mode}] | Buf {}/{} ({} modified) | {filename} | {language}{pane} | Ln {}, Col {} ",
                 self.active_slot + 1, self.slots.len(), self.dirty_buffers(),
                 self.doc.row + 1, self.doc.col + 1);
             let status = fit_cells(&status, width);
