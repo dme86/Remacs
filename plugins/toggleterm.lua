@@ -7,6 +7,8 @@ local M = {}
 local sessions = {}
 local active = nil
 
+M.dismiss_key = "ctrl-t"
+
 M.keys = {
   ["ctrl-t"] = "shell",
   ["space t"] = "shell",
@@ -20,6 +22,10 @@ M.programs = {
 
 function M.binding(key)
   return M.keys[key]
+end
+
+function M.dismiss(key)
+  return key == M.dismiss_key
 end
 
 function M.active()
