@@ -9,6 +9,7 @@ pub struct Document {
     pub row: usize,
     pub col: usize,
     pub dirty: bool,
+    pub revision: u64,
     newline: &'static str,
     syntax_invalid_from: Option<usize>,
 }
@@ -23,7 +24,7 @@ impl Document {
         let lines = text.split('\n')
             .map(|line| line.strip_suffix('\r').unwrap_or(line).chars().collect())
             .collect();
-        Self { lines, path: None, row: 0, col: 0, dirty: false, newline, syntax_invalid_from: None }
+        Self { lines, path: None, row: 0, col: 0, dirty: false, revision: 0, newline, syntax_invalid_from: None }
     }
 
     pub fn open(path: PathBuf) -> io::Result<Self> {
@@ -48,6 +49,12 @@ impl Document {
         fs::write(path, contents)?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// Serialize only when the LSP client observes a changed revision.
+    pub fn lsp_text(&self) -> String {
+        self.lines.iter().map(|line| line.iter().collect::<String>())
+            .collect::<Vec<_>>().join(self.newline)
     }
 
     pub fn line(&self) -> &[char] {
@@ -86,6 +93,7 @@ impl Document {
     pub fn end(&mut self) { self.col = self.line().len(); }
 
     pub fn invalidate_syntax_from(&mut self, row: usize) {
+        self.revision = self.revision.wrapping_add(1);
         self.syntax_invalid_from = Some(self.syntax_invalid_from.map_or(row, |old| old.min(row)));
     }
 
