@@ -2100,7 +2100,7 @@ mod tests {
             editor.open(root.join("two.md").to_string_lossy().into_owned());
             editor.switch_buffer(0);
             editor.close_buffer(false);
-            for key in ['\`', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            for key in ['`', 'A'] { press(&mut editor, KeyCode::Char(key)); }
             assert_eq!(editor.doc.row, 2);
             assert_eq!(editor.doc.col, 1);
         }
