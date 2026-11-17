@@ -49,6 +49,7 @@ shows incomplete sequences.
 | Set local / global mark | **ma / mA** |
 | Jump to mark | **'a** (line) / **`a** (exact column), uppercase for cross-file |
 | Select function (Tree-sitter) | **`vaf`** or **`SPC v f`** |
+| LSP definition and hover (rust-analyzer) | **`gd`** and **`K`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
 | Yank / delete selection | **`y` / `d`** in VISUAL mode |
 | Delete character / line | **`x` / `dd`** |
@@ -86,6 +87,47 @@ From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
 Opening another file does **not** require saving the current one: unsaved changes
 stay in their own buffer. Start an empty document with `remacs` and save it
 via `SPC f s`.
+
+## Language server support (Lua plugin)
+
+Remacs ships **`plugins/lsp.lua`** for language-server configuration and
+shortcuts. The Rust host **`src/lsp.rs`** handles asynchronous LSP 3.17 JSON-RPC
+over stdio; it starts **one server per language and workspace only when a
+matching file is opened**, never one server per buffer.
+
+For the first milestone Rust files use **rust-analyzer**:
+
+| Action | Shortcut |
+| --- | --- |
+| Go to definition | **`gd`** in Normal mode |
+| Hover documentation | **`K`** in Normal mode; Esc dismisses |
+| Return from definition | **`Ctrl+O`** (existing global jumplist) |
+
+Install rust-analyzer using your Rust toolchain:
+
+```sh
+rustup component add rust-analyzer rust-src
+```
+
+Open a Rust project and run `remacs src/main.rs`. The server starts in the
+background, initializes, opens the current file and processes changes without
+blocking the editor. `gd` works across files and reuses already-open buffers.
+`K` displays Markdown text in the existing centered Remacs popup.
+
+**Memory/CPU design:** One rust-analyzer process is shared by all open Rust
+buffers within a workspace. Remacs uses document revision numbers so ordinary
+cursor movement never sends text to the server. Changes are sent as minimal
+Unicode-safe edits with the server's negotiated position encoding (UTF-16 by
+default); no LSP server is started for non-Rust files. After closing a buffer,
+Remacs informs the language server. External tools such as rust-analyzer are
+not bundled with Remacs.
+
+**Roadmap:** This PR establishes LSP Core (definition, hover and synchronization).
+Interactive completion, diagnostics and refactoring actions are follow-up
+milestones, not included in this implementation. Language servers and
+keybindings remain configured in Lua; add more languages to
+`plugins/lsp.lua` and rebuild. GitHub Actions exercises a real rust-analyzer
+server on both Linux and macOS in addition to protocol unit tests.
 
 ## Floating terminal & LazyGit (Lua plugin)
 
