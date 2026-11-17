@@ -1,5 +1,6 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
 mod document;
+mod finder_ui;
 mod function_select;
 mod plugins;
 mod syntax;
@@ -18,6 +19,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use document::Document;
+use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache};
 use function_select::{around_function, Position, TextRange};
 use plugins::{TreeAction, TreePlugin, TreeView};
 use syntax::{Span, SyntaxEngine};
@@ -98,6 +100,7 @@ struct ScreenCache {
     syntax_enabled: Option<bool>,
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
+    finder: FinderCache,
     lines: Vec<Option<PaintedLine>>,
     status: Option<String>,
     message: Option<String>,
@@ -794,18 +797,32 @@ impl Editor {
         }
         self.screen.lines.resize_with(height, || None);
 
+        let tree_view = match self.tree.as_ref().map(|tree| tree.view(height.saturating_sub(1))) {
+            Some(Ok(view)) => Some(view),
+            Some(Err(error)) => {
+                self.message = format!("Tree render error: {error}");
+                None
+            }
+            None => None,
+        };
+        let finder_rect = tree_view.as_ref()
+            .and_then(|view| view.finder.as_ref())
+            .and_then(|_| finder_rect_for(cols, height));
+
+        // On closing the dialog, invalidate just the rows it covered.
+        // That restores the existing tree/editor content without clearing the
+        // whole screen or affecting the incremental renderer's other rows.
+        if let Some(old) = self.screen.finder.set_rect(finder_rect) {
+            for y in old.y as usize..old.y as usize + old.height {
+                if let Some(line) = self.screen.lines.get_mut(y) { *line = None; }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) { *line = None; }
+            }
+        }
+
         let mut selected_tree_row = 0;
         let mut search_cursor: Option<usize> = None;
         if sidebar_width > 0 {
-            let view = match self.tree.as_ref().map(|tree| tree.view(height.saturating_sub(1))) {
-                Some(Ok(view)) => Some(view),
-                Some(Err(error)) => {
-                    self.message = format!("Tree render error: {error}");
-                    None
-                }
-                None => None,
-            };
-            if let Some(view) = view {
+            if let Some(view) = tree_view.as_ref() {
                 selected_tree_row = view.selected;
                 search_cursor = view.search_cursor;
                 let focused = self.tree.as_ref().is_some_and(|tree| tree.focused);
@@ -977,11 +994,28 @@ impl Editor {
                 self.screen.message = Some(message);
             }
         }
+        // Overlay the fully visible fzf-style picker after the normal editor
+        // and sidebar have painted; only changed popup rows are output.
+        if let (Some(rect), Some(finder)) = (
+            finder_rect,
+            tree_view.as_ref().and_then(|view| view.finder.as_ref()),
+        ) {
+            self.screen.finder.paint(output, rect, finder)?;
+        }
+
         let (x, y) = match &self.prompt {
             Some(Prompt::SaveAs(name)) => ("Save file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Open(name)) => ("Find file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
+            None if finder_rect.is_some() => {
+                let rect = finder_rect.unwrap();
+                let query = tree_view.as_ref()
+                    .and_then(|view| view.finder.as_ref())
+                    .map_or("", |finder| finder.query.as_str());
+                let (x, y) = finder_cursor(rect, query);
+                (x as usize, y)
+            }
             None if sidebar_width > 0 && self.tree.as_ref().is_some_and(|tree| tree.focused) => (
                 search_cursor.map_or(2, |x| x.min(sidebar_width.saturating_sub(2))),
                 if search_cursor.is_some() { 0 } else { selected_tree_row as u16 },
@@ -1408,6 +1442,65 @@ mod tests {
         assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
         assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_none());
         assert_eq!(editor.doc.line().iter().collect::<String>(), "editor text");
+    }
+
+    #[test]
+    fn focused_tree_slash_opens_visible_fuzzy_dialog_and_opens_file() {
+        let temp = std::env::temp_dir().join(format!(
+            "remacs-finder-ui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(temp.join("src")).unwrap();
+        std::fs::write(temp.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(temp.join("README.md"), "# Example").unwrap();
+
+        let mut editor = Editor::new(Document::empty());
+        let mut tree = TreePlugin::new(&temp).unwrap();
+        tree.toggle().unwrap();
+        editor.tree = Some(tree);
+        let initial = paint(&mut editor);
+        assert!(initial.contains("FILES"));
+
+        press(&mut editor, KeyCode::Char('/'));
+        let opened = paint(&mut editor);
+        assert!(opened.contains("FIND FILES"), "finder must visibly open");
+        assert!(opened.contains("README.md"), "unfiltered project files must be listed");
+        assert!(!opened.contains("\x1b[2J"), "search must not erase entire screen");
+
+        // Live fuzzy search should narrow to the nested file.
+        for key in "mainrs".chars() {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        let matches = paint(&mut editor);
+        assert!(matches.contains("src/main.rs"));
+        assert!(matches.contains("mainrs"));
+        press(&mut editor, KeyCode::Enter);
+        assert_eq!(editor.doc.path.as_deref(), Some(temp.join("src/main.rs").as_path()));
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+        let restored = paint(&mut editor);
+        assert!(!restored.contains("FIND FILES"));
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn fuzzy_search_esc_closes_only_popup_not_the_tree() {
+        let mut editor = Editor::new(Document::from_text(
+            &vec!["EDITOR_CONTENT_STAYS_VISIBLE"; 30].join("\n")
+        ));
+        let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
+        tree.toggle().unwrap();
+        editor.tree = Some(tree);
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char('f'));
+        assert!(paint(&mut editor).contains("FIND FILES"));
+        press(&mut editor, KeyCode::Esc);
+        let restored = paint(&mut editor);
+        assert!(!restored.contains("FIND FILES"));
+        assert!(restored.contains("EDITOR_CONTENT_STAYS_VISIBLE"));
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(!restored.contains("\x1b[2J"));
     }
 
     #[test]

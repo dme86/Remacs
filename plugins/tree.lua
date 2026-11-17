@@ -13,6 +13,7 @@ local tree = {
   query = "",
   files = nil,
   results = {},
+  total_matches = 0,
   search_selected = 1,
   search_top = 1,
 }
@@ -137,12 +138,9 @@ local function update_results()
   if not tree.files then scan_files() end
   local results = {}
   for _, node in ipairs(tree.files) do
-    if tree.query == "" then
-      -- Avoid dumping a huge unfiltered project list on opening '/'.
-      -- The visible tree remains available by pressing Escape.
-      break
-    end
-    local score = fuzzy_score(node.name, tree.query)
+    -- An empty query should immediately offer files instead of showing a
+    -- blank pane (which previously made the finder seem broken).
+    local score = tree.query == "" and 0 or fuzzy_score(node.name, tree.query)
     if score then
       results[#results + 1] = { node = node, score = score }
     end
@@ -152,6 +150,7 @@ local function update_results()
     return a.node.name:lower() < b.node.name:lower()
   end)
   tree.results = {}
+  tree.total_matches = #results
   for i = 1, math.min(#results, MAX_RESULTS) do
     tree.results[i] = results[i].node
   end
@@ -167,12 +166,14 @@ local function start_search()
   tree.search_selected = 1
   tree.search_top = 1
   scan_files()
+  update_results()
 end
 
 local function cancel_search()
   tree.searching = false
   tree.query = ""
   tree.results = {}
+  tree.total_matches = 0
   tree.files = nil
   tree.search_selected = 1
   tree.search_top = 1
@@ -328,6 +329,12 @@ function tree.render(height)
   else
     title = " FILES  " .. name_of(tree.root)
   end
+  local search_matches = {}
+  if searching then
+    for i, entry in ipairs(tree.results) do
+      search_matches[i] = entry.name
+    end
+  end
   return {
     rows = rows,
     selected = selected_row,
@@ -336,6 +343,10 @@ function tree.render(height)
     searching = searching,
     query = tree.query,
     count = #nodes,
+    matches = search_matches,
+    search_selected = tree.search_selected,
+    total_matches = tree.total_matches,
+    scanned = tree.files and #tree.files or 0,
   }
 end
 

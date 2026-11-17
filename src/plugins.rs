@@ -16,6 +16,15 @@ pub enum TreeAction {
     Close,
 }
 
+pub struct FinderView {
+    pub query: String,
+    pub matches: Vec<String>,
+    /// 1-based index among matching files, not restricted to terminal height.
+    pub selected: usize,
+    pub total_matches: usize,
+    pub scanned: usize,
+}
+
 pub struct TreeView {
     pub title: String,
     pub lines: Vec<String>,
@@ -23,6 +32,7 @@ pub struct TreeView {
     pub selected: usize,
     /// Column of the search input in the sidebar header, when searching.
     pub search_cursor: Option<usize>,
+    pub finder: Option<FinderView>,
 }
 
 pub struct TreePlugin {
@@ -153,11 +163,25 @@ impl TreePlugin {
         } else {
             None
         };
+        let finder = if searching {
+            let matches: Table = result.get("matches")?;
+            Some(FinderView {
+                query: result.get("query")?,
+                matches: matches.sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?,
+                selected: result.get("search_selected")?,
+                total_matches: result.get("total_matches")?,
+                scanned: result.get("scanned")?,
+            })
+        } else {
+            None
+        };
         Ok(TreeView {
             title: result.get::<String>("title").unwrap_or_else(|_| format!(" FILES  {root}")),
             lines,
             selected: result.get("selected")?,
             search_cursor,
+            finder,
         })
     }
 }
@@ -185,6 +209,12 @@ mod tests {
         tree.toggle().unwrap();
         tree.on_key("/").unwrap();
         assert!(tree.view(10).unwrap().title.contains("FIND /"));
+        let initial = tree.view(10).unwrap();
+        let finder = initial.finder.as_ref().unwrap();
+        assert!(!finder.matches.is_empty(), "opening the finder must show results");
+        assert!(finder.matches.iter().any(|name| name == "README.md"));
+        assert_eq!(finder.selected, 1);
+        assert!(finder.scanned >= 3);
         // Search the whole project, even before expanding the src folder.
         for c in "renger".chars() {
             tree.on_key(&c.to_string()).unwrap();
@@ -237,7 +267,10 @@ mod tests {
         tree.on_key("backspace").unwrap();
         assert!(tree.view(10).unwrap().title.contains("FIND / ca "));
         tree.on_key("ctrl-u").unwrap();
-        assert!(tree.view(10).unwrap().lines.iter().all(String::is_empty));
+        let cleared = tree.view(10).unwrap();
+        assert!(cleared.finder.as_ref().is_some_and(|finder| finder.query.is_empty()));
+        assert!(cleared.lines.iter().any(|line| line.contains("camel.txt")),
+            "clearing the query should restore initial suggestions");
         let _ = fs::remove_dir_all(temp);
     }
 

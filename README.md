@@ -107,11 +107,16 @@ prototype, not yet a general-purpose plugin manager or configuration loader.
 
 ### Fuzzy file finding in the tree
 
-Focus the tree, then press **`/`** (or **`f`**) to search the *whole project*,
-including files inside collapsed folders. Type a filename or any subsequence,
-for example `rdme` to find `README.md`, or `rndr` to find
-`src/render_engine.rs`. Matching paths are ranked live (filename and
-consecutive matches receive higher scores).
+Focus the file tree, then press **`/`** (or **`f`**) to open a **centered file
+finder overlay** over the editor. Matches are visible immediately, even
+before typing. Type a filename or any subsequence, for example `rdme` to
+find `README.md`, or `rndr` to find `src/render_engine.rs`.
+It searches the entire project including collapsed folders and updates the
+ranked matches live. The overlay leaves the file tree open in the background.
+
+The finder is currently a built-in, fzf-*style* Lua fuzzy matcher, **not** an
+external `fzf` subprocess and does not require `fzf` to be installed.
+If desired, an optional native fzf backend can be added later.
 
 In search mode, use **Up/Down** or **Tab/Shift+Tab** to choose a match,
 **Enter** to open it, **Backspace** to edit the query, **Ctrl+U** to clear it,
