@@ -1,7 +1,7 @@
 //! Syntax highlighting with embedded Sublime/bat grammars. Enabled by default.
 //! Cache parser state after each line so normal cursor movement never reparses it.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::{Arc, OnceLock}};
 
 use crossterm::style::Color;
 use two_face::re_exports::syntect::{
@@ -25,8 +25,8 @@ struct CachedLine {
 }
 
 pub struct SyntaxEngine {
-    syntaxes: SyntaxSet,
-    theme: Theme,
+    syntaxes: Arc<SyntaxSet>,
+    theme: Arc<Theme>,
     path: Option<PathBuf>,
     name: String,
     cached: Vec<CachedLine>,
@@ -35,16 +35,20 @@ pub struct SyntaxEngine {
 
 impl SyntaxEngine {
     pub fn new(doc: &Document) -> Self {
-        let syntaxes = two_face::syntax::extra_newlines();
-        let mut themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .remove("base16-ocean.dark")
-            .expect("embedded highlighting theme");
-        let name = Self::detect(&syntaxes, doc).name.to_owned();
+        // Share the bundled grammars and theme across every open buffer.
+        // Loading and retaining a full SyntaxSet per document wastes memory.
+        static SHARED: OnceLock<(Arc<SyntaxSet>, Arc<Theme>)> = OnceLock::new();
+        let (syntaxes, theme) = SHARED.get_or_init(|| {
+            let syntaxes = Arc::new(two_face::syntax::extra_newlines());
+            let mut themes = ThemeSet::load_defaults();
+            let theme = Arc::new(themes.themes.remove("base16-ocean.dark")
+                .expect("embedded highlighting theme"));
+            (syntaxes, theme)
+        });
+        let name = Self::detect(syntaxes, doc).name.to_owned();
         Self {
-            syntaxes,
-            theme,
+            syntaxes: Arc::clone(syntaxes),
+            theme: Arc::clone(theme),
             path: doc.path.clone(),
             name,
             cached: Vec::new(),
