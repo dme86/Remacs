@@ -595,8 +595,8 @@ mod tests {
     #[test]
     fn precise_incremental_edits_use_unicode_utf16_offsets() {
         let patch = incremental_change("fn 🦀() {}\n", "fn 🦀(x) {}\n", Encoding::Utf16);
-        assert_eq!(patch["range"]["start"], json!({"line":0,"character":7}));
-        assert_eq!(patch["range"]["end"], json!({"line":0,"character":7}));
+        assert_eq!(patch["range"]["start"], json!({"line":0,"character":6}));
+        assert_eq!(patch["range"]["end"], json!({"line":0,"character":6}));
         assert_eq!(patch["text"], "x");
         let chars: Vec<char> = "🦀hi".chars().collect();
         assert_eq!(character_offset(&chars, 1, Encoding::Utf16), 2);
