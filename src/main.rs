@@ -212,7 +212,13 @@ impl Editor {
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
-            jumps: JumpManager::load_default(),
+            // Unit tests must not write to the real user's persistent state
+            // or race each other while modifying the global jump history.
+            jumps: if cfg!(test) {
+                JumpManager::memory_only()
+            } else {
+                JumpManager::load_default()
+            },
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -2023,6 +2029,128 @@ mod tests {
         editor.command("wa");
         assert_eq!(editor.message, "All buffers already saved");
         assert_eq!(editor.dirty_buffers(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_and_alt_right_jump_back_and_forward_across_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.doc.col = 1;
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        assert_eq!(editor.active_slot, 1);
+        // Exercise the actual keyboard event dispatch.
+        editor.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 0);
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 1));
+
+        editor.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), 12);
+        assert_eq!(editor.active_slot, 1);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_positions_are_recalled_across_buffers_and_buffer_close() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.doc.col = 2;
+        // Recording happens at the start of each editing command.
+        editor.remember();
+        editor.doc.insert('A');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.row = 0;
+        editor.doc.col = 3;
+        editor.remember();
+        editor.doc.insert('B');
+        assert_eq!(editor.jumps.changes().len(), 2);
+        editor.jump_to_change(true);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        editor.jump_to_change(true);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 2));
+
+        // Close the now-clean second file, then revisit its edit position.
+        editor.switch_buffer(1);
+        editor.doc.dirty = false; // simulate file saved
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1);
+        editor.jump_to_change(false);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        assert_eq!(editor.doc.row, 0);
+        // Files reopened after buffer close are loaded from disk; unsaved
+        // content is intentionally not persisted by the jumplist.
+        assert_eq!(editor.doc.line().iter().collect::<String>(), "# two");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_persist_across_buffer_closes_and_process_restart() {
+        let root = temporary_buffer_project();
+        let state = root.join("jump_history.json");
+        {
+            let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+            editor.jumps = JumpManager::from_path(state.clone());
+            editor.doc.row = 2;
+            editor.doc.col = 1;
+            for key in ['m', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            for key in ['m', 'a'] { press(&mut editor, KeyCode::Char(key)); }
+            assert!(editor.message.contains("Mark a"));
+            editor.open(root.join("two.md").to_string_lossy().into_owned());
+            editor.switch_buffer(0);
+            editor.close_buffer(false);
+            for key in ['\`', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            assert_eq!(editor.doc.row, 2);
+            assert_eq!(editor.doc.col, 1);
+        }
+
+        let mut editor = Editor::new(Document::open(root.join("two.md")).unwrap());
+        editor.jumps = JumpManager::from_path(state);
+        for key in ['\'', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        assert_eq!(editor.doc.row, 2);
+        assert_eq!(editor.doc.col, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_jump_target_does_not_create_a_new_file() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.jumps.remember(Location {
+            path: root.join("missing.rs"), row: 5, col: 0
+        }).unwrap();
+        editor.jumps.remember(Location {
+            path: root.join("one.rs"), row: 0, col: 0
+        }).unwrap();
+        editor.jump_back();
+        assert!(editor.message.contains("Jump target missing"));
+        assert!(!root.join("missing.rs").exists());
+        assert_eq!(editor.slots.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vim_gg_and_g_semicolon_record_and_navigate_jumps_and_edits() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        for key in ['g', 'g'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 0);
+        editor.jump_back();
+        assert_eq!(editor.doc.row, 2);
+        editor.doc.row = 1;
+        editor.remember();
+        editor.doc.row = 2;
+        editor.remember();
+        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 2);
+        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 1);
+        for key in ['g', ','] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
