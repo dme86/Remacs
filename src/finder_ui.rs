@@ -264,7 +264,7 @@ mod tests {
         assert!(rect.x < 34);
         let mut cache = Cache::default();
         cache.set_rect(Some(rect));
-        cache.paint(&mut Vec::new(), rect, &finder).unwrap();
+        cache.paint(&mut Vec::new(), rect, &finder, PickerKind::Files).unwrap();
 
         // Ordinary repeated draws still avoid redundant popup output.
         let mut no_update = Vec::new();
