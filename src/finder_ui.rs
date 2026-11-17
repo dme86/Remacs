@@ -78,6 +78,7 @@ pub fn search_cursor(rect: Rect, query: &str) -> (u16, u16) {
 pub enum PickerKind {
     Files,
     Buffers,
+    Hover,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,13 +147,16 @@ impl Cache {
                 let title = match kind {
                     PickerKind::Files => "─ FIND FILES ",
                     PickerKind::Buffers => "─ SWITCH BUFFER ",
+                    PickerKind::Hover => "─ LSP HOVER ",
                 };
                 // Terminal geometry is measured in cells, not UTF-8 bytes.
                 let filler = rect.width.saturating_sub(2 + UnicodeWidthStr::width(title));
                 (format!("╭{title}{}╮", "─".repeat(filler)), Style::Border)
             } else if row == 1 {
                 let query = trailing_query(&finder.query, rect.width.saturating_sub(7));
-                (format!("│{}│", pad(&format!("  > {query}"), interior)), Style::Input)
+                (format!("│{}│", pad(&if kind == PickerKind::Hover {
+                    "  Documentation · Esc to close".to_string()
+                } else { format!("  > {query}") }, interior)), Style::Input)
             } else if row == 2 {
                 (format!("├{}┤", "─".repeat(interior)), Style::Border)
             } else if row == rect.height - 2 {
@@ -165,6 +169,7 @@ impl Cache {
                         "  {} matches · {} buffers · ↑↓ choose · Enter switch · Esc cancel",
                         finder.total_matches, finder.scanned
                     ),
+                    PickerKind::Hover => "  Rust language server · Esc close".to_string(),
                 };
                 (format!("│{}│", pad(&label, interior)), Style::Footer)
             } else if row == rect.height - 1 {
@@ -172,13 +177,16 @@ impl Cache {
             } else {
                 let index = start + row - 3;
                 let entry = finder.matches.get(index);
-                let is_selected = entry.is_some() && index + 1 == selected;
+                let is_selected = kind != PickerKind::Hover
+                    && entry.is_some() && index + 1 == selected;
                 let label = match entry {
+                    Some(path) if kind == PickerKind::Hover => format!("  {path}"),
                     Some(path) => format!("  {} {path}", if is_selected { '>' } else { ' ' }),
                     None if row == 3 && finder.matches.is_empty() && finder.query.is_empty() =>
                         match kind {
                             PickerKind::Files => "  No project files found".to_string(),
                             PickerKind::Buffers => "  No open buffers".to_string(),
+                            PickerKind::Hover => "  No hover information".to_string(),
                         },
                     None if row == 3 && finder.matches.is_empty() =>
                         "  No matches — try another query".to_string(),
@@ -214,6 +222,25 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_overlay_reuses_cached_dialog_without_search_controls() {
+        let view = FinderView {
+            query: String::new(),
+            matches: vec!["fn greet(name: &str)".into(), "Rust documentation".into()],
+            selected: 0, total_matches: 2, scanned: 2,
+        };
+        let rect = rect_for(80, 30).unwrap();
+        let mut cache = Cache::default();
+        cache.set_rect(Some(rect));
+        let mut output = Vec::new();
+        cache.paint(&mut output, rect, &view, PickerKind::Hover).unwrap();
+        let display = String::from_utf8(output).unwrap();
+        assert!(display.contains("LSP HOVER"));
+        assert!(display.contains("fn greet(name: &str)"));
+        assert!(display.contains("Esc to close"));
+        assert!(!display.contains("Enter switch"));
+    }
 
     #[test]
     fn popup_is_centered_and_not_in_status_area() {
