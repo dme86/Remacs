@@ -1589,6 +1589,151 @@ mod tests {
         String::from_utf8(output).unwrap()
     }
 
+    fn temporary_buffer_project() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "remacs-buffers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("one.rs"), "one\nsecond\nthird\n").unwrap();
+        std::fs::write(root.join("two.md"), "# two\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn unsaved_file_can_be_left_and_restored_with_independent_undo() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        press(&mut editor, KeyCode::Char('j'));
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('X'));
+        press(&mut editor, KeyCode::Esc);
+        editor.scroll_row = 1;
+        editor.scroll_col = 3;
+        assert!(editor.doc.dirty);
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        assert_eq!(editor.slots.len(), 2);
+        assert_eq!(editor.active_slot, 1);
+        assert_eq!(editor.dirty_buffers(), 1);
+        assert!(!editor.doc.dirty);
+        assert_eq!(editor.doc.row, 0);
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('Y'));
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.dirty_buffers(), 2);
+        editor.open(root.join("one.rs").to_string_lossy().into_owned());
+        assert_eq!(editor.slots.len(), 2, "reopening must reuse the buffer");
+        assert_eq!(editor.active_slot, 0);
+        assert_eq!(editor.scroll_row, 1);
+        assert_eq!(editor.scroll_col, 3);
+        assert_eq!(editor.doc.row, 1);
+        assert!(editor.doc.lines[1].iter().collect::<String>().starts_with('X'));
+        editor.undo();
+        assert_eq!(editor.doc.lines[1].iter().collect::<String>(), "second");
+        editor.switch_buffer(1);
+        assert!(editor.doc.lines[0].iter().collect::<String>().starts_with('Y'));
+        editor.undo();
+        assert_eq!(editor.doc.lines[0].iter().collect::<String>(), "# two");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tree_opens_second_file_without_discarding_modified_first_buffer() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.insert('!');
+        let mut tree = TreePlugin::new(&root).unwrap();
+        tree.toggle().unwrap();
+        editor.tree = Some(tree);
+        // Sorted root: one.rs, two.md.
+        editor.tree_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        editor.tree_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(editor.doc.path.as_ref().is_some_and(|p| p.ends_with("two.md")));
+        assert_eq!(editor.slots.len(), 2);
+        assert!(editor.slots[0].as_ref().unwrap().doc.dirty);
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+        editor.switch_buffer(0);
+        assert_eq!(editor.doc.lines[0].first(), Some(&'!'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doom_buffer_navigation_and_last_buffer_are_stable() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        assert_eq!(editor.active_slot, 1);
+        for key in [' ', 'b', 'p'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.active_slot, 0);
+        for key in [' ', 'b', 'l'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.active_slot, 1);
+        for key in [' ', 'b', 'n'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.active_slot, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn buffer_picker_lists_dirty_buffers_and_switches_without_reloading() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.insert('!');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        for key in [' ', 'b', 'b'] { press(&mut editor, KeyCode::Char(key)); }
+        assert!(editor.buffer_picker.is_some());
+        let popup = paint(&mut editor);
+        assert!(popup.contains("SWITCH BUFFER"));
+        assert!(popup.contains("one.rs"));
+        assert!(popup.contains("two.md"));
+        assert!(popup.contains('●'), "dirty buffers are marked");
+        for key in ['o', 'n', 'e'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.buffer_picker_view().unwrap().total_matches, 1);
+        press(&mut editor, KeyCode::Enter);
+        assert!(editor.buffer_picker.is_none());
+        assert_eq!(editor.active_slot, 0);
+        assert!(editor.doc.dirty);
+        assert_eq!(editor.doc.lines[0].first(), Some(&'!'));
+        let output = paint(&mut editor);
+        assert!(!output.contains("SWITCH BUFFER"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quit_and_close_protect_all_dirty_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.insert('!');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.quit();
+        assert!(matches!(editor.prompt, Some(Prompt::Quit)),
+            "quit must notice an unsaved inactive buffer");
+        editor.prompt_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(editor.running);
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1);
+        assert!(editor.doc.dirty, "closing clean buffer must restore dirty buffer");
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1, "cannot close an unsaved buffer");
+        editor.close_buffer(true);
+        assert!(!editor.doc.dirty);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_open_and_duplicate_save_do_not_damage_other_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.open(root.join("not-a-directory").join("a.rs").to_string_lossy().into_owned());
+        assert_eq!(editor.active_slot, 1);
+        assert_eq!(editor.slots.len(), 2);
+        editor.set_path_and_save(root.join("one.rs"));
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"),
+            "save-as cannot overwrite a file already open in another buffer");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn moving_up_and_down_never_repaints_the_file() {
         let mut editor = Editor::new(Document::from_text("Unique first line\nUnique second line\nUnique third line"));
