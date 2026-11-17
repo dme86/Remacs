@@ -1486,7 +1486,9 @@ mod tests {
 
     #[test]
     fn fuzzy_search_esc_closes_only_popup_not_the_tree() {
-        let mut editor = Editor::new(Document::from_text("EDITOR_CONTENT_STAYS_VISIBLE"));
+        let mut editor = Editor::new(Document::from_text(
+            &vec!["EDITOR_CONTENT_STAYS_VISIBLE"; 30].join("\n")
+        ));
         let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
         tree.toggle().unwrap();
         editor.tree = Some(tree);
