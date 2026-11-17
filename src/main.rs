@@ -2522,6 +2522,45 @@ mod tests {
     }
 
     #[test]
+    fn mason_opens_same_fuzzy_popup_and_filters_language_catalog() {
+        let mut editor = Editor::new(Document::from_text("example"));
+        editor.command("mason");
+        assert!(editor.mason_picker.is_some());
+        let out = paint(&mut editor);
+        assert!(out.contains("MASON"));
+        assert!(out.contains("rust_analyzer"));
+        assert!(out.contains("Ctrl+S sync"));
+        for key in ['g', 'o', 'p', 'l', 's'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        let entries = editor.mason_view().unwrap();
+        assert_eq!(entries.total_matches, 1);
+        assert!(entries.matches[0].contains("gopls"));
+        editor.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10);
+        assert!(editor.mason_picker.is_none());
+        assert!(!paint(&mut editor).contains("MASON"));
+    }
+
+    #[test]
+    fn mason_leader_binding_and_commands_queue_tools_without_starting_downloads() {
+        let mut editor = Editor::new(Document::from_text("example"));
+        for key in [' ', 'l', 'm'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        assert!(editor.mason_picker.is_some());
+        editor.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10);
+        assert!(editor.mason_picker.is_some(), "installer UI stays visible");
+        // An explicit update is allowed even if a system server exists.
+        editor.command("mason update gopls");
+        assert!(editor.message.contains("gopls"));
+        editor.command("mason install nonexistent");
+        assert!(editor.message.contains("Unknown language server"));
+        editor.command("mason log");
+        assert!(editor.message.contains("install.log"));
+        // Test does not tick the installer. Nothing runs without poll_mason.
+    }
+
+    #[test]
     fn save_all_shortcut_persists_dirty_active_and_inactive_buffers() {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
