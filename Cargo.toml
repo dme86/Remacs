@@ -36,3 +36,6 @@ serde_json = "1"
 # Lua toggleterm host: a real PTY plus bounded VT100 emulator (Linux/macOS)
 portable-pty = "0.9"
 vt100 = "0.18"
+
+# Canonical file:// URI handling for LSP workspaces and non-ASCII file paths
+url = "2.5"
