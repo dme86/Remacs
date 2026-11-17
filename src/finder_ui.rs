@@ -79,6 +79,7 @@ pub enum PickerKind {
     Files,
     Buffers,
     Hover,
+    Mason,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +149,7 @@ impl Cache {
                     PickerKind::Files => "─ FIND FILES ",
                     PickerKind::Buffers => "─ SWITCH BUFFER ",
                     PickerKind::Hover => "─ LSP HOVER ",
+                    PickerKind::Mason => "─ MASON · LANGUAGE SERVERS ",
                 };
                 // Terminal geometry is measured in cells, not UTF-8 bytes.
                 let filler = rect.width.saturating_sub(2 + UnicodeWidthStr::width(title));
@@ -170,6 +172,8 @@ impl Cache {
                         finder.total_matches, finder.scanned
                     ),
                     PickerKind::Hover => "  Rust language server · Esc close".to_string(),
+                    PickerKind::Mason =>
+                        "  Enter install · Ctrl+U update · Ctrl+S sync · Ctrl+R update all".to_string(),
                 };
                 (format!("│{}│", pad(&label, interior)), Style::Footer)
             } else if row == rect.height - 1 {
@@ -187,6 +191,7 @@ impl Cache {
                             PickerKind::Files => "  No project files found".to_string(),
                             PickerKind::Buffers => "  No open buffers".to_string(),
                             PickerKind::Hover => "  No hover information".to_string(),
+                            PickerKind::Mason => "  No configured language servers".to_string(),
                         },
                     None if row == 3 && finder.matches.is_empty() =>
                         "  No matches — try another query".to_string(),
@@ -222,6 +227,24 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mason_overlay_shows_status_and_action_hints() {
+        let view = FinderView {
+            query: "".into(),
+            matches: vec!["rust_analyzer · Rust · installed · system".into()],
+            selected: 1, total_matches: 1, scanned: 6,
+        };
+        let rect = rect_for(120, 32).unwrap();
+        let mut cache = Cache::default();
+        cache.set_rect(Some(rect));
+        let mut rendered = Vec::new();
+        cache.paint(&mut rendered, rect, &view, PickerKind::Mason).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("MASON"));
+        assert!(text.contains("rust_analyzer"));
+        assert!(text.contains("Ctrl+S sync"));
+    }
 
     #[test]
     fn hover_overlay_reuses_cached_dialog_without_search_controls() {
