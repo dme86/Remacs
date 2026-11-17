@@ -234,10 +234,6 @@ impl Editor {
             + self.slots.iter().flatten().filter(|buffer| buffer.doc.dirty).count()
     }
 
-    fn dirty_except_active(&self) -> usize {
-        self.slots.iter().flatten().filter(|buffer| buffer.doc.dirty).count()
-    }
-
     fn named_slot(&self, path: &Path) -> Option<usize> {
         let target = path_identity(path);
         if self.doc.path.as_ref().is_some_and(|p| path_identity(p) == target) {
@@ -349,11 +345,20 @@ impl Editor {
             };
             let name = Self::buffer_name(doc);
             if !matches_buffer(&name, query) { return None; }
+            // Filename comes first so long absolute paths never hide the
+            // useful part of the entry in a narrower terminal.
+            let basename = doc.path.as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "[No Name]".into());
+            let parent = doc.path.as_ref().and_then(|path| path.parent())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
             Some((index, format!(
-                "{} {}{}  {}",
+                "{} {}{}  {}  {}",
                 if active { "▶" } else { " " },
                 if doc.dirty { "● " } else { "  " },
-                index + 1, name
+                index + 1, basename, parent
             )))
         }).collect()
     }
