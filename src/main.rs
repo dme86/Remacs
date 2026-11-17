@@ -2123,7 +2123,10 @@ mod tests {
 
     #[test]
     fn missing_jump_target_does_not_create_a_new_file() {
-        let root = temporary_buffer_project();
+        // macOS temp paths often contain /var -> /private/var symlinks.
+        // Use the canonical root so test fixtures match production
+        // path_identity() when storing and comparing jump locations.
+        let root = std::fs::canonicalize(temporary_buffer_project()).unwrap();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.jumps.remember(Location {
             path: root.join("missing.rs"), row: 5, col: 0
