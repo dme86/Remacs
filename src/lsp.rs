@@ -4,7 +4,7 @@
 //! server startup, indexing or IO. Calls are queued until initialized.
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
@@ -152,6 +152,14 @@ pub fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
     serde_json::from_slice(&body).map(Some).map_err(io::Error::other)
 }
 
+fn trace_message(direction: &str, payload: &Value) {
+    if cfg!(test) && std::env::var_os("REMACS_LSP_TRACE").is_some() {
+        let message = payload.to_string();
+        let preview = message.chars().take(1200).collect::<String>();
+        eprintln!("LSP {direction}: {preview}");
+    }
+}
+
 pub fn write_frame(writer: &mut impl Write, message: &Value) -> io::Result<()> {
     let body = serde_json::to_vec(message).map_err(io::Error::other)?;
     write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
@@ -235,7 +243,11 @@ impl Server {
         thread::Builder::new().name("remacs-lsp-writer".into()).spawn(move || {
             let mut stdin = stdin;
             while let Ok(value) = outgoing.recv() {
-                if write_frame(&mut stdin, &value).is_err() { break; }
+                trace_message(">>>", &value);
+                if let Err(error) = write_frame(&mut stdin, &value) {
+                    eprintln!("remacs LSP writer stopped: {error}");
+                    break;
+                }
             }
         })?;
         thread::Builder::new().name("remacs-lsp-reader".into()).spawn(move || {
@@ -243,6 +255,7 @@ impl Server {
             loop {
                 match read_frame(&mut stdout) {
                     Ok(Some(value)) => {
+                        trace_message("<<<", &value);
                         if incoming.send(Ok(value)).is_err() { break; }
                     }
                     Ok(None) => break,
@@ -644,12 +657,15 @@ mod tests {
         assert!(manager.request(&config, &source, 0, 1, column,
             RequestKind::Definition).unwrap());
 
-        let deadline = Instant::now() + Duration::from_secs(75);
+        let deadline = Instant::now() + Duration::from_secs(25);
         let present = HashSet::from([absolute(&source)]);
         let mut found = false;
         let mut failure = None;
         while Instant::now() < deadline {
             for event in manager.poll() {
+                if let Event::Status(ref status) = event {
+                    eprintln!("LSP EVENT: {status}");
+                }
                 match event {
                     Event::Definition { target: Some(target), .. } => {
                         assert_eq!(absolute(&target.path), absolute(&source));
