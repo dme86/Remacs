@@ -75,6 +75,12 @@ pub fn search_cursor(rect: Rect, query: &str) -> (u16, u16) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerKind {
+    Files,
+    Buffers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Style {
     Border,
     Input,
@@ -124,6 +130,7 @@ impl Cache {
         output: &mut impl Write,
         rect: Rect,
         finder: &FinderView,
+        kind: PickerKind,
     ) -> io::Result<()> {
         self.painted.resize_with(rect.height, || None);
         let interior = rect.width.saturating_sub(2);
@@ -136,7 +143,10 @@ impl Cache {
 
         for row in 0..rect.height {
             let (line, style) = if row == 0 {
-                let title = "─ FIND FILES ";
+                let title = match kind {
+                    PickerKind::Files => "─ FIND FILES ",
+                    PickerKind::Buffers => "─ SWITCH BUFFER ",
+                };
                 // Terminal geometry is measured in cells, not UTF-8 bytes.
                 let filler = rect.width.saturating_sub(2 + UnicodeWidthStr::width(title));
                 (format!("╭{title}{}╮", "─".repeat(filler)), Style::Border)
@@ -146,10 +156,16 @@ impl Cache {
             } else if row == 2 {
                 (format!("├{}┤", "─".repeat(interior)), Style::Border)
             } else if row == rect.height - 2 {
-                let label = format!(
-                    "  {} matches · {} indexed · ↑↓ choose · Enter open · Esc cancel",
-                    finder.total_matches, finder.scanned
-                );
+                let label = match kind {
+                    PickerKind::Files => format!(
+                        "  {} matches · {} indexed · ↑↓ choose · Enter open · Esc cancel",
+                        finder.total_matches, finder.scanned
+                    ),
+                    PickerKind::Buffers => format!(
+                        "  {} matches · {} buffers · ↑↓ choose · Enter switch · Esc cancel",
+                        finder.total_matches, finder.scanned
+                    ),
+                };
                 (format!("│{}│", pad(&label, interior)), Style::Footer)
             } else if row == rect.height - 1 {
                 (format!("╰{}╯", "─".repeat(interior)), Style::Border)
@@ -160,7 +176,10 @@ impl Cache {
                 let label = match entry {
                     Some(path) => format!("  {} {path}", if is_selected { '>' } else { ' ' }),
                     None if row == 3 && finder.matches.is_empty() && finder.query.is_empty() =>
-                        "  No project files found".to_string(),
+                        match kind {
+                            PickerKind::Files => "  No project files found".to_string(),
+                            PickerKind::Buffers => "  No open buffers".to_string(),
+                        },
                     None if row == 3 && finder.matches.is_empty() =>
                         "  No matches — try another query".to_string(),
                     None => String::new(),
@@ -218,7 +237,7 @@ mod tests {
         let mut cache = Cache::default();
         cache.set_rect(Some(rect));
         let mut output = Vec::new();
-        cache.paint(&mut output, rect, &finder).unwrap();
+        cache.paint(&mut output, rect, &finder, PickerKind::Files).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("FIND FILES"));
         assert!(output.contains("README.md"));
@@ -226,7 +245,7 @@ mod tests {
         assert!(output.contains("indexed"));
         assert!(!output.contains("\x1b[2J"));
         let mut subsequent = Vec::new();
-        cache.paint(&mut subsequent, rect, &finder).unwrap();
+        cache.paint(&mut subsequent, rect, &finder, PickerKind::Files).unwrap();
         assert!(subsequent.is_empty(), "unchanged search should not repaint");
         assert_eq!(cache.set_rect(None), Some(rect));
     }
@@ -245,17 +264,17 @@ mod tests {
         assert!(rect.x < 34);
         let mut cache = Cache::default();
         cache.set_rect(Some(rect));
-        cache.paint(&mut Vec::new(), rect, &finder).unwrap();
+        cache.paint(&mut Vec::new(), rect, &finder, PickerKind::Files).unwrap();
 
         // Ordinary repeated draws still avoid redundant popup output.
         let mut no_update = Vec::new();
-        cache.paint(&mut no_update, rect, &finder).unwrap();
+        cache.paint(&mut no_update, rect, &finder, PickerKind::Files).unwrap();
         assert!(no_update.is_empty());
 
         // Simulate an underlying tree repaint crossing the popup's left edge.
         cache.invalidate_underpaint(0, rect.y as usize, 34);
         let mut repaired = Vec::new();
-        cache.paint(&mut repaired, rect, &finder).unwrap();
+        cache.paint(&mut repaired, rect, &finder, PickerKind::Files).unwrap();
         let text = String::from_utf8(repaired).unwrap();
         assert!(text.contains("FIND FILES"), "popup title must be restored");
         assert!(!text.contains("src/plugins.rs"), "other popup rows stay cached");
@@ -263,7 +282,7 @@ mod tests {
         // A repaint at the search prompt must restore that row as well.
         cache.invalidate_underpaint(0, rect.y as usize + 1, 34);
         let mut repaired = Vec::new();
-        cache.paint(&mut repaired, rect, &finder).unwrap();
+        cache.paint(&mut repaired, rect, &finder, PickerKind::Files).unwrap();
         let text = String::from_utf8(repaired).unwrap();
         assert!(text.contains("  > p"), "search input must not be clipped");
 
@@ -271,7 +290,7 @@ mod tests {
         cache.invalidate_underpaint(0, rect.y as usize + 1, rect.x as usize);
         cache.invalidate_underpaint(0, 0, 34);
         let mut unchanged = Vec::new();
-        cache.paint(&mut unchanged, rect, &finder).unwrap();
+        cache.paint(&mut unchanged, rect, &finder, PickerKind::Files).unwrap();
         assert!(unchanged.is_empty());
     }
 

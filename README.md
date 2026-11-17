@@ -14,7 +14,7 @@ No GUI, no menus, no daemon, and no configuration required to start editing.
 The default keymap is **Vim-style modal editing** with a **Doom-inspired Space leader**.
 
 This is an independent implementation, **not** a port of MicroEmacs' C code.
-The first milestone focuses on the essentials; Lua plugins and LSP are future goals.
+The first milestone focuses on the essentials; the Lua file-tree plugin is bundled and LSP is a future goal.
 
 ## Get started
 
@@ -50,15 +50,19 @@ shows incomplete sequences.
 | Delete character / line | **`x` / `dd`** |
 | Yank line / paste | **`yy` / `p`** |
 | Undo / redo | **`u` / `Ctrl+R`** |
-| Open file | **`SPC f f`** |
+| Open file in a buffer | **`SPC f f`** (or select in tree) |
+| Switch buffers (searchable picker) | **`SPC b b`** |
+| Next / previous buffer | **`SPC b n`** / **`SPC b p`** |
+| Toggle last buffer | **`SPC b l`** |
+| Close current buffer (only if saved) | **`SPC b d`** |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
 | Save file | **`SPC f s`** |
 | Quit (prompts if modified) | **`SPC q q`** |
-| Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, or `w FILE` |
+| Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, `w FILE`, `buffers`, `bn`, `bp`, `b#`, `bd` or `bd!` |
 | Legacy Emacs-style file shortcuts | **`Ctrl+X Ctrl+F`**, **`Ctrl+X Ctrl+S`**, **`Ctrl+X Ctrl+C`** |
 
-The editor has a single file buffer, a status line, a minibuffer, UTF-8 text
-editing, basic horizontal/vertical scrolling, and CRLF/LF preservation.
+The editor supports multiple independent file buffers, a status line, a minibuffer,
+UTF-8 text editing, basic horizontal/vertical scrolling, and CRLF/LF preservation.
 This is a **small subset** of Vim/Evil, not full compatibility with Doom Emacs.
 
 ### macOS
@@ -72,8 +76,37 @@ remacs ~/Documents/notes.txt
 ```
 
 From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
-Opening another file requires saving or discarding your current unsaved changes
-first. Start an empty document with `remacs` and save it via `SPC f s`.
+Opening another file does **not** require saving the current one: unsaved changes
+stay in their own buffer. Start an empty document with `remacs` and save it
+via `SPC f s`.
+
+## Multiple file buffers
+
+Every opened document has its **own editable text, unsaved/dirty flag,
+cursor, scroll position, and undo/redo history**. Opening another file
+from the tree, the fuzzy finder, `SPC f f`, or `:e FILE` leaves the old
+buffer intact. Opening a file already in the buffer list switches back to
+that same buffer rather than rereading the file and losing edits.
+
+**`SPC b b`** opens a searchable popup listing all buffers. Start typing
+to filter by name/path, use Up/Down (or Tab/Shift+Tab), and Enter to switch.
+A `●` denotes unsaved edits and `▶` marks the active buffer.
+**`SPC b n`** and **`SPC b p`** cycle through buffers;
+**`SPC b l`** toggles between the two most recently active buffers.
+The status line shows the current buffer index, total count, and modified count.
+
+**`SPC b d`** or `:bd` closes a clean buffer; a dirty buffer is protected
+until saved, unless you explicitly use `:bd!` to discard it.
+Quit checks **all** open buffers, including inactive ones, and prompts before
+discarding unsaved changes. `:q!` still exits without saving.
+
+Buffers are kept **in memory only**, with no session persistence or
+automatic disk swap. Switching uses Rust ownership moves (no document clone);
+the bundled syntax grammars and theme are loaded once and shared by all
+buffers. Undo histories still use snapshots, but the editor now limits retained
+history to **100 steps or roughly 32 MiB per buffer**, whichever is smaller.
+For very large files, at least one undo snapshot is preserved even if it
+exceeds the limit. Incremental/delta-based undo is planned later.
 
 ## Line numbers and cursor line
 
@@ -95,8 +128,8 @@ starts at the working directory you launched Remacs from. You can navigate it
 with j/k or arrow keys, expand and collapse directories using l/h, and open
 a selected file with Enter. Tab or Esc returns focus to the editor; q
 closes the sidebar. Press . to show/hide dotfiles, r to refresh, and g/G
-to jump to the first/last entry. Unsaved editor changes block opening
-a different file so nothing is lost.
+to jump to the first/last entry. Opening a different file preserves
+unsaved changes in the original buffer.
 
 The tree is implemented in **plugins/tree.lua** and executed by the
 bundled Lua 5.4 runtime (mlua). Rust provides a small host API
