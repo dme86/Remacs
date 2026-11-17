@@ -74,7 +74,7 @@ fn function_kind(kind: &str) -> bool {
 
 fn selection_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
-        if function_kind(node.kind()) && !node.has_error() {
+        if function_kind(node.kind()) {
             // Python decorators belong to the declaration.
             if node.kind() == "function_definition" {
                 if let Some(parent) = node.parent() {
@@ -102,6 +102,58 @@ fn selection_node(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         node = node.parent()?;
     }
+}
+
+/// A declaration can start with visibility/modifier tokens that the grammar
+/// represents as siblings rather than children of the function node. When
+/// the cursor is on those tokens (or indentation before the declaration),
+/// the usual descendant/ancestor lookup won't reach the function.
+fn header_function<'a>(
+    root: Node<'a>,
+    source: &str,
+    row: usize,
+    cursor_byte: usize,
+) -> Option<(Node<'a>, usize)> {
+    let line_start = source[..cursor_byte].rfind('\n').map_or(0, |i| i + 1);
+    let mut stack = vec![root];
+    let mut result: Option<(Node<'a>, usize)> = None;
+
+    while let Some(node) = stack.pop() {
+        let start = node.start_position();
+        let end = node.end_position();
+        if start.row > row || end.row < row {
+            continue;
+        }
+
+        if function_kind(node.kind()) && start.row == row && node.start_byte() >= cursor_byte {
+            let declaration_prefix = &source[line_start..node.start_byte()];
+            let leading = declaration_prefix.trim_start();
+            // Do not accidentally select a function from a preceding
+            // unrelated statement on the same line.
+            let is_declaration_prefix = leading.is_empty()
+                || ["pub ", "pub(", "pub", "async ", "unsafe ", "extern ",
+                    "default ", "export ", "const ", "let ", "var "]
+                    .iter().any(|keyword| leading.starts_with(keyword));
+            if is_declaration_prefix && declaration_prefix.len() < 128 {
+                let leading_bytes = declaration_prefix.len() - leading.len();
+                let prefix_start = line_start + leading_bytes;
+                let normalized = selection_node(node).unwrap_or(node);
+                if result.is_none_or(|(previous, _)| {
+                    normalized.end_byte() - normalized.start_byte()
+                        < previous.end_byte() - previous.start_byte()
+                }) {
+                    result = Some((normalized, prefix_start.min(normalized.start_byte())));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_position().row <= row && child.end_position().row >= row {
+                stack.push(child);
+            }
+        }
+    }
+    result
 }
 
 fn source_position(doc: &Document, row: usize, byte_col: usize) -> Position {
@@ -147,12 +199,30 @@ pub fn around_function(doc: &Document) -> Result<Option<TextRange>, String> {
     let tree = parser.parse(&source, None)
         .ok_or_else(|| "Tree-sitter could not parse the document".to_string())?;
     let byte = byte_offset(doc).min(source.len().saturating_sub(1));
-    let node = tree.root_node().descendant_for_byte_range(byte, byte + 1);
-    let Some(function) = node.and_then(selection_node) else { return Ok(None) };
+    let root = tree.root_node();
+    let node = root.descendant_for_byte_range(byte, byte + 1);
+    let regular = node.and_then(selection_node);
+    let fallback = if regular.is_none() {
+        header_function(root, &source, doc.row, byte)
+    } else {
+        None
+    };
+    let Some(function) = regular.or_else(|| fallback.map(|(node, _)| node)) else {
+        return Ok(None);
+    };
     let start = function.start_position();
     let end = function.end_position();
+    let mut from = source_position(doc, start.row, start.column);
+    if let Some((_, start_byte)) = fallback {
+        // If the grammar starts at "fn" but the declaration begins with
+        // "pub", "async" etc., include those modifiers in the selection.
+        if start_byte < function.start_byte() {
+            let line_start = source[..start_byte].rfind('\n').map_or(0, |i| i + 1);
+            from = source_position(doc, start.row, start_byte - line_start);
+        }
+    }
     let selection = TextRange {
-        start: source_position(doc, start.row, start.column),
+        start: from,
         end: source_position(doc, end.row, end.column),
     };
     if selection.start >= selection.end { Ok(None) } else { Ok(Some(selection)) }
@@ -173,6 +243,37 @@ mod tests {
         doc.row = row;
         doc.col = col;
         doc
+    }
+
+
+    #[test]
+    fn rust_function_header_is_selectable_at_every_position() {
+        // Regression: vaf used to work only after entering the function body.
+        let text = "pub fn from_text(text: &str) -> Self {\n    let newline = if text.contains(\"\\r\\n\") { \"\\r\\n\" } else { \"\\n\" };\n    let lines = text.split('\\n').collect();\n    Self { lines }\n}\n";
+        for needle in ["pub", "fn", "from_text", "text:", "&str", "Self", "{"] {
+            let doc = named("src/document.rs", text, needle);
+            let selected = around_function(&doc).unwrap()
+                .unwrap_or_else(|| panic!("no function found at {needle}"));
+            assert_eq!(selected.start, Position { row: 0, col: 0 }, "{needle}");
+            assert_eq!(selected.end, Position { row: 4, col: 1 }, "{needle}");
+        }
+    }
+
+    #[test]
+    fn indented_and_multiline_declarations_are_selectable() {
+        let text = "impl Example {\n    pub fn build(\n        input: &str,\n    ) -> Self {\n        Self {}\n    }\n}\n";
+        for needle in ["pub", "fn", "build", "input:", "Self {"] {
+            let doc = named("src/lib.rs", text, needle);
+            let selected = around_function(&doc).unwrap().unwrap();
+            assert_eq!(selected.start, Position { row: 1, col: 4 }, "{needle}");
+            assert_eq!(selected.end, Position { row: 5, col: 5 }, "{needle}");
+        }
+    }
+
+    #[test]
+    fn selecting_a_function_from_preceding_unrelated_line_is_not_allowed() {
+        let doc = named("src/lib.rs", "const ANSWER: i32 = 42;\n\npub fn answer() -> i32 { ANSWER }\n", "ANSWER:");
+        assert!(around_function(&doc).unwrap().is_none());
     }
 
     #[test]
