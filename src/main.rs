@@ -8,7 +8,7 @@ mod syntax;
 use std::{
     env,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crossterm::{
@@ -19,9 +19,9 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use document::Document;
-use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache};
+use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
 use function_select::{around_function, Position, TextRange};
-use plugins::{TreeAction, TreePlugin};
+use plugins::{FinderView, TreeAction, TreePlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -48,6 +48,7 @@ enum Sequence {
     Leader,
     File,
     Panel,
+    Buffer,
     Visual,
     TextObjectAround,
     Quit,
@@ -121,9 +122,53 @@ struct PaintedLine {
     selected: Option<(usize, usize)>,
 }
 
+
+/// Inactive buffers retain their unsaved content and independent undo/redo,
+/// cursor and scroll state. Switching moves ownership without cloning text.
+struct StoredBuffer {
+    doc: Document,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    scroll_row: usize,
+    scroll_col: usize,
+}
+
+#[derive(Default)]
+struct BufferPicker {
+    query: String,
+    selected: usize,
+}
+
+// Only path and filename are compared for fuzzy matching. No filesystem scan
+// is needed: a buffer picker typically only contains a handful of entries.
+fn matches_buffer(label: &str, query: &str) -> bool {
+    let mut letters = label.to_lowercase().chars().collect::<Vec<_>>().into_iter();
+    query.to_lowercase().chars().all(|wanted| letters.by_ref().any(|actual| actual == wanted))
+}
+
+fn path_identity(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    };
+    // Normalise the parent even for a newly created, not-yet-existing file.
+    absolute.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .and_then(|parent| absolute.file_name().map(|file| parent.join(file)))
+        .unwrap_or(absolute)
+}
+
 struct Editor {
     doc: Document,
     syntax: SyntaxEngine,
+    slots: Vec<Option<StoredBuffer>>,
+    active_slot: usize,
+    last_slot: Option<usize>,
+    buffer_picker: Option<BufferPicker>,
     tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
@@ -149,6 +194,10 @@ impl Editor {
         Self {
             doc,
             syntax,
+            slots: vec![None],
+            active_slot: 0,
+            last_slot: None,
+            buffer_picker: None,
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -167,6 +216,236 @@ impl Editor {
             insert_changed: false,
             running: true,
         }
+    }
+
+    fn active_name(&self) -> String {
+        self.doc.path.as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "[No Name]".into())
+    }
+
+    fn buffer_name(doc: &Document) -> String {
+        doc.path.as_ref().map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "[No Name]".into())
+    }
+
+    fn dirty_buffers(&self) -> usize {
+        usize::from(self.doc.dirty)
+            + self.slots.iter().flatten().filter(|buffer| buffer.doc.dirty).count()
+    }
+
+    fn dirty_except_active(&self) -> usize {
+        self.slots.iter().flatten().filter(|buffer| buffer.doc.dirty).count()
+    }
+
+    fn named_slot(&self, path: &Path) -> Option<usize> {
+        let target = path_identity(path);
+        if self.doc.path.as_ref().is_some_and(|p| path_identity(p) == target) {
+            return Some(self.active_slot);
+        }
+        self.slots.iter().position(|entry| entry.as_ref().is_some_and(|buffer| {
+            buffer.doc.path.as_ref().is_some_and(|path| path_identity(path) == target)
+        }))
+    }
+
+    fn set_path_and_save(&mut self, path: PathBuf) {
+        if self.named_slot(&path).is_some_and(|index| index != self.active_slot) {
+            self.message = "That file is already open in another buffer".into();
+            return;
+        }
+        let before = self.doc.path.clone();
+        self.doc.path = Some(path);
+        self.save();
+        if self.doc.dirty && before != self.doc.path {
+            // A failed write should not silently rename a buffer.
+            self.doc.path = before;
+        }
+    }
+
+    fn take_current(&mut self) -> StoredBuffer {
+        StoredBuffer {
+            // An empty placeholder is replaced, never cloned or displayed.
+            doc: std::mem::replace(&mut self.doc, Document::empty()),
+            undo: std::mem::take(&mut self.undo),
+            redo: std::mem::take(&mut self.redo),
+            scroll_row: self.scroll_row,
+            scroll_col: self.scroll_col,
+        }
+    }
+
+    fn activate(&mut self, next: StoredBuffer, index: usize) {
+        self.doc = next.doc;
+        self.undo = next.undo;
+        self.redo = next.redo;
+        self.scroll_row = next.scroll_row;
+        self.scroll_col = next.scroll_col;
+        self.active_slot = index;
+        let enabled = self.syntax.enabled();
+        self.syntax = SyntaxEngine::new(&self.doc);
+        self.syntax.set_enabled(enabled);
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.visual_anchor = None;
+        self.sequence = Sequence::None;
+        self.count = None;
+        self.control_x = false;
+        self.insert_changed = false;
+        // Only visible text rows are invalidated; tree and terminal geometry
+        // are unchanged, so there is no destructive whole-screen clear.
+        for line in &mut self.screen.lines { *line = None; }
+        self.screen.status = None;
+        self.screen.origin = None;
+        self.message = format!("Buffer {}/{}: {}", index + 1, self.slots.len(), self.active_name());
+    }
+
+    fn switch_buffer(&mut self, index: usize) {
+        if index == self.active_slot || index >= self.slots.len() {
+            return;
+        }
+        let Some(next) = self.slots[index].take() else { return; };
+        let previous = self.active_slot;
+        let current = self.take_current();
+        self.slots[previous] = Some(current);
+        self.last_slot = Some(previous);
+        self.activate(next, index);
+    }
+
+    fn cycle_buffer(&mut self, forward: bool) {
+        let count = self.slots.len();
+        if count < 2 {
+            self.message = "Only one buffer is open".into();
+            return;
+        }
+        let index = if forward {
+            (self.active_slot + 1) % count
+        } else {
+            (self.active_slot + count - 1) % count
+        };
+        self.switch_buffer(index);
+    }
+
+    fn last_buffer(&mut self) {
+        if let Some(index) = self.last_slot {
+            self.switch_buffer(index);
+        } else {
+            self.message = "No previous buffer".into();
+        }
+    }
+
+    fn open_buffer_picker(&mut self) {
+        self.buffer_picker = Some(BufferPicker::default());
+        self.sequence = Sequence::None;
+        self.message = "Buffers: type to filter, ↑↓ select, Enter switch, Esc cancel".into();
+    }
+
+    fn buffer_candidates(&self, query: &str) -> Vec<(usize, String)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            let (doc, active) = if index == self.active_slot {
+                (&self.doc, true)
+            } else {
+                (&slot.as_ref()?.doc, false)
+            };
+            let name = Self::buffer_name(doc);
+            if !matches_buffer(&name, query) { return None; }
+            Some((index, format!(
+                "{} {}{}  {}",
+                if active { "▶" } else { " " },
+                if doc.dirty { "● " } else { "  " },
+                index + 1, name
+            )))
+        }).collect()
+    }
+
+    fn buffer_picker_view(&self) -> Option<FinderView> {
+        let picker = self.buffer_picker.as_ref()?;
+        let entries = self.buffer_candidates(&picker.query);
+        let selected = picker.selected.min(entries.len().saturating_sub(1)) + 1;
+        Some(FinderView {
+            query: picker.query.clone(),
+            matches: entries.into_iter().map(|(_, label)| label).collect(),
+            selected,
+            total_matches: self.buffer_candidates(&picker.query).len(),
+            scanned: self.slots.len(),
+        })
+    }
+
+    fn buffer_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.buffer_picker.as_ref() else { return; };
+        let count = self.buffer_candidates(&picker.query).len();
+        match key.code {
+            KeyCode::Esc => { self.buffer_picker = None; }
+            KeyCode::Enter => {
+                let results = self.buffer_candidates(&picker.query);
+                let index = results.get(picker.selected).map(|(index, _)| *index);
+                self.buffer_picker = None;
+                if let Some(index) = index { self.switch_buffer(index); }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(picker) = &mut self.buffer_picker {
+                    picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(picker) = &mut self.buffer_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = &mut self.buffer_picker {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = &mut self.buffer_picker {
+                    picker.query.clear();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if let Some(picker) = &mut self.buffer_picker {
+                    if picker.query.len() < 128 {
+                        picker.query.push(c);
+                        picker.selected = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn close_buffer(&mut self, discard: bool) {
+        if self.doc.dirty && !discard {
+            self.message = "Buffer modified; save it or use :bd! to discard".into();
+            return;
+        }
+        if self.slots.len() == 1 {
+            let enabled = self.syntax.enabled();
+            self.doc = Document::empty();
+            self.syntax = SyntaxEngine::new(&self.doc);
+            self.syntax.set_enabled(enabled);
+            self.undo.clear();
+            self.redo.clear();
+            self.scroll_row = 0;
+            self.scroll_col = 0;
+            self.insert_changed = false;
+            self.mode = Mode::Normal;
+            self.selection = None;
+            self.visual_anchor = None;
+            for line in &mut self.screen.lines { *line = None; }
+            self.screen.status = None;
+            self.message = "Empty buffer".into();
+            return;
+        }
+        let closed = self.active_slot;
+        let next = (closed + 1) % self.slots.len();
+        let replacement = self.slots[next].take().expect("inactive buffer in slot");
+        self.slots.remove(closed);
+        // Adjust target index because removing an earlier slot shifts it.
+        let adjusted_next = if next > closed { next - 1 } else { next };
+        self.last_slot = None;
+        self.activate(replacement, adjusted_next);
+        self.message = "Buffer closed".into();
     }
 
     fn remember(&mut self) {
