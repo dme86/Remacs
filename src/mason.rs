@@ -227,15 +227,9 @@ impl Manager {
     }
 
     fn ensure_data_directory(&self) -> io::Result<()> {
-        fs::create_dir_all(self.root.join("bin"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Do not chmod existing directories (e.g. a user-controlled
-            // XDG_DATA_HOME); only newly created private app directories.
-            // create_dir_all has already succeeded; keep defaults on existing.
-        }
-        Ok(())
+        // Do not chmod existing parents (XDG_DATA_HOME might be shared).
+        // Only managed file paths are created inside the app data directory.
+        fs::create_dir_all(self.root.join("bin"))
     }
 
     fn open_log(&self) -> io::Result<File> {
@@ -408,6 +402,55 @@ mod tests {
         assert_eq!(cmd.get_program(), OsStr::new("npm"));
         assert!(cmd.get_args().any(|arg| arg == OsStr::new("--prefix")));
         assert!(cmd.get_args().any(|arg| arg == OsStr::new("yaml-language-server@latest")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_subprocess_reports_success_and_updates_timestamp_without_network() {
+        let mut manager = fixture();
+        std::fs::create_dir_all(&manager.root).unwrap();
+        // Simulate an installer process with a harmless local executable.
+        // No package manager, shell string or network is involved in CI.
+        let child = Command::new("/usr/bin/true").spawn().unwrap();
+        manager.active = Some(Active {
+            task: Task { id: "gopls".into(), update: false }, child
+        });
+        let mut completed = false;
+        for _ in 0..50 {
+            for event in manager.poll() {
+                if let Event::Done { id, language, .. } = event {
+                    assert_eq!(id, "gopls");
+                    assert_eq!(language, "go");
+                    completed = true;
+                }
+            }
+            if completed { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(completed, "installer completion must be polled asynchronously");
+        assert!(manager.active.is_none());
+        assert!(manager.history.updated_at.contains_key("gopls"));
+        assert!(manager.root.join("history.json").exists());
+        std::fs::remove_dir_all(&manager.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_subprocess_does_not_mark_package_as_updated() {
+        let mut manager = fixture();
+        let child = Command::new("/usr/bin/false").spawn().unwrap();
+        manager.active = Some(Active {
+            task: Task { id: "gopls".into(), update: true }, child
+        });
+        for _ in 0..50 {
+            manager.poll();
+            if manager.active.is_none() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(manager.active.is_none());
+        assert!(!manager.history.updated_at.contains_key("gopls"));
+        assert!(manager.status(manager.tools.iter().find(|t| t.id == "gopls").unwrap())
+            .contains("failed"));
     }
 
     #[test]
