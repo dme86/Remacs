@@ -1725,7 +1725,8 @@ mod tests {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.open(root.join("two.md").to_string_lossy().into_owned());
-        editor.open(root.join("not-a-directory").join("a.rs").to_string_lossy().into_owned());
+        std::fs::write(root.join("broken.bin"), [0xff, 0xfe]).unwrap();
+        editor.open(root.join("broken.bin").to_string_lossy().into_owned());
         assert_eq!(editor.active_slot, 1);
         assert_eq!(editor.slots.len(), 2);
         editor.set_path_and_save(root.join("one.rs"));
