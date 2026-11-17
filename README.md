@@ -52,9 +52,9 @@ shows incomplete sequences.
 | LSP definition and hover (rust-analyzer) | **`gd`** and **`K`** |
 | Language-server manager | **`:mason`** or **`SPC l m`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
-| Yank / delete selection | **`y` / `d`** in VISUAL mode |
+| Yank / delete selection | **`y` / `d`** in VISUAL mode (also copies to OS clipboard) |
 | Delete character / line | **`x` / `dd`** |
-| Yank line / paste | **`yy` / `p`** |
+| Yank line / paste | **`yy` / `p`** (system clipboard shared with other apps) |
 | Undo / redo | **`u` / `Ctrl+R`** |
 | Open file in a buffer | **`SPC f f`** (or select in tree) |
 | Switch buffers (searchable picker) | **`Ctrl+P`** or **`SPC b b`** |
@@ -73,6 +73,23 @@ shows incomplete sequences.
 The editor supports multiple independent file buffers, a status line, a minibuffer,
 UTF-8 text editing, basic horizontal/vertical scrolling, and CRLF/LF preservation.
 This is a **small subset** of Vim/Evil, not full compatibility with Doom Emacs.
+
+## System clipboard
+
+Remacs shares text with the **desktop clipboard** on macOS and Linux (Wayland/X11).
+`yy` and Visual `y` copy directly to the OS clipboard; `dd`, `x`, and Visual `d`
+copy the deleted text as well. Normal-mode `p` reads the current system
+clipboard, so you can copy text in a browser or another app and paste it into
+Remacs. If the clipboard is inaccessible (for example, on a headless machine),
+the internal register continues to work. The existing `yy` → `p` workflow
+retains its **linewise** behavior when the clipboard has not been replaced.
+
+Terminal paste (e.g. **Cmd+V** in macOS terminals, or **Ctrl+Shift+V** on
+Linux) uses bracketed paste. Multi-line UTF-8 text is inserted literally,
+without triggering Normal-mode commands, and is one undoable edit when in
+Insert mode. Clipboard access is lazy; no GUI clipboard connection is needed
+until the first copy or `p`. Linux Wayland support uses the compositor's
+`ext-data-control-v1` or `wlr-data-control` protocol (or XWayland fallback).
 
 ### macOS
 
