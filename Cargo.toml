@@ -7,6 +7,8 @@ description = "A tiny Rust terminal editor with Emacs-inspired keybindings"
 repository = "https://github.com/dme86/Remacs"
 
 [dependencies]
+# Native macOS pasteboard and Linux X11/Wayland clipboard (text only).
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 crossterm = "0.28"
 unicode-width = "0.2"
 two-face = { version = "0.5.2", features = ["syntect-default-onig"] }

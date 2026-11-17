@@ -135,6 +135,11 @@ impl Session {
         Ok(())
     }
 
+    pub fn paste(&mut self, text: &str) -> io::Result<()> {
+        self.writer.write_all(text.as_bytes())?;
+        self.writer.flush()
+    }
+
     pub fn cursor(&self, rect: Rect) -> (u16, u16) {
         let (row, col) = self.parser.screen().cursor_position();
         (rect.x + 1 + col.min(rect.width - 3), rect.y + 1 + row.min(rect.height - 3))

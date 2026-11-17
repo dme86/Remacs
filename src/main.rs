@@ -1,4 +1,5 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
+mod clipboard;
 mod document;
 mod finder_ui;
 mod function_select;
@@ -22,11 +23,12 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use clipboard::Clipboard;
 use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
 use function_select::{around_function, Position, TextRange};
@@ -122,6 +124,19 @@ enum Register {
     Line(Vec<char>),
 }
 
+impl Register {
+    fn clipboard_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Line(line) => {
+                let mut text: String = line.iter().collect();
+                text.push('\n');
+                text
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ScreenCache {
     size: Option<(u16, u16)>,
@@ -175,6 +190,10 @@ fn matches_buffer(label: &str, query: &str) -> bool {
     query.to_lowercase().chars().all(|wanted| letters.by_ref().any(|actual| actual == wanted))
 }
 
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn path_identity(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
@@ -220,6 +239,7 @@ struct Editor {
     prompt: Option<Prompt>,
     message: String,
     register: Option<Register>,
+    clipboard: Clipboard,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     insert_changed: bool,
@@ -271,6 +291,7 @@ impl Editor {
             prompt: None,
             message: "NORMAL | i Insert | Space f f Open | Space f s Save | Space q q Quit".into(),
             register: None,
+            clipboard: Clipboard::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             insert_changed: false,
@@ -1106,6 +1127,84 @@ impl Editor {
         }
     }
 
+    /// Keep Vim's unnamed register and the desktop clipboard in sync.
+    /// Clipboard errors never prevent editing or internal yanks.
+    fn store_register(&mut self, value: Register, action: &str) {
+        let text = value.clipboard_text();
+        self.register = Some(value);
+        self.message = match self.clipboard.write(&text) {
+            Ok(()) => format!("{action} (system clipboard)"),
+            Err(error) => format!("{action} (internal only; clipboard: {error})"),
+        };
+    }
+
+    fn paste_value(&mut self, value: Register) {
+        self.remember();
+        match value {
+            Register::Line(line) => self.doc.insert_line_below(line),
+            Register::Text(text) => {
+                if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
+                self.doc.insert_text(&normalize_pasted_text(&text));
+                self.doc.col = self.doc.col.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Prefer fresh text copied in another application, but keep the linewise
+    /// semantics of an unchanged 'yy' register. If the OS clipboard is not
+    /// available (e.g. a remote/headless session), use Remacs' own register.
+    fn paste_clipboard(&mut self) {
+        let value = match self.clipboard.read() {
+            Ok(text) if !text.is_empty() => {
+                match self.register.as_ref() {
+                    Some(register) if register.clipboard_text() == text => register.clone(),
+                    _ => Register::Text(text),
+                }
+            }
+            _ => match self.register.clone() {
+                Some(value) => value,
+                None => return,
+            },
+        };
+        self.paste_value(value);
+    }
+
+    /// Bracketed paste arrives as one event instead of a stream of hotkeys.
+    /// In Insert mode this is one undoable edit, even with multiline Unicode.
+    fn pasted(&mut self, text: &str) {
+        if text.is_empty() { return; }
+        if let Ok(Some(active)) = self.toggleterm.active() {
+            if let Some(session) = self.terminals.get_mut(&active) {
+                if let Err(error) = session.paste(text) {
+                    self.message = format!("PTY paste: {error}");
+                }
+            }
+            return;
+        }
+        if self.prompt.is_some() || self.buffer_picker.is_some()
+            || self.mason_picker.is_some()
+            || self.tree.as_ref().is_some_and(|tree| tree.focused)
+        {
+            return;
+        }
+        let text = normalize_pasted_text(text);
+        match self.mode {
+            Mode::Insert => {
+                self.insert_change();
+                self.doc.insert_text(&text);
+            }
+            Mode::Visual => {
+                if let Some(range) = self.selection {
+                    self.remember();
+                    self.doc.delete_text_range(range);
+                    self.doc.insert_text(&text);
+                    self.leave_visual();
+                }
+            }
+            Mode::Normal => self.paste_value(Register::Text(text)),
+        }
+    }
+
     fn leave_visual(&mut self) {
         self.mode = Mode::Normal;
         self.selection = None;
@@ -1173,8 +1272,7 @@ impl Editor {
             KeyCode::Char('y') => {
                 if let Some(range) = self.selection {
                     let text = self.doc.text_in_range(range);
-                    self.register = Some(Register::Text(text));
-                    self.message = "Selection yanked into Remacs register".into();
+                    self.store_register(Register::Text(text), "Selection copied");
                 }
                 self.leave_visual();
                 return;
@@ -1183,9 +1281,9 @@ impl Editor {
                 if let Some(range) = self.selection {
                     if range.start < range.end {
                         self.remember();
-                        self.register = Some(Register::Text(self.doc.text_in_range(range)));
+                        let text = self.doc.text_in_range(range);
                         self.doc.delete_text_range(range);
-                        self.message = "Selection deleted (u to undo)".into();
+                        self.store_register(Register::Text(text), "Selection deleted (u to undo)");
                     }
                 }
                 self.leave_visual();
@@ -1657,11 +1755,11 @@ impl Editor {
                 (Sequence::Quit, KeyCode::Char('q')) => self.quit(),
                 (Sequence::Delete, KeyCode::Char('d')) => {
                     self.remember();
-                    self.register = Some(Register::Line(self.doc.delete_line()));
+                    let line = self.doc.delete_line();
+                    self.store_register(Register::Line(line), "Line deleted");
                 }
                 (Sequence::Yank, KeyCode::Char('y')) => {
-                    self.register = Some(Register::Line(self.doc.line().to_vec()));
-                    self.message = "Line yanked".into();
+                    self.store_register(Register::Line(self.doc.line().to_vec()), "Line copied");
                 }
                 (Sequence::Go, KeyCode::Char('g')) => {
                     self.record_current_jump();
@@ -1763,23 +1861,12 @@ impl Editor {
             KeyCode::Char('x') => {
                 if self.doc.col < self.doc.line().len() {
                     self.remember();
-                    self.register = Some(Register::Text(self.doc.line()[self.doc.col].to_string()));
+                    let deleted = self.doc.line()[self.doc.col].to_string();
                     self.doc.delete();
+                    self.store_register(Register::Text(deleted), "Character deleted");
                 }
             }
-            KeyCode::Char('p') => {
-                if let Some(value) = self.register.clone() {
-                    self.remember();
-                    match value {
-                        Register::Line(line) => self.doc.insert_line_below(line),
-                        Register::Text(text) => {
-                            if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
-                            self.doc.insert_text(&text);
-                            self.doc.col = self.doc.col.saturating_sub(1);
-                        }
-                    }
-                }
-            }
+            KeyCode::Char('p') => self.paste_clipboard(),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char(':') => self.prompt = Some(Prompt::Command(String::new())),
             KeyCode::PageDown => self.page_down(page_height),
@@ -2384,7 +2471,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste) {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
@@ -2393,7 +2480,7 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, ResetColor, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, Show, ResetColor, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -2433,11 +2520,13 @@ fn main() -> io::Result<()> {
             Duration::from_millis(90)
         };
         if event::poll(delay)? {
-            if let Event::Key(key) = event::read()? {
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            match event::read()? {
+                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                     let height = terminal::size()?.1.saturating_sub(2) as usize;
                     editor.key(key, height);
                 }
+                Event::Paste(text) => editor.pasted(&text),
+                _ => {}
             }
         }
     }
@@ -3465,6 +3554,63 @@ mod tests {
         assert_eq!(editor.doc.line().iter().collect::<String>(), "one");
         for key in ['d', 'd'] { press(&mut editor, KeyCode::Char(key)); }
         assert_eq!(editor.doc.lines.len(), 2);
+    }
+
+    #[test]
+    fn visual_yank_and_external_clipboard_paste() {
+        let mut editor = Editor::new(Document::from_text("ab"));
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('y'));
+        assert_eq!(editor.clipboard.read().unwrap(), "a");
+        // Another application replaces the desktop clipboard.
+        editor.clipboard.write("β\r\n世界").unwrap();
+        press(&mut editor, KeyCode::Char('p'));
+        assert_eq!(editor.doc.lsp_text(), "aβ\n世界b");
+        press(&mut editor, KeyCode::Char('u'));
+        assert_eq!(editor.doc.lsp_text(), "ab");
+    }
+
+    #[test]
+    fn line_yank_preserves_linewise_paste_and_exports_newline() {
+        let mut editor = Editor::new(Document::from_text("one\ntwo"));
+        press(&mut editor, KeyCode::Char('y'));
+        press(&mut editor, KeyCode::Char('y'));
+        assert_eq!(editor.clipboard.read().unwrap(), "one\n");
+        press(&mut editor, KeyCode::Char('p'));
+        assert_eq!(editor.doc.lsp_text(), "one\none\ntwo");
+        press(&mut editor, KeyCode::Char('d'));
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.clipboard.read().unwrap(), "one\n");
+    }
+
+    #[test]
+    fn delete_char_and_visual_delete_update_desktop_clipboard() {
+        let mut editor = Editor::new(Document::from_text("abc"));
+        press(&mut editor, KeyCode::Char('x'));
+        assert_eq!(editor.clipboard.read().unwrap(), "a");
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('l'));
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.clipboard.read().unwrap(), "bc");
+        assert_eq!(editor.doc.lsp_text(), "");
+    }
+
+    #[test]
+    fn bracketed_paste_is_multiline_unicode_and_single_undo() {
+        let mut editor = Editor::new(Document::from_text("tail"));
+        press(&mut editor, KeyCode::Char('i'));
+        editor.pasted("hé\r\n世界");
+        assert_eq!(editor.doc.lsp_text(), "hé\n世界tail");
+        press(&mut editor, KeyCode::Esc);
+        press(&mut editor, KeyCode::Char('u'));
+        assert_eq!(editor.doc.lsp_text(), "tail");
+    }
+
+    #[test]
+    fn bracketed_paste_in_normal_mode_inserts_literal_text() {
+        let mut editor = Editor::new(Document::from_text("two"));
+        editor.pasted("hello");
+        assert_eq!(editor.doc.lsp_text(), "thellowo");
     }
 
     #[test]
