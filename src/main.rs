@@ -253,12 +253,14 @@ impl Editor {
             self.message = "That file is already open in another buffer".into();
             return;
         }
-        let before = self.doc.path.clone();
-        self.doc.path = Some(path);
-        self.save();
-        if self.doc.dirty && before != self.doc.path {
-            // A failed write should not silently rename a buffer.
-            self.doc.path = before;
+        let before = self.doc.path.replace(path);
+        match self.doc.save() {
+            Ok(()) => self.message = "File saved".into(),
+            Err(error) => {
+                // A failed write must not silently rename an unnamed buffer.
+                self.doc.path = before;
+                self.message = format!("Save error: {error}");
+            }
         }
     }
 
@@ -549,14 +551,11 @@ impl Editor {
                 if let Some(tree) = &mut self.tree { tree.close(); }
             }
             TreeAction::Open(path) => {
-                if !self.doc.dirty {
-                    let filename = path.to_string_lossy().into_owned();
-                    self.open(filename);
-                    if self.doc.path.as_ref() == Some(&path) {
-                        if let Some(tree) = &mut self.tree { tree.leave(); }
-                    }
-                } else {
-                    self.message = "Unsaved changes: save before opening a tree file".into();
+                self.open(path.to_string_lossy().into_owned());
+                if self.doc.path.as_ref().is_some_and(|current| {
+                    path_identity(current) == path_identity(&path)
+                }) {
+                    if let Some(tree) = &mut self.tree { tree.leave(); }
                 }
             }
         }
@@ -671,30 +670,34 @@ impl Editor {
     }
 
     fn open(&mut self, name: String) {
-        if self.doc.dirty {
-            self.message = "Unsaved changes: save before opening another file".into();
+        let path = PathBuf::from(&name);
+        if let Some(index) = self.named_slot(&path) {
+            if index != self.active_slot {
+                self.switch_buffer(index);
+            } else {
+                self.message = format!("Already open: {name}");
+            }
             return;
         }
-        match Document::open(PathBuf::from(&name)) {
+        match Document::open(path) {
             Ok(doc) => {
-                self.doc = doc;
-                self.syntax = SyntaxEngine::new(&self.doc);
-                self.scroll_row = 0;
-                self.scroll_col = 0;
-                self.count = None;
-                self.mode = Mode::Normal;
-                self.selection = None;
-                self.visual_anchor = None;
-                self.undo.clear();
-                self.redo.clear();
-                self.message = format!("Opened {name}");
+                let previous = self.active_slot;
+                let current = self.take_current();
+                self.slots[previous] = Some(current);
+                let index = self.slots.len();
+                self.slots.push(None);
+                self.last_slot = Some(previous);
+                self.activate(StoredBuffer {
+                    doc, undo: Vec::new(), redo: Vec::new(),
+                    scroll_row: 0, scroll_col: 0,
+                }, index);
             }
             Err(error) => self.message = format!("Open error: {error}"),
         }
     }
 
     fn quit(&mut self) {
-        if self.doc.dirty {
+        if self.dirty_buffers() > 0 {
             self.prompt = Some(Prompt::Quit);
         } else {
             self.running = false;
@@ -715,11 +718,17 @@ impl Editor {
                 self.message = "Syntax highlighting disabled".into();
             }
             "tree" | "tree toggle" => self.toggle_tree(),
+            "buffers" | "ls" => self.open_buffer_picker(),
+            "bn" | "bnext" => self.cycle_buffer(true),
+            "bp" | "bprev" => self.cycle_buffer(false),
+            "b#" => self.last_buffer(),
+            "bd" => self.close_buffer(false),
+            "bd!" => self.close_buffer(true),
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
                     if !self.doc.dirty {
-                        self.running = false;
+                        self.quit(); // Other unsaved buffers still require confirmation.
                     }
                 } else {
                     self.message = "Choose a filename with :w or Space f s first".into();
@@ -729,8 +738,7 @@ impl Editor {
             value if value.starts_with("w ") => {
                 let name = value[2..].trim();
                 if !name.is_empty() {
-                    self.doc.path = Some(PathBuf::from(name));
-                    self.save();
+                    self.set_path_and_save(PathBuf::from(name));
                 }
             }
             "" => {},
@@ -754,8 +762,7 @@ impl Editor {
             },
             Prompt::SaveAs(mut name) => match key.code {
                 KeyCode::Enter if !name.is_empty() => {
-                    self.doc.path = Some(PathBuf::from(name));
-                    self.save();
+                    self.set_path_and_save(PathBuf::from(name));
                 }
                 KeyCode::Backspace => {
                     name.pop();
@@ -1242,7 +1249,9 @@ impl Editor {
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
-            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
+            let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Buf {}/{} ({} modified) | Ln {}, Col {} ",
+                self.active_slot + 1, self.slots.len(), self.dirty_buffers(),
+                self.doc.row + 1, self.doc.col + 1);
             let status = fit_cells(&status, width);
             if self.screen.status.as_deref() != Some(status.as_str()) {
                 queue!(output,
@@ -1258,8 +1267,12 @@ impl Editor {
                 Some(Prompt::SaveAs(name)) => format!("Save file: {name}"),
                 Some(Prompt::Open(name)) => format!("Find file: {name}"),
                 Some(Prompt::Command(command)) => format!(":{command}"),
-                Some(Prompt::Quit) => "Discard changes and quit? (y/n)".into(),
+                Some(Prompt::Quit) => format!(
+                    "Discard unsaved changes in {} buffer(s) and quit? (y/n)", self.dirty_buffers()
+                ),
                 None if self.control_x => "C-x".into(),
+                None if self.buffer_picker.is_some() =>
+                    "BUFFERS  Type to filter · ↑↓ Choose · Enter Switch · Esc Cancel".into(),
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
