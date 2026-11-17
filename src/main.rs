@@ -316,6 +316,17 @@ impl Editor {
         self.activate(next, index);
     }
 
+    fn return_to_editor_after_switch(&mut self) {
+        if let Some(tree) = &mut self.tree {
+            if tree.focused {
+                // A direct buffer switch should land in the editor, not leave
+                // keyboard focus (or a fuzzy-file popup) in the old tree.
+                let _ = tree.on_key("esc");
+                tree.leave();
+            }
+        }
+    }
+
     fn cycle_buffer(&mut self, forward: bool) {
         let count = self.slots.len();
         if count < 2 {
@@ -328,6 +339,7 @@ impl Editor {
             (self.active_slot + count - 1) % count
         };
         self.switch_buffer(index);
+        self.return_to_editor_after_switch();
     }
 
     fn last_buffer(&mut self) {
@@ -408,7 +420,10 @@ impl Editor {
                 let results = self.buffer_candidates(&picker.query);
                 let index = results.get(picker.selected).map(|(index, _)| *index);
                 self.buffer_picker = None;
-                if let Some(index) = index { self.switch_buffer(index); }
+                if let Some(index) = index {
+                    self.switch_buffer(index);
+                    self.return_to_editor_after_switch();
+                }
             }
             KeyCode::Down | KeyCode::Tab => {
                 if let Some(picker) = &mut self.buffer_picker {
@@ -1958,6 +1973,8 @@ mod tests {
         assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
         editor.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), 12);
         assert_eq!(editor.active_slot, 0);
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && !tree.focused),
+            "fast buffer switching should return focus to the editor");
         // Opening the chooser must not re-read or discard files.
         assert_eq!(editor.slots.len(), 2);
         let _ = std::fs::remove_dir_all(root);
