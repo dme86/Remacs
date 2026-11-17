@@ -21,7 +21,7 @@ use crossterm::{
 use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache};
 use function_select::{around_function, Position, TextRange};
-use plugins::{TreeAction, TreePlugin, TreeView};
+use plugins::{TreeAction, TreePlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1474,7 +1474,7 @@ mod tests {
 
         let popup = finder_rect_for(120, 38).unwrap();
         let overlap_y = popup.y as usize;
-        assert!(popup.x as usize < tree_sidebar_width(120, true));
+        assert!((popup.x as usize) < tree_sidebar_width(120, true));
 
         // Simulate the tree re-rendering a row on the popup's title.
         // Previously this overwrote the left edge of the title, while
