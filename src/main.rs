@@ -1141,6 +1141,20 @@ impl Editor {
             self.tree_key(key);
             return;
         }
+        // Legacy terminals (including rst in its standard input mode)
+        // send the *same byte* (0x09) for Ctrl+I and Tab. Crossterm reports
+        // it as an unmodified Tab, so the forward jumplist must take priority
+        // over the editor-to-tree focus shortcut while history exists ahead.
+        // Once the newest jump is reached, ordinary Tab focus returns.
+        // Enhanced terminals can still report an explicit Ctrl+I separately.
+        if self.mode == Mode::Normal
+            && key.code == KeyCode::Tab
+            && key.modifiers == KeyModifiers::NONE
+            && self.jumps.can_forward()
+        {
+            self.jump_forward();
+            return;
+        }
         if self.mode == Mode::Normal && key.code == KeyCode::Tab
             && !key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(tree) = &mut self.tree {
@@ -2039,6 +2053,62 @@ mod tests {
         editor.command("wa");
         assert_eq!(editor.message, "All buffers already saved");
         assert_eq!(editor.dirty_buffers(), 0);
+    }
+
+    #[test]
+    fn ctrl_i_legacy_tab_retraces_entire_jumplist_even_with_tree_visible() {
+        let root = temporary_buffer_project();
+        std::fs::write(root.join("three.rs"), "three\nfour\n").unwrap();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.doc.col = 1;
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.open(root.join("three.rs").to_string_lossy().into_owned());
+
+        // The tree can be visible, but we remain in the editor.
+        editor.toggle_tree();
+        editor.tree.as_mut().unwrap().leave();
+        assert!(editor.tree.as_ref().unwrap().visible);
+
+        let back = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        editor.key(back, 12);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        editor.key(back, 12);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 1));
+
+        // In legacy PTY input Ctrl+I arrives as KeyCode::Tab *without*
+        // a Control modifier. It must go forward, not focus the tree.
+        let legacy_ctrl_i = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        editor.key(legacy_ctrl_i, 12);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+        editor.key(legacy_ctrl_i, 12);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("three.rs"));
+        assert!(!editor.jumps.can_forward());
+
+        // At the newest location ordinary Tab resumes its original
+        // editor-to-tree focus behavior.
+        editor.key(legacy_ctrl_i, 12);
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
+
+        // Tab with focus in tree still returns to the editor.
+        editor.key(legacy_ctrl_i, 12);
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_control_i_remains_forward_jump_with_enhanced_key_reporting() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 0);
+        editor.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

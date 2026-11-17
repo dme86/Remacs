@@ -119,8 +119,12 @@ created.
 
 **Difference from Vim:** Vim's changelist is traditionally per buffer and
 its jumplist per window; Remacs deliberately uses a global edit history.
-Ctrl+I can be indistinguishable from Tab in some terminals; Alt+Right is
-the reliable alternative in rst. Like Vim's simple location marks, these
+In legacy PTY mode **Ctrl+I and Tab send the exact same character**. Remacs
+interprets Tab as **forward jump** in Normal mode if the jump history has
+a newer entry; otherwise Tab keeps its original editor-to-tree focus
+behavior. While the file tree itself has focus, Tab still returns to the
+editor. If you always want an unambiguous jump shortcut, use **Alt+Right**
+(Option+Right in rst) instead. Like Vim's simple location marks, these
 coordinates cannot yet follow arbitrary insertions after a file has
 been closed and reopened. Concurrent processes can overwrite one another's
 history; this is a first lightweight persistent version.
