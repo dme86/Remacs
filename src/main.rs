@@ -627,6 +627,9 @@ impl Editor {
             self.message = "Buffer modified; save it or use :bd! to discard".into();
             return;
         }
+        // Closing a buffer is a jump-worthy event. Its last position remains
+        // reachable even when the document is no longer held in memory.
+        self.record_current_jump();
         if self.slots.len() == 1 {
             let enabled = self.syntax.enabled();
             self.doc = Document::empty();
@@ -2118,6 +2121,23 @@ mod tests {
         assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
         assert_eq!(editor.doc.row, 2);
         assert_eq!(editor.doc.col, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    #[test]
+    fn closing_clean_buffer_preserves_its_last_jump_position() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.col = 3;
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        editor.jump_back();
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        assert_eq!(editor.doc.col, 3);
+        assert_eq!(editor.slots.len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
