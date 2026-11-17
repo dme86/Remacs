@@ -2685,8 +2685,8 @@ impl Editor {
     }
 
     // Compare the current viewport with the last painted frame. A simple j/k
-    // movement only updates the cursor and status line: no screen clear or
-    // syntax-aware body repaint is sent to the terminal.
+    // movement repaints only changed gutter/active rows and the status line,
+    // without clearing the screen.
     fn draw_at(&mut self, output: &mut impl Write, cols: u16, rows: u16) -> io::Result<()> {
         let syntax_invalid = self.syntax.refresh(&mut self.doc);
         if cols == 0 || rows == 0 {
@@ -2694,6 +2694,11 @@ impl Editor {
             self.screen = ScreenCache::default();
             return Ok(());
         }
+
+        // Painting moves the terminal cursor through the gutter and sidebar.
+        // Hide it for every frame, then show it only after the final MoveTo
+        // restores its editing position, even when output arrives in chunks.
+        queue!(output, Hide)?;
 
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
@@ -4296,6 +4301,70 @@ mod tests {
             editor.doc.path.as_ref().unwrap().ends_with("two.md"),
             "save-as cannot overwrite a file already open in another buffer"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_vertical_navigation_never_shows_cursor_in_line_numbers() {
+        let root = temporary_buffer_project();
+        let text = (0..120)
+            .map(|row| format!("line {row:03}: text wide enough to scroll horizontally\n"))
+            .collect::<String>();
+        for (cols, rows, sidebar) in [(80, 18, false), (100, 24, true), (18, 8, false)] {
+            let mut editor = Editor::new(Document::from_text(&text));
+            editor.doc.col = 20;
+            if sidebar {
+                let mut tree = TreePlugin::new(&root).unwrap();
+                tree.toggle().unwrap();
+                tree.leave();
+                editor.tree = Some(tree);
+            }
+            let mut parser = vt100::Parser::new(
+                std::num::NonZeroU16::new(rows).unwrap(),
+                std::num::NonZeroU16::new(cols).unwrap(),
+                0,
+            );
+            let mut initial = Vec::new();
+            editor.draw_at(&mut initial, cols, rows).unwrap();
+            parser.process(&initial);
+            assert!(!parser.screen().hide_cursor());
+
+            for direction in ['j', 'k'] {
+                for step in 0..90 {
+                    let mut key = KeyEvent::new(KeyCode::Char(direction), KeyModifiers::NONE);
+                    key.kind = KeyEventKind::Repeat;
+                    editor.key(key, rows.saturating_sub(2) as usize);
+                    let mut frame = Vec::new();
+                    editor.draw_at(&mut frame, cols, rows).unwrap();
+                    let sidebar_width = tree_sidebar_width(cols as usize, sidebar);
+                    let gutter =
+                        gutter_width(cols as usize - sidebar_width, editor.doc.lines.len());
+                    let text_left = sidebar_width + gutter;
+                    // A terminal may render between any two bytes/writes.
+                    // Even an incomplete frame must never expose the paint
+                    // cursor in the relative line numbers or the sidebar.
+                    for byte in &frame {
+                        parser.process(std::slice::from_ref(byte));
+                        if !parser.screen().hide_cursor() {
+                            assert!(parser.screen().cursor_position().1 as usize >= text_left,
+                                "visible cursor in gutter during {direction} repeat {step} ({cols}x{rows})");
+                        }
+                    }
+                    assert!(
+                        !parser.screen().hide_cursor(),
+                        "editing cursor must be restored"
+                    );
+                    assert_eq!(
+                        parser.screen().cursor_position(),
+                        (
+                            (editor.doc.row - editor.scroll_row) as u16,
+                            (text_left + visual_column(&editor.doc.line()[..editor.doc.col])
+                                - editor.scroll_col) as u16,
+                        )
+                    );
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
