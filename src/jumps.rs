@@ -12,6 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 const MAX_JUMPS: usize = 200;
+const MAX_CHANGES: usize = 200;
 const MAX_MARKS: usize = 1024;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -28,12 +29,14 @@ pub struct Location {
 struct Saved {
     history: Vec<Location>,
     cursor: Option<usize>,
+    changes: Vec<Location>,
     marks: BTreeMap<String, Location>,
 }
 
 pub struct JumpManager {
     saved: Saved,
     state_path: Option<PathBuf>,
+    change_cursor: usize,
 }
 
 pub fn default_state_path() -> Option<PathBuf> {
@@ -53,7 +56,7 @@ pub fn default_state_path() -> Option<PathBuf> {
 
 impl JumpManager {
     pub fn memory_only() -> Self {
-        Self { saved: Saved::default(), state_path: None }
+        Self { saved: Saved::default(), state_path: None, change_cursor: 0 }
     }
 
     pub fn load_default() -> Self {
@@ -73,15 +76,20 @@ impl JumpManager {
                 .filter(|entry| entry.path.is_absolute())
                 .take(MAX_JUMPS).collect(),
             cursor: None,
+            changes: saved.changes.into_iter().filter(|entry| entry.path.is_absolute())
+                .rev().take(MAX_CHANGES).collect::<Vec<_>>()
+                .into_iter().rev().collect(),
             marks: saved.marks.into_iter()
                 .filter(|(_, loc)| loc.path.is_absolute()).take(MAX_MARKS).collect(),
         };
         let cursor = saved.history.len().checked_sub(1);
-        Self { saved: Saved { cursor, ..saved }, state_path: Some(path) }
+        let change_cursor = saved.changes.len();
+        Self { saved: Saved { cursor, ..saved }, state_path: Some(path), change_cursor }
     }
 
     pub fn entries(&self) -> &[Location] { &self.saved.history }
     pub fn cursor(&self) -> Option<usize> { self.saved.cursor }
+    pub fn changes(&self) -> &[Location] { &self.saved.changes }
 
     // History is a timeline, not a stream of every keystroke. Coalesce
     // repeated edits/moves on the same line and discard forward history
@@ -141,6 +149,46 @@ impl JumpManager {
         self.saved.cursor = Some(index);
         self.persist()?;
         Ok(self.saved.history.get(index).cloned())
+    }
+
+
+    /// Remacs extension of Vim's changelist: edits across *all* open files,
+    /// with position recording once per edit command / insert session.
+    pub fn record_change(&mut self, location: Location) -> io::Result<()> {
+        if !location.path.is_absolute() { return Ok(()); }
+        // A new edit discards the forward traversal of the old change list.
+        if self.change_cursor < self.saved.changes.len() {
+            self.saved.changes.truncate(self.change_cursor + 1);
+        }
+        if let Some(last) = self.saved.changes.last_mut() {
+            if last.path == location.path && last.row == location.row {
+                *last = location;
+                self.change_cursor = self.saved.changes.len();
+                return self.persist();
+            }
+        }
+        self.saved.changes.push(location);
+        if self.saved.changes.len() > MAX_CHANGES {
+            self.saved.changes.remove(0);
+        }
+        self.change_cursor = self.saved.changes.len();
+        self.persist()
+    }
+
+    /// g; starts with the newest edit, then moves to older edit sites.
+    pub fn older_change(&mut self) -> io::Result<Option<Location>> {
+        if self.change_cursor == 0 { return Ok(None); }
+        self.change_cursor = self.change_cursor.saturating_sub(1);
+        self.persist()?;
+        Ok(self.saved.changes.get(self.change_cursor).cloned())
+    }
+
+    /// g, moves forward through the previous edit sites.
+    pub fn newer_change(&mut self) -> io::Result<Option<Location>> {
+        if self.change_cursor + 1 >= self.saved.changes.len() { return Ok(None); }
+        self.change_cursor += 1;
+        self.persist()?;
+        Ok(self.saved.changes.get(self.change_cursor).cloned())
     }
 
     /// Lowercase marks are file-local; uppercase marks are global.
@@ -210,6 +258,28 @@ mod tests {
 
     fn place(file: &str, row: usize, col: usize) -> Location {
         Location { path: std::env::temp_dir().join(file), row, col }
+    }
+
+
+    #[test]
+    fn global_changes_can_be_navigated_across_closed_buffers() {
+        let mut store = JumpManager::memory_only();
+        store.record_change(place("first.rs", 2, 0)).unwrap();
+        store.record_change(place("second.rs", 12, 4)).unwrap();
+        store.record_change(place("third.md", 8, 3)).unwrap();
+        assert_eq!(store.older_change().unwrap(), Some(place("third.md", 8, 3)));
+        assert_eq!(store.older_change().unwrap(), Some(place("second.rs", 12, 4)));
+        assert_eq!(store.older_change().unwrap(), Some(place("first.rs", 2, 0)));
+        assert_eq!(store.older_change().unwrap(), None);
+        assert_eq!(store.newer_change().unwrap(), Some(place("second.rs", 12, 4)));
+    }
+
+    #[test]
+    fn repeated_changes_on_same_line_coalesce() {
+        let mut store = JumpManager::memory_only();
+        store.record_change(place("f.rs", 8, 0)).unwrap();
+        store.record_change(place("f.rs", 8, 10)).unwrap();
+        assert_eq!(store.changes(), &[place("f.rs", 8, 10)]);
     }
 
     #[test]
