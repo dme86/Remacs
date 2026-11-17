@@ -2,6 +2,7 @@
 mod document;
 mod finder_ui;
 mod function_select;
+mod jumps;
 mod plugins;
 mod syntax;
 
@@ -21,6 +22,7 @@ use crossterm::{
 use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
 use function_select::{around_function, Position, TextRange};
+use jumps::{JumpManager, Location};
 use plugins::{FinderView, TreeAction, TreePlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -56,6 +58,9 @@ enum Sequence {
     Delete,
     Yank,
     Go,
+    MarkSet,
+    MarkLine,
+    MarkExact,
 }
 
 enum Prompt {
@@ -177,6 +182,7 @@ struct Editor {
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
+    jumps: JumpManager,
     tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
@@ -206,6 +212,13 @@ impl Editor {
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
+            // Unit tests must not write to the real user's persistent state
+            // or race each other while modifying the global jump history.
+            jumps: if cfg!(test) {
+                JumpManager::memory_only()
+            } else {
+                JumpManager::load_default()
+            },
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -235,6 +248,150 @@ impl Editor {
     fn buffer_name(doc: &Document) -> String {
         doc.path.as_ref().map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "[No Name]".into())
+    }
+
+
+    fn current_location(&self) -> Option<Location> {
+        self.doc.path.as_ref().map(|path| Location {
+            path: path_identity(path),
+            row: self.doc.row,
+            col: self.doc.col,
+        })
+    }
+
+    fn record_current_jump(&mut self) {
+        if let Some(location) = self.current_location() {
+            if let Err(error) = self.jumps.remember(location) {
+                self.message = format!("Jump history could not be saved: {error}");
+            }
+        }
+    }
+
+    fn record_current_change(&mut self) {
+        if let Some(location) = self.current_location() {
+            if let Err(error) = self.jumps.record_change(location) {
+                self.message = format!("Change history could not be saved: {error}");
+            }
+        }
+    }
+
+    fn visit_location(&mut self, target: Location, linewise: bool) -> bool {
+        let slot = self.named_slot(&target.path);
+        // In-memory buffers take precedence: a file may have been deleted
+        // on disk while its modified contents remain open in Remacs.
+        if slot.is_none() && !target.path.is_file() {
+            self.message = format!("Jump target missing: {}", target.path.display());
+            return false;
+        }
+        let Some(slot) = slot else {
+            // Open through the standard buffer API but without adding
+            // the origin as another jump to this already-traversed history.
+            let next = match Document::open(target.path.clone()) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    self.message = format!("Jump target unreadable: {error}");
+                    return false;
+                }
+            };
+            let previous = self.active_slot;
+            let current = self.take_current();
+            self.slots[previous] = Some(current);
+            let index = self.slots.len();
+            self.slots.push(None);
+            self.last_slot = Some(previous);
+            self.activate(StoredBuffer {
+                doc: next, undo: Vec::new(), redo: Vec::new(),
+                scroll_row: 0, scroll_col: 0,
+            }, index);
+            self.move_to_location(target, linewise);
+            return true;
+        };
+        if slot != self.active_slot {
+            self.switch_buffer_internal(slot, false);
+        }
+        self.move_to_location(target, linewise);
+        true
+    }
+
+    fn move_to_location(&mut self, target: Location, linewise: bool) {
+        self.doc.row = target.row.min(self.doc.lines.len().saturating_sub(1));
+        let line = &self.doc.lines[self.doc.row];
+        let col = if linewise {
+            line.iter().position(|c| !c.is_whitespace()).unwrap_or(0)
+        } else {
+            target.col
+        };
+        self.doc.col = col.min(line.len());
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.visual_anchor = None;
+        self.sequence = Sequence::None;
+        self.return_to_editor_after_switch();
+        self.message = format!("Jump: {}:{}:{}",
+            self.doc.path.as_ref().map_or(String::new(), |p| p.display().to_string()),
+            self.doc.row + 1, self.doc.col + 1);
+    }
+
+    fn jump_back(&mut self) {
+        let current = self.current_location();
+        match self.jumps.back(current) {
+            Ok(Some(place)) => { self.visit_location(place, false); }
+            Ok(None) => self.message = "At oldest jump".into(),
+            Err(error) => self.message = format!("Jump history error: {error}"),
+        }
+    }
+
+    fn jump_forward(&mut self) {
+        match self.jumps.forward() {
+            Ok(Some(place)) => { self.visit_location(place, false); }
+            Ok(None) => self.message = "At newest jump".into(),
+            Err(error) => self.message = format!("Jump history error: {error}"),
+        }
+    }
+
+    fn jump_to_change(&mut self, older: bool) {
+        let result = if older {
+            self.jumps.older_change()
+        } else {
+            self.jumps.newer_change()
+        };
+        match result {
+            Ok(Some(place)) => {
+                self.record_current_jump();
+                self.visit_location(place, false);
+            }
+            Ok(None) => self.message = if older {
+                "No older edit location".into()
+            } else {
+                "No newer edit location".into()
+            },
+            Err(error) => self.message = format!("Change history error: {error}"),
+        }
+    }
+
+    fn set_mark(&mut self, name: char) {
+        let Some(location) = self.current_location() else {
+            self.message = "Name this file before setting a persistent mark".into();
+            return;
+        };
+        match self.jumps.set_mark(name, location) {
+            Ok(true) => self.message = format!("Mark {name} saved"),
+            Ok(false) => self.message = "Marks must be letters a-z or A-Z".into(),
+            Err(error) => self.message = format!("Could not save mark: {error}"),
+        }
+    }
+
+    fn jump_to_mark(&mut self, name: char, linewise: bool) {
+        let Some(current) = self.current_location() else {
+            self.message = "Name this file before jumping to a mark".into();
+            return;
+        };
+        if let Some(place) = self.jumps.mark(name, &current.path) {
+            self.record_current_jump();
+            self.visit_location(place, linewise);
+        } else {
+            self.message = format!("Mark {name} not set");
+        }
     }
 
     fn dirty_buffers(&self) -> usize {
@@ -305,9 +462,15 @@ impl Editor {
     }
 
     fn switch_buffer(&mut self, index: usize) {
+        self.switch_buffer_internal(index, true);
+    }
+
+    fn switch_buffer_internal(&mut self, index: usize, record_jump: bool) {
         if index == self.active_slot || index >= self.slots.len() {
             return;
         }
+        if self.slots[index].is_none() { return; }
+        if record_jump { self.record_current_jump(); }
         let Some(next) = self.slots[index].take() else { return; };
         let previous = self.active_slot;
         let current = self.take_current();
@@ -464,6 +627,9 @@ impl Editor {
             self.message = "Buffer modified; save it or use :bd! to discard".into();
             return;
         }
+        // Closing a buffer is a jump-worthy event. Its last position remains
+        // reachable even when the document is no longer held in memory.
+        self.record_current_jump();
         if self.slots.len() == 1 {
             let enabled = self.syntax.enabled();
             self.doc = Document::empty();
@@ -494,6 +660,7 @@ impl Editor {
     }
 
     fn remember(&mut self) {
+        self.record_current_change();
         let snapshot = Snapshot::capture(&self.doc);
         let next_bytes = snapshot.approx_bytes();
         let mut used = self.undo.iter().map(Snapshot::approx_bytes).sum::<usize>();
@@ -644,6 +811,7 @@ impl Editor {
         self.sequence = Sequence::None;
         match around_function(&self.doc) {
             Ok(Some(range)) => {
+                self.record_current_jump();
                 self.mode = Mode::Visual;
                 self.visual_anchor = Some(range.start);
                 self.selection = Some(range);
@@ -785,6 +953,7 @@ impl Editor {
         }
         match Document::open(path) {
             Ok(doc) => {
+                self.record_current_jump();
                 let previous = self.active_slot;
                 let current = self.take_current();
                 self.slots[previous] = Some(current);
@@ -829,6 +998,12 @@ impl Editor {
             "b#" => self.last_buffer(),
             "bd" => self.close_buffer(false),
             "bd!" => self.close_buffer(true),
+            "jumps" => self.message = format!(
+                "{} jump locations (Ctrl+O older, Alt+Right newer)", self.jumps.entries().len()
+            ),
+            "changes" => self.message = format!(
+                "{} recent edits (g; older, g, newer)", self.jumps.changes().len()
+            ),
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
@@ -942,6 +1117,8 @@ impl Editor {
                 match key.code {
                     KeyCode::Char('j') => { self.cycle_buffer(true); return; }
                     KeyCode::Char('k') => { self.cycle_buffer(false); return; }
+                    KeyCode::Left => { self.jump_back(); return; }
+                    KeyCode::Right => { self.jump_forward(); return; }
                     _ => {}
                 }
             }
@@ -964,7 +1141,8 @@ impl Editor {
             self.tree_key(key);
             return;
         }
-        if self.mode == Mode::Normal && key.code == KeyCode::Tab {
+        if self.mode == Mode::Normal && key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(tree) = &mut self.tree {
                 if tree.visible {
                     tree.focus();
@@ -997,6 +1175,8 @@ impl Editor {
                 KeyCode::Char('x') => self.control_x = true,
                 KeyCode::Char('g') => { self.sequence = Sequence::None; self.count = None; self.message = "Cancelled".into(); }
                 KeyCode::Char('r') if self.mode == Mode::Normal => self.redo(),
+                KeyCode::Char('o') if self.mode == Mode::Normal => self.jump_back(),
+                KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => self.jump_forward(),
                 KeyCode::Char('v') if self.mode == Mode::Normal => self.page_down(page_height),
                 _ => {},
             }
@@ -1067,9 +1247,15 @@ impl Editor {
                     self.message = "Line yanked".into();
                 }
                 (Sequence::Go, KeyCode::Char('g')) => {
+                    self.record_current_jump();
                     self.doc.row = count.unwrap_or(1).saturating_sub(1).min(self.doc.lines.len() - 1);
                     self.doc.home();
                 }
+                (Sequence::Go, KeyCode::Char(';')) => self.jump_to_change(true),
+                (Sequence::Go, KeyCode::Char(',')) => self.jump_to_change(false),
+                (Sequence::MarkSet, KeyCode::Char(name)) => self.set_mark(name),
+                (Sequence::MarkLine, KeyCode::Char(name)) => self.jump_to_mark(name, true),
+                (Sequence::MarkExact, KeyCode::Char(name)) => self.jump_to_mark(name, false),
                 _ => self.message = "Unknown key sequence".into(),
             }
             return;
@@ -1139,7 +1325,11 @@ impl Editor {
                 self.count = explicit_count;
                 self.sequence = Sequence::Go;
             },
+            KeyCode::Char('m') => self.sequence = Sequence::MarkSet,
+            KeyCode::Char('\'') => self.sequence = Sequence::MarkLine,
+            KeyCode::Char('`') => self.sequence = Sequence::MarkExact,
             KeyCode::Char('G') => {
+                self.record_current_jump();
                 self.doc.row = explicit_count.map_or(
                     self.doc.lines.len() - 1,
                     |line| line.saturating_sub(1).min(self.doc.lines.len() - 1),
@@ -1177,9 +1367,11 @@ impl Editor {
     }
 
     fn page_down(&mut self, height: usize) {
+        self.record_current_jump();
         for _ in 0..height.max(1) { self.doc.down(); }
     }
     fn page_up(&mut self, height: usize) {
+        self.record_current_jump();
         for _ in 0..height.max(1) { self.doc.up(); }
     }
 
@@ -1445,7 +1637,10 @@ impl Editor {
                     Sequence::Quit => "SPC q → q Quit".into(),
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
-                    Sequence::Go => "g → g First line".into(),
+                    Sequence::Go => "g → g First line | ; Previous edit | , Next edit".into(),
+                    Sequence::MarkSet => "m → a-z File mark | A-Z Global mark".into(),
+                    Sequence::MarkLine => "' → mark (first nonblank on line)".into(),
+                    Sequence::MarkExact => "` → mark (exact position)".into(),
                     Sequence::None => self.count.map_or_else(|| self.message.clone(), |n| n.to_string()),
                 },
             };
@@ -1844,6 +2039,148 @@ mod tests {
         editor.command("wa");
         assert_eq!(editor.message, "All buffers already saved");
         assert_eq!(editor.dirty_buffers(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_and_alt_right_jump_back_and_forward_across_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.doc.col = 1;
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        assert_eq!(editor.active_slot, 1);
+        // Exercise the actual keyboard event dispatch.
+        editor.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 0);
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 1));
+
+        editor.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), 12);
+        assert_eq!(editor.active_slot, 1);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_positions_are_recalled_across_buffers_and_buffer_close() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        editor.doc.col = 2;
+        // Recording happens at the start of each editing command.
+        editor.remember();
+        editor.doc.insert('A');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.row = 0;
+        editor.doc.col = 3;
+        editor.remember();
+        editor.doc.insert('B');
+        assert_eq!(editor.jumps.changes().len(), 2);
+        editor.jump_to_change(true);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        editor.jump_to_change(true);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 2));
+
+        // Close the now-clean second file, then revisit its edit position.
+        editor.switch_buffer(1);
+        editor.doc.dirty = false; // simulate file saved
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1);
+        editor.jump_to_change(false);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        assert_eq!(editor.doc.row, 0);
+        // Files reopened after buffer close are loaded from disk; unsaved
+        // content is intentionally not persisted by the jumplist.
+        assert_eq!(editor.doc.line().iter().collect::<String>(), "# two");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_persist_across_buffer_closes_and_process_restart() {
+        let root = temporary_buffer_project();
+        let state = root.join("jump_history.json");
+        {
+            let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+            editor.jumps = JumpManager::from_path(state.clone());
+            editor.doc.row = 2;
+            editor.doc.col = 1;
+            for key in ['m', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            for key in ['m', 'a'] { press(&mut editor, KeyCode::Char(key)); }
+            assert!(editor.message.contains("Mark a"));
+            editor.open(root.join("two.md").to_string_lossy().into_owned());
+            editor.switch_buffer(0);
+            editor.close_buffer(false);
+            for key in ['`', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            assert_eq!(editor.doc.row, 2);
+            assert_eq!(editor.doc.col, 1);
+        }
+
+        let mut editor = Editor::new(Document::open(root.join("two.md")).unwrap());
+        editor.jumps = JumpManager::from_path(state);
+        for key in ['\'', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        assert_eq!(editor.doc.row, 2);
+        assert_eq!(editor.doc.col, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    #[test]
+    fn closing_clean_buffer_preserves_its_last_jump_position() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.col = 3;
+        editor.close_buffer(false);
+        assert_eq!(editor.slots.len(), 1);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
+        editor.jump_back();
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        assert_eq!(editor.doc.col, 3);
+        assert_eq!(editor.slots.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_jump_target_does_not_create_a_new_file() {
+        // macOS temp paths often contain /var -> /private/var symlinks.
+        // Use the canonical root so test fixtures match production
+        // path_identity() when storing and comparing jump locations.
+        let root = std::fs::canonicalize(temporary_buffer_project()).unwrap();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.jumps.remember(Location {
+            path: root.join("missing.rs"), row: 5, col: 0
+        }).unwrap();
+        editor.jumps.remember(Location {
+            path: root.join("one.rs"), row: 0, col: 0
+        }).unwrap();
+        editor.jump_back();
+        assert!(editor.message.contains("Jump target missing"));
+        assert!(!root.join("missing.rs").exists());
+        assert_eq!(editor.slots.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vim_gg_and_g_semicolon_record_and_navigate_jumps_and_edits() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.row = 2;
+        for key in ['g', 'g'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 0);
+        editor.jump_back();
+        assert_eq!(editor.doc.row, 2);
+        editor.doc.row = 1;
+        editor.remember();
+        editor.doc.row = 2;
+        editor.remember();
+        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 2);
+        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 1);
+        for key in ['g', ','] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.doc.row, 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

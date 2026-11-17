@@ -43,7 +43,11 @@ shows incomplete sequences.
 | Normal mode | **`Esc`** |
 | Move | **`h` / `j` / `k` / `l`**, arrows, **`w` / `b`**, optional count (e.g. **`5j`**, **`12k`**) |
 | Beginning / end of line | **`0` / `$`** |
-| First / last line | **`gg` / `G`**, absolute jump via **`42G`** or **`42gg`** |
+| First / last line | **gg / G**, absolute jump via **42G** or **42gg** |
+| Jump backwards / forwards | **Ctrl+O / Ctrl+I** or **Alt+Left / Alt+Right** |
+| Previous / next edit (global) | **g; / g,** |
+| Set local / global mark | **ma / mA** |
+| Jump to mark | **'a** (line) / **`a** (exact column), uppercase for cross-file |
 | Select function (Tree-sitter) | **`vaf`** or **`SPC v f`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
 | Yank / delete selection | **`y` / `d`** in VISUAL mode |
@@ -80,6 +84,46 @@ From an open editor, use `SPC f f` to enter a filename, or `:e path/to/file`.
 Opening another file does **not** require saving the current one: unsaved changes
 stay in their own buffer. Start an empty document with `remacs` and save it
 via `SPC f s`.
+
+## Persistent jumps and named marks
+
+Remacs follows Vim's distinction between a **jumplist** (places you jumped
+from) and a **changelist** (places you edited). Both histories are global
+across buffers in Remacs. Edit one file, switch to another, and return to
+either location with just a shortcut.
+
+| Action | Keys |
+| --- | --- |
+| Older / newer jump | **Ctrl+O / Ctrl+I**, or **Alt+Left / Alt+Right** |
+| Older / newer edit | **g; / g,** |
+| Set local / global mark | **ma / mA** (lowercase scoped to file, uppercase global) |
+| Jump to exact marked position | **`a / `A** |
+| Jump to first nonblank character on marked line | **'a / 'A** |
+
+**Example:** edit main.rs, switch to document.rs and edit again. Repeating
+**g;** visits the most recent edit locations even across files. **Ctrl+O**
+moves back through major navigation positions, **Alt+Right** moves forward.
+When a target file is closed, Remacs automatically reopens it. If it is
+already open, Remacs reuses that exact buffer, including unsaved edits.
+
+Locations persist as a small JSON file:
+
+- macOS: **~/Library/Application Support/Remacs/jumps.json**
+- Linux: **${XDG_STATE_HOME:-~/.local/state}/remacs/jumps.json**
+
+Only absolute file paths, line/column coordinates, and named marks are
+saved—not unsaved text, document buffers, or undo snapshots. The history
+holds at most **200 jumps and 200 edits**; repeated changes on the same
+line are collapsed. Removed files do not cause placeholder files to be
+created.
+
+**Difference from Vim:** Vim's changelist is traditionally per buffer and
+its jumplist per window; Remacs deliberately uses a global edit history.
+Ctrl+I can be indistinguishable from Tab in some terminals; Alt+Right is
+the reliable alternative in rst. Like Vim's simple location marks, these
+coordinates cannot yet follow arbitrary insertions after a file has
+been closed and reopened. Concurrent processes can overwrite one another's
+history; this is a first lightweight persistent version.
 
 ## Multiple file buffers
 
