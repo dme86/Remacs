@@ -861,10 +861,12 @@ impl Editor {
                 painted.index != index || painted.content.as_deref() != content
             });
             let highlight_changed = old.is_none_or(|painted| painted.active != active);
+            let selected = self.selection.and_then(|range| range.columns(index, line.map_or(0, Vec::len)));
+            let selection_changed = old.is_none_or(|painted| painted.selected != selected);
             let gutter_changed = old.is_none_or(|painted| painted.gutter != number);
             let syntax_stale = self.syntax.enabled()
                 && syntax_invalid.is_some_and(|first| index >= first);
-            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale;
+            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale || selection_changed;
 
             if !paint_text && !gutter_changed {
                 continue;
@@ -886,7 +888,16 @@ impl Editor {
 
                 let mut visible_width = 0;
                 if let Some(line) = line {
-                    if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
+                    if let Some(columns) = selected {
+                        let spans = self.syntax.spans(&self.doc, index);
+                        for (foreground, background, text) in render_selected_line(
+                            line, spans.unwrap_or(&[]), self.scroll_col, text_width, columns, active
+                        ) {
+                            visible_width += UnicodeWidthStr::width(text.as_str());
+                            queue!(output, SetForegroundColor(foreground), SetBackgroundColor(background), Print(text))?;
+                        }
+                        queue!(output, ResetColor)?;
+                    } else if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
                         for (color, text) in render_color_line(line, spans, self.scroll_col, text_width) {
                             visible_width += UnicodeWidthStr::width(text.as_str());
                             queue!(output, SetForegroundColor(color), Print(text))?;
@@ -901,6 +912,7 @@ impl Editor {
                     // Fill to the right edge without clearing the terminal.
                     // This also highlights empty lines and trailing whitespace.
                     queue!(output,
+                        SetBackgroundColor(CURRENT_LINE_BG),
                         SetForegroundColor(Color::Reset),
                         Print(" ".repeat(text_width.saturating_sub(visible_width))),
                         ResetColor
@@ -915,6 +927,7 @@ impl Editor {
                 content: line.cloned(),
                 gutter: number,
                 active,
+                selected,
             });
         }
 
@@ -1084,6 +1097,64 @@ fn render_color_line(line: &[char], spans: &[Span], start: usize, width: usize) 
             }
             column += size;
         }
+    }
+    runs
+}
+
+fn render_selected_line(
+    line: &[char], spans: &[Span], scroll: usize, width: usize,
+    selection: (usize, usize), active: bool,
+) -> Vec<(Color, Color, String)> {
+    let mut runs: Vec<(Color, Color, String)> = Vec::new();
+    let mut visual_col = 0;
+    let mut syntax_index = 0;
+    let end = scroll.saturating_add(width);
+    for (index, &ch) in line.iter().enumerate() {
+        if visual_col >= end { break; }
+        while syntax_index < spans.len() && index >= spans[syntax_index].end {
+            syntax_index += 1;
+        }
+        let foreground = spans.get(syntax_index)
+            .filter(|span| index >= span.start && index < span.end)
+            .map_or(Color::Reset, |span| span.foreground);
+        let background = if (selection.0..selection.1).contains(&index) {
+            VISUAL_SELECTION_BG
+        } else if active {
+            CURRENT_LINE_BG
+        } else {
+            Color::Reset
+        };
+        let size = char_width(ch, visual_col);
+        let mut visible = String::new();
+        if ch == '\t' || ch.is_control() {
+            for offset in 0..size.max(usize::from(ch.is_control())) {
+                if visual_col + offset >= scroll && visual_col + offset < end {
+                    visible.push(' ');
+                }
+            }
+        } else if size == 0 {
+            if visual_col > scroll && visual_col <= end { visible.push(ch); }
+        } else if visual_col >= scroll && visual_col + size <= end {
+            visible.push(ch);
+        } else {
+            for offset in 0..size {
+                if visual_col + offset >= scroll && visual_col + offset < end {
+                    visible.push(' ');
+                }
+            }
+        }
+        if !visible.is_empty() {
+            if let Some((fg, bg, text)) = runs.last_mut() {
+                if *fg == foreground && *bg == background {
+                    text.push_str(&visible);
+                } else {
+                    runs.push((foreground, background, visible));
+                }
+            } else {
+                runs.push((foreground, background, visible));
+            }
+        }
+        visual_col += size;
     }
     runs
 }
