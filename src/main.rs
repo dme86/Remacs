@@ -1190,12 +1190,14 @@ impl Editor {
     }
 
     fn key(&mut self, key: KeyEvent, page_height: usize) {
+        let shortcut = popup_shortcut(key);
         // A visible terminal receives every key, including Escape, instead of
         // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
         // the PTY; the session continues while hidden.
         if let Ok(Some(active)) = self.toggleterm.active() {
-            if key.code == KeyCode::Char('t')
-                && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if shortcut.as_deref().is_some_and(|name| {
+                self.toggleterm.dismiss(name).unwrap_or(false)
+            }) {
                 let _ = self.toggleterm.hide();
                 return;
             }
@@ -1210,10 +1212,11 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
-        if key.code == KeyCode::Char('t')
-            && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.terminal_binding("ctrl-t");
-            return;
+        if let Some(ref name) = shortcut {
+            if self.toggleterm.binding(name).ok().flatten().is_some() {
+                self.terminal_binding(name);
+                return;
+            }
         }
         // Ctrl+P opens/closes the existing centered buffer search popup.
         // Check it before the buffer picker and focused Lua tree so the
@@ -1357,6 +1360,17 @@ impl Editor {
         if self.sequence != Sequence::None {
             let sequence = std::mem::take(&mut self.sequence);
             let count = self.count.take();
+            // Lua owns the leader bindings. Any new "space x" mapping in
+            // plugins/toggleterm.lua works without changing this dispatcher.
+            if sequence == Sequence::Leader {
+                if let KeyCode::Char(c) = key.code {
+                    let binding = format!("space {}", c.to_ascii_lowercase());
+                    if self.toggleterm.binding(&binding).ok().flatten().is_some() {
+                        self.terminal_binding(&binding);
+                        return;
+                    }
+                }
+            }
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
@@ -1364,8 +1378,6 @@ impl Editor {
                 (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
                 (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
-                (Sequence::Leader, KeyCode::Char('g')) => self.terminal_binding("space g"),
-                (Sequence::Leader, KeyCode::Char('t')) => self.terminal_binding("space t"),
                 (Sequence::Buffer, KeyCode::Char('b')) => self.open_buffer_picker(),
                 (Sequence::Buffer, KeyCode::Char('n')) => self.cycle_buffer(true),
                 (Sequence::Buffer, KeyCode::Char('p')) => self.cycle_buffer(false),
@@ -1868,6 +1880,20 @@ impl Editor {
     }
 }
 
+
+// Convert terminal key events into Lua plugin binding names. This is a
+// generic dispatcher, not a hardcoded terminal-plugin shortcut table.
+fn popup_shortcut(key: KeyEvent) -> Option<String> {
+    let KeyCode::Char(c) = key.code else { return None };
+    let modifiers = key.modifiers;
+    if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+        Some(format!("ctrl-{}", c.to_ascii_lowercase()))
+    } else if modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL) {
+        Some(format!("alt-{}", c.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
 
 fn tree_sidebar_width(columns: usize, visible: bool) -> usize {
     if !visible || columns < 48 { return 0; }
