@@ -3,13 +3,15 @@ mod document;
 mod finder_ui;
 mod function_select;
 mod jumps;
+mod lsp;
+mod lsp_plugin;
 mod plugins;
 mod popup_terminal;
 mod syntax;
 mod toggleterm_plugin;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     io::{self, Write},
     time::Duration,
@@ -27,6 +29,8 @@ use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
 use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
+use lsp::{Event as LspEvent, Manager as LspManager, RequestKind};
+use lsp_plugin::LspPlugin;
 use plugins::{FinderView, TreeAction, TreePlugin};
 use popup_terminal::{popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession};
 use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
@@ -189,6 +193,9 @@ struct Editor {
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
+    hover_popup: Option<String>,
+    lsp_plugin: LspPlugin,
+    lsp: LspManager,
     jumps: JumpManager,
     toggleterm: ToggleTermPlugin,
     terminals: HashMap<String, TerminalSession>,
@@ -221,6 +228,9 @@ impl Editor {
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
+            hover_popup: None,
+            lsp_plugin: LspPlugin::new().expect("bundled plugins/lsp.lua"),
+            lsp: LspManager::default(),
             // Unit tests must not write to the real user's persistent state
             // or race each other while modifying the global jump history.
             jumps: if cfg!(test) {
@@ -324,6 +334,132 @@ impl Editor {
             let _ = self.toggleterm.exited(&kind);
             self.message = format!("{kind} terminal exited");
         }
+    }
+
+    fn lsp_action(&mut self, action: &str) {
+        let Some(path) = self.doc.path.as_ref() else {
+            self.message = "LSP requires a named file".into();
+            return;
+        };
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = match self.lsp_plugin.server_for(path, &cwd) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                self.message = "No language server configured for this file".into();
+                return;
+            }
+            Err(error) => {
+                self.message = format!("LSP plugin error: {error}");
+                return;
+            }
+        };
+        let kind = match action {
+            "definition" => RequestKind::Definition,
+            "hover" => RequestKind::Hover,
+            _ => {
+                self.message = format!("Unsupported LSP action: {action}");
+                return;
+            }
+        };
+        match self.lsp.request(&config, path, self.doc.revision,
+            self.doc.row, self.doc.col, kind) {
+            Ok(true) => self.message = format!("{}: {action} requested", config.language),
+            Ok(false) => self.message = format!("{} LSP unavailable; check rust-analyzer", config.language),
+            Err(error) => self.message = format!("Cannot start {} LSP: {error}", config.language),
+        }
+    }
+
+    fn sync_lsp_documents(&mut self) {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let docs = std::iter::once(&self.doc)
+            .chain(self.slots.iter().filter_map(|entry| entry.as_ref().map(|b| &b.doc)));
+        let mut present = HashSet::new();
+        for doc in docs {
+            let Some(path) = doc.path.as_ref() else { continue };
+            present.insert(lsp::absolute(path));
+            let config = match self.lsp_plugin.server_for(path, &cwd) {
+                Ok(Some(config)) => config,
+                Ok(None) => continue,
+                Err(error) => {
+                    self.message = format!("LSP configuration error: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = self.lsp.sync(&config, path, doc.revision, ||doc.lsp_text()) {
+                self.message = format!("{} LSP: {error}", config.language);
+            }
+        }
+        self.lsp.flush(&present);
+    }
+
+    fn apply_lsp_definition(&mut self, target: lsp::Target) {
+        // LSP coordinates are UTF-16 code units (or negotiated UTF-8/32).
+        // Remacs stores Unicode scalar indices in Vec<char>.
+        let line_in_buffer = if self.doc.path.as_ref().is_some_and(|p|
+            lsp::absolute(p) == lsp::absolute(&target.path)) {
+            self.doc.lines.get(target.row)
+        } else {
+            self.slots.iter().flatten()
+                .find(|entry| entry.doc.path.as_ref().is_some_and(|path|
+                    lsp::absolute(path) == lsp::absolute(&target.path)))
+                .and_then(|entry| entry.doc.lines.get(target.row))
+        };
+        let col = if let Some(line) = line_in_buffer {
+            lsp::char_index(line, target.character, target.encoding)
+        } else {
+            std::fs::read_to_string(&target.path).ok()
+                .and_then(|text| text.split('\n').nth(target.row)
+                    .map(|line| line.trim_end_matches('\r').chars().collect::<Vec<_>>()))
+                .map(|line| lsp::char_index(&line, target.character, target.encoding))
+                .unwrap_or(target.character)
+        };
+        self.record_current_jump();
+        self.visit_location(Location {
+            path: target.path,
+            row: target.row,
+            col,
+        }, false);
+    }
+
+    fn poll_lsp(&mut self) {
+        for event in self.lsp.poll() {
+            match event {
+                LspEvent::Status(text) => self.message = text,
+                LspEvent::Definition { origin, revision, target } => {
+                    let still_current = self.doc.path.as_ref().is_some_and(|path|
+                        lsp::absolute(path) == origin) && self.doc.revision == revision;
+                    if !still_current { continue; }
+                    if let Some(target) = target {
+                        self.apply_lsp_definition(target);
+                    } else {
+                        self.message = "No definition found".into();
+                    }
+                }
+                LspEvent::Hover { origin, revision, text } => {
+                    let still_current = self.doc.path.as_ref().is_some_and(|path|
+                        lsp::absolute(path) == origin) && self.doc.revision == revision;
+                    if !still_current { continue; }
+                    if let Some(text) = text {
+                        self.hover_popup = Some(text);
+                    } else {
+                        self.message = "No hover information at cursor".into();
+                    }
+                }
+            }
+        }
+        self.sync_lsp_documents();
+    }
+
+    fn hover_view(&self) -> Option<FinderView> {
+        let content = self.hover_popup.as_ref()?;
+        let matches = content.lines().take(150).map(str::to_owned).collect::<Vec<_>>();
+        Some(FinderView {
+            query: String::new(),
+            selected: 0,
+            total_matches: matches.len(),
+            scanned: matches.len(),
+            matches,
+        })
     }
 
     fn active_name(&self) -> String {
