@@ -1693,6 +1693,103 @@ mod tests {
     }
 
     #[test]
+    fn save_all_shortcut_persists_dirty_active_and_inactive_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('X'));
+        press(&mut editor, KeyCode::Esc);
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('Y'));
+        press(&mut editor, KeyCode::Esc);
+        editor.scroll_row = 2;
+        editor.scroll_col = 4;
+        assert_eq!(editor.dirty_buffers(), 2);
+        let before_undo = editor.undo.len();
+
+        let status = paint(&mut editor);
+        assert!(status.contains("B 2/2  ●2  SPC b s"));
+        for key in [' ', 'b', 's'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+
+        assert_eq!(editor.dirty_buffers(), 0);
+        assert_eq!(editor.active_slot, 1);
+        assert_eq!(editor.scroll_row, 2);
+        assert_eq!(editor.scroll_col, 4);
+        assert_eq!(editor.undo.len(), before_undo, "save-all must not wipe undo");
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        assert!(!editor.slots[0].as_ref().unwrap().doc.dirty);
+        assert!(editor.message.contains("Saved 2 buffer"));
+        assert!(paint(&mut editor).contains("B 2/2  ●0"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_all_skips_unnamed_buffers_without_discarding_changes() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::empty());
+        editor.doc.insert('!');
+        editor.open(root.join("one.rs").to_string_lossy().into_owned());
+        editor.doc.insert('X');
+
+        editor.command("wa");
+        assert_eq!(editor.dirty_buffers(), 1);
+        assert!(editor.message.contains("Saved 1"));
+        assert!(editor.message.contains("1 unnamed"));
+        assert!(editor.message.contains(":w FILE"));
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+
+        editor.switch_buffer(0);
+        assert!(editor.doc.path.is_none());
+        assert!(editor.doc.dirty);
+        assert_eq!(editor.doc.line().first(), Some(&'!'));
+        editor.set_path_and_save(root.join("scratch.txt"));
+        assert_eq!(editor.dirty_buffers(), 0);
+        assert_eq!(std::fs::read_to_string(root.join("scratch.txt")).unwrap(), "!");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_all_continues_after_error_and_reports_failed_buffer() {
+        let root = temporary_buffer_project();
+        let failed_path = root.join("does-not-exist").join("failed.rs");
+        let mut editor = Editor::new(Document::empty());
+        editor.doc.path = Some(failed_path.clone());
+        editor.doc.insert('!');
+        editor.open(root.join("one.rs").to_string_lossy().into_owned());
+        editor.doc.insert('X');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.insert('Y');
+        assert_eq!(editor.dirty_buffers(), 3);
+
+        editor.command("wall");
+        assert_eq!(editor.active_slot, 2);
+        assert_eq!(editor.dirty_buffers(), 1);
+        assert_eq!(editor.slots[0].as_ref().unwrap().doc.path.as_ref(), Some(&failed_path));
+        assert!(editor.slots[0].as_ref().unwrap().doc.dirty);
+        assert!(editor.message.contains("Saved 2"));
+        assert!(editor.message.contains("1 failed"));
+        assert!(editor.message.contains("failed.rs"));
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_footer_stays_compact_and_save_all_is_noop() {
+        let mut editor = Editor::new(Document::from_text("unchanged"));
+        let status = paint(&mut editor);
+        assert!(status.contains("B 1/1  ●0"));
+        assert!(!status.contains("SPC b s"));
+        editor.command("wa");
+        assert_eq!(editor.message, "All buffers already saved");
+        assert_eq!(editor.dirty_buffers(), 0);
+    }
+
+    #[test]
     fn unsaved_file_can_be_left_and_restored_with_independent_undo() {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
