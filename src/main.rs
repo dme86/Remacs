@@ -337,30 +337,38 @@ impl Editor {
     }
 
     fn buffer_candidates(&self, query: &str) -> Vec<(usize, String)> {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            let (doc, active) = if index == self.active_slot {
-                (&self.doc, true)
-            } else {
-                (&slot.as_ref()?.doc, false)
-            };
-            let name = Self::buffer_name(doc);
-            if !matches_buffer(&name, query) { return None; }
-            // Filename comes first so long absolute paths never hide the
-            // useful part of the entry in a narrower terminal.
-            let basename = doc.path.as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "[No Name]".into());
-            let parent = doc.path.as_ref().and_then(|path| path.parent())
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            Some((index, format!(
-                "{} {}{}  {}  {}",
-                if active { "▶" } else { " " },
-                if doc.dirty { "● " } else { "  " },
-                index + 1, basename, parent
-            )))
-        }).collect()
+        let mut entries: Vec<(usize, String, bool)> = self.slots.iter()
+            .enumerate().filter_map(|(index, slot)| {
+                let (doc, active) = if index == self.active_slot {
+                    (&self.doc, true)
+                } else {
+                    (&slot.as_ref()?.doc, false)
+                };
+                let name = Self::buffer_name(doc);
+                // Filename comes first so long absolute paths never hide
+                // the useful part of an entry in a narrower terminal.
+                let basename = doc.path.as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".into());
+                let file_match = matches_buffer(&basename, query);
+                if !file_match && !matches_buffer(&name, query) { return None; }
+                let parent = doc.path.as_ref().and_then(|path| path.parent())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((index, format!(
+                    "{} {}{}  {}  {}",
+                    if active { "▶" } else { " " },
+                    if doc.dirty { "● " } else { "  " },
+                    index + 1, basename, parent
+                ), file_match))
+            }).collect();
+        // Filename hits take precedence over unrelated matches created by
+        // combining characters across the absolute parent directory.
+        if !query.is_empty() && entries.iter().any(|(_, _, file_match)| *file_match) {
+            entries.retain(|(_, _, file_match)| *file_match);
+        }
+        entries.into_iter().map(|(index, label, _)| (index, label)).collect()
     }
 
     fn buffer_picker_view(&self) -> Option<FinderView> {
