@@ -51,6 +51,7 @@ shows incomplete sequences.
 | Jump to mark | **'a** (line) / **`a** (exact column), uppercase for cross-file |
 | Select function (Tree-sitter) | **`vaf`** or **`SPC v f`** |
 | LSP definition and hover (rust-analyzer) | **`gd`** and **`K`** |
+| Code completion (Insert mode) | Automatic, or **Ctrl+Space**; **↑/↓** choose, **Tab** accept |
 | Language-server manager | **`:mason`** or **`SPC l m`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
 | Yank / delete selection | **`y` / `d`** in VISUAL mode (also copies to OS clipboard) |
@@ -182,13 +183,17 @@ The Rust host **`src/lsp.rs`** handles asynchronous LSP 3.17 JSON-RPC
 over stdio; it starts **one server per language and workspace only when a
 matching file is opened**, never one server per buffer.
 
-For the first milestone Rust files use **rust-analyzer**:
+Servers enabled in the Lua catalog provide navigation and completion; Rust
+files use **rust-analyzer**:
 
 | Action | Shortcut |
 | --- | --- |
 | Go to definition | **`gd`** in Normal mode |
 | Hover documentation | **`K`** in Normal mode; Esc dismisses |
 | Return from definition | **`Ctrl+O`** (existing global jumplist) |
+| Request completion | **Ctrl+Space** in Insert mode |
+| Choose / accept completion | **↑/↓** or **Shift+Tab** / **Tab** |
+| Dismiss completion | **Ctrl+G** stays in Insert; **Esc** returns to Normal |
 
 Install rust-analyzer using your Rust toolchain:
 
@@ -201,11 +206,31 @@ background, initializes, opens the current file and processes changes without
 blocking the editor. `gd` works across files and reuses already-open buffers.
 `K` displays Markdown text in the existing centered Remacs popup.
 
+Completion suggestions appear in a small dropdown at the cursor after a
+150 ms typing pause: after two identifier characters, a dot, or `::`.
+**Ctrl+Space** explicitly requests suggestions at any position. **Tab** accepts
+the highlighted entry; without a visible menu it still inserts a tab.
+**Enter always inserts a newline**, so ordinary typing cannot accidentally
+accept a suggestion. Up/Down and Shift+Tab navigate the list.
+
+The editor synchronizes the current document before requesting suggestions
+and discards results after edits, cursor movements, dismissal or buffer
+switches. Server-provided replacement ranges and additional edits, such as
+imports, are applied together as **one undoable change**, using the negotiated
+Unicode position encoding. Invalid or overlapping edits leave the document
+unchanged. Suggestions never block typing; rapid input cancels earlier work.
+While a server is still indexing, Ctrl+Space can request a fresh list.
+
+This first version supports plain-text completion and handles common snippet
+placeholders defensively, but does not advertise full snippet support or offer
+linked placeholder navigation, item-resolution requests or completion commands.
+
 **Memory/CPU design:** One rust-analyzer process is shared by all open Rust
 buffers within a workspace. Remacs uses document revision numbers so ordinary
 cursor movement never sends text to the server. Changes are sent as minimal
 Unicode-safe edits with the server's negotiated position encoding (UTF-16 by
-default); no LSP server is started for non-Rust files. After closing a buffer,
+default); no LSP server is started for files outside the configured languages.
+After closing a buffer,
 Remacs informs the language server. External tools such as rust-analyzer are
 not bundled with Remacs.
 
@@ -215,9 +240,8 @@ unresponsive initialization is reported instead of staying stuck at startup.
 Workspace configuration is cached, so idle ticks and cursor motions do not
 repeat filesystem root discovery. Mason updates invalidate the cache.
 
-**Roadmap:** LSP Core covers definition, hover and synchronization.
-Interactive completion, diagnostics and refactoring actions are follow-up
-milestones, not included in this implementation. Language servers and
+**Roadmap:** LSP Core covers definition, hover, completion and synchronization.
+Diagnostics and refactoring actions are follow-up milestones. Language servers and
 keybindings remain configured in Lua; add more languages to
 `plugins/mason.lua` and rebuild. GitHub Actions exercises a real rust-analyzer
 server on both Linux and macOS in addition to protocol unit tests.
@@ -456,10 +480,10 @@ The embedded grammars have their own third-party licenses; see
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
 Doom-inspired leader shortcuts, hybrid relative line numbers, current-line highlighting,
 built-in syntax highlighting, multiple buffers, persistent jumps and marks,
-native clipboard integration, asynchronous LSP definition/hover, a Lua server
+native clipboard integration, asynchronous LSP definition/hover/completion, a Lua server
 manager, a file finder, floating terminals, status line, and minibuffer.
 
-**Not yet included:** in-buffer text search, LSP completion/diagnostics/refactoring,
+**Not yet included:** in-buffer text search, LSP diagnostics/refactoring,
 tabs, splits, mouse support, or menus. This release is not
 intended to replace a full-featured editor yet. Undo currently keeps up to 100 in-memory whole-document snapshots;
 some complex Unicode grapheme clusters and control sequences need more work.

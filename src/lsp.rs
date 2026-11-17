@@ -221,6 +221,7 @@ pub fn write_frame(writer: &mut impl Write, message: &Value) -> io::Result<()> {
 pub enum RequestKind {
     Definition,
     Hover,
+    Completion,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +244,13 @@ pub enum Event {
         revision: u64,
         cursor: (usize, usize),
         text: Option<String>,
+    },
+    Completion {
+        origin: PathBuf,
+        revision: u64,
+        cursor: (usize, usize),
+        encoding: Encoding,
+        list: crate::completion::List,
     },
     Status(String),
 }
@@ -279,6 +287,7 @@ struct Server {
     started_at: Instant,
     initialization_failed: bool,
     sync_kind: u8,
+    completion_supported: bool,
     encoding: Encoding,
     documents: HashMap<PathBuf, Synced>,
     deferred: Vec<Requested>,
@@ -353,6 +362,7 @@ impl Server {
             started_at: Instant::now(),
             initialization_failed: false,
             sync_kind: 2,
+            completion_supported: false,
             encoding: Encoding::Utf16,
             documents: HashMap::new(),
             deferred: Vec::new(),
@@ -374,7 +384,17 @@ impl Server {
                     "textDocument": {
                         "synchronization": {"didSave": true},
                         "definition": {"linkSupport": true},
-                        "hover": {"contentFormat": ["markdown", "plaintext"]}
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "completion": {
+                            "contextSupport": true,
+                            "completionItem": {
+                                "snippetSupport": false,
+                                "insertReplaceSupport": true
+                            },
+                            "completionList": {
+                                "itemDefaults": ["editRange", "insertTextFormat"]
+                            }
+                        }
                     }
                 }
             }
@@ -453,9 +473,10 @@ impl Server {
     fn expire_requests(&mut self) -> bool {
         let now = Instant::now();
         let expired = self.waiting.values().any(|request| {
-            request
-                .sent_at
-                .is_some_and(|sent| now.duration_since(sent) >= REQUEST_TIMEOUT)
+            request.kind != RequestKind::Completion
+                && request
+                    .sent_at
+                    .is_some_and(|sent| now.duration_since(sent) >= REQUEST_TIMEOUT)
         });
         self.cancel_requests(|request| {
             request
@@ -495,6 +516,7 @@ impl Server {
             }
             let cap = &message["result"]["capabilities"];
             self.encoding = Encoding::from_server(cap);
+            self.completion_supported = cap["completionProvider"].is_object();
             self.sync_kind = match cap["textDocumentSync"]
                 .as_u64()
                 .or_else(|| cap["textDocumentSync"]["change"].as_u64())
@@ -511,6 +533,17 @@ impl Server {
                 return events;
             }
             self.ready = true;
+            if !self.completion_supported {
+                // Requests made during startup still complete once, even
+                // when this server does not implement completion.
+                for request in &self.deferred {
+                    if request.kind == RequestKind::Completion {
+                        events.push(self.completion_event(request, &Value::Null));
+                    }
+                }
+                self.deferred
+                    .retain(|request| request.kind != RequestKind::Completion);
+            }
             events.push(Event::Status("Language server connected".into()));
             return events;
         }
@@ -518,6 +551,18 @@ impl Server {
             return events;
         };
         let result = &message["result"];
+        if request.kind == RequestKind::Completion {
+            // Completion is invoked often while typing. Empty results and
+            // transient cancellation/content-modified errors are final for
+            // this snapshot; the next edit can request a fresh list.
+            let result = if message.get("error").is_some() {
+                &Value::Null
+            } else {
+                result
+            };
+            events.push(self.completion_event(&request, result));
+            return events;
+        }
         if let Some(error) = message.get("error") {
             // -32801 (ContentModified) means the server's semantic snapshot
             // changed while it was processing the request. rust-analyzer can
@@ -566,8 +611,19 @@ impl Server {
                 cursor,
                 text: hover,
             }),
+            RequestKind::Completion => unreachable!("completion responses handled above"),
         }
         events
+    }
+
+    fn completion_event(&self, request: &Requested, result: &Value) -> Event {
+        Event::Completion {
+            origin: request.origin.clone(),
+            revision: request.revision,
+            cursor: (request.row, request.character),
+            encoding: self.encoding,
+            list: crate::completion::parse(result),
+        }
     }
 
     fn sync_document(
@@ -667,6 +723,9 @@ impl Server {
             if doc.revision != request.revision {
                 continue;
             }
+            if request.kind == RequestKind::Completion && !self.completion_supported {
+                continue;
+            }
             self.next_id += 1;
             let id = self.next_id;
             let line: Vec<char> = doc
@@ -680,14 +739,18 @@ impl Server {
             let method = match request.kind {
                 RequestKind::Definition => "textDocument/definition",
                 RequestKind::Hover => "textDocument/hover",
+                RequestKind::Completion => "textDocument/completion",
             };
-            let payload = json!({
+            let mut payload = json!({
                 "jsonrpc":"2.0", "id":id, "method":method,
                 "params":{
                     "textDocument":{"uri":uri(&request.origin)?},
                     "position":{"line":request.row,"character":character}
                 }
             });
+            if request.kind == RequestKind::Completion {
+                payload["params"]["context"] = json!({"triggerKind":1});
+            }
             match self.send(payload) {
                 Ok(()) => {
                     request.attempts += 1;
@@ -713,6 +776,12 @@ pub struct Manager {
 }
 
 impl Manager {
+    /// Dismiss completion without disturbing navigation/hover operations.
+    pub fn cancel_completion(&mut self) {
+        for server in self.servers.values_mut() {
+            server.cancel_requests(|request| request.kind == RequestKind::Completion);
+        }
+    }
     /// Initialization is asynchronous; documents must be retried until ready.
     pub fn has_starting_servers(&self) -> bool {
         self.servers
@@ -780,6 +849,9 @@ impl Manager {
         let Some(server) = self.ensure(config)? else {
             return Ok(false);
         };
+        if kind == RequestKind::Completion && server.ready && !server.completion_supported {
+            return Ok(false);
+        }
         server.queue_request(Requested {
             origin: absolute(path),
             revision,
@@ -945,6 +1017,7 @@ mod tests {
                 started_at: Instant::now(),
                 initialization_failed: false,
                 sync_kind: 2,
+                completion_supported: true,
                 encoding: Encoding::Utf16,
                 documents: HashMap::new(),
                 deferred: Vec::new(),
@@ -994,6 +1067,140 @@ mod tests {
             server,
         );
         (manager, config)
+    }
+
+    #[test]
+    fn completion_requests_use_negotiated_positions_and_invocation_context() {
+        for (encoding, character) in [
+            (Encoding::Utf16, 3),
+            (Encoding::Utf8, 5),
+            (Encoding::Utf32, 2),
+        ] {
+            let (mut server, outgoing) = test_server(16);
+            server.encoding = encoding;
+            let mut request = requested(0);
+            request.kind = RequestKind::Completion;
+            request.character = 2;
+            open_request_document(&mut server, &request);
+            server.documents.get_mut(&request.origin).unwrap().text = "🦀a".into();
+            server.queue_request(request);
+            server.flush_requests().unwrap();
+            let payload = outgoing.try_recv().unwrap();
+            assert_eq!(payload["method"], "textDocument/completion");
+            assert_eq!(
+                payload["params"]["position"],
+                json!({"line":0,"character":character})
+            );
+            assert_eq!(payload["params"]["context"], json!({"triggerKind":1}));
+        }
+    }
+
+    #[test]
+    fn completion_responses_preserve_context_and_empty_results_do_not_retry() {
+        for result in [
+            Value::Null,
+            json!([]),
+            json!({"isIncomplete":true,"items":[{"label":"width"}]}),
+        ] {
+            let (mut server, outgoing) = test_server(16);
+            let mut request = requested(0);
+            request.kind = RequestKind::Completion;
+            request.character = 3;
+            open_request_document(&mut server, &request);
+            server.queue_request(request.clone());
+            server.flush_requests().unwrap();
+            let payload = outgoing.try_recv().unwrap();
+            let events = server.handle_message(json!({"id":payload["id"],"result":result}));
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                Event::Completion {
+                    origin,
+                    revision,
+                    cursor,
+                    encoding,
+                    list,
+                } => {
+                    assert_eq!(origin, &request.origin);
+                    assert_eq!(*revision, request.revision);
+                    assert_eq!(*cursor, (0, 3));
+                    assert_eq!(*encoding, Encoding::Utf16);
+                    assert_eq!(
+                        list.incomplete,
+                        result["isIncomplete"].as_bool().unwrap_or(false)
+                    );
+                    assert_eq!(list.items.len(), usize::from(!result["items"].is_null()));
+                }
+                _ => panic!("expected a completion event"),
+            }
+            assert!(server.deferred.is_empty());
+            assert!(server.waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn unsupported_completion_is_rejected_and_startup_requests_finish_empty() {
+        let (mut server, outgoing) = test_server(16);
+        server.ready = false;
+        let mut request = requested(0);
+        request.kind = RequestKind::Completion;
+        server.queue_request(request.clone());
+        let events = server.handle_message(json!({"id":1,"result":{"capabilities":{}}}));
+        assert!(!server.completion_supported);
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Completion { list, .. } if list.items.is_empty())));
+        assert!(server.deferred.is_empty());
+        assert_eq!(outgoing.try_recv().unwrap()["method"], "initialized");
+        let (mut manager, config) = manager_with_server(server);
+        assert!(!manager
+            .request(&config, &request.origin, 1, 0, 0, RequestKind::Completion)
+            .unwrap());
+        assert!(manager
+            .servers
+            .values()
+            .all(|server| server.deferred.is_empty()));
+    }
+
+    #[test]
+    fn completion_cancellation_keeps_definition_requests_and_discards_late_results() {
+        let (mut server, outgoing) = test_server(16);
+        let mut completion = requested(0);
+        completion.kind = RequestKind::Completion;
+        open_request_document(&mut server, &completion);
+        server.queue_request(completion.clone());
+        server.queue_request(requested(0));
+        server.flush_requests().unwrap();
+        let completion_payload = outgoing.try_recv().unwrap();
+        let definition_payload = outgoing.try_recv().unwrap();
+        let (mut manager, _) = manager_with_server(server);
+        manager.cancel_completion();
+        assert_eq!(outgoing.try_recv().unwrap()["method"], "$/cancelRequest");
+        let server = manager.servers.values_mut().next().unwrap();
+        assert_eq!(server.waiting.len(), 1);
+        assert!(server
+            .waiting
+            .contains_key(&definition_payload["id"].as_i64().unwrap()));
+        assert!(server
+            .handle_message(json!({"id":completion_payload["id"],"result":[{"label":"stale"}]}))
+            .is_empty());
+    }
+
+    #[test]
+    fn completion_errors_are_quiet_and_do_not_retry_outdated_snapshots() {
+        for code in [-32800, -32801, -32603] {
+            let (mut server, outgoing) = test_server(16);
+            let mut request = requested(0);
+            request.kind = RequestKind::Completion;
+            open_request_document(&mut server, &request);
+            server.queue_request(request);
+            server.flush_requests().unwrap();
+            let payload = outgoing.try_recv().unwrap();
+            let events = server.handle_message(
+                json!({"id":payload["id"],"error":{"code":code,"message":"cancelled"}}),
+            );
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], Event::Completion { list, .. } if list.items.is_empty()));
+            assert!(server.deferred.is_empty());
+        }
     }
 
     #[test]
@@ -1374,5 +1581,83 @@ mod tests {
             Some("**struct** Example".into())
         );
         assert!(parse_hover(&Value::Null).is_none());
+    }
+
+    #[test]
+    #[ignore = "run in CI with rustup component add rust-analyzer rust-src"]
+    fn actual_rust_analyzer_completes_symbol() {
+        let root = std::env::temp_dir().join(format!(
+            "remacs-ra-completion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"),
+            "[package]\nname = \"remacs-completion-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let text = "pub struct Widget { pub width: u32 }\npub fn caller() { let widget = Widget { width: 42 }; widget.wid }\n";
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, text).unwrap();
+        let config = ServerConfig {
+            language: "rust".into(),
+            command: vec!["rust-analyzer".into()],
+            root: root.canonicalize().unwrap(),
+        };
+        let row = 1;
+        let line = text.lines().nth(row).unwrap();
+        let col = line.find("widget.wid").unwrap() + "widget.wid".len();
+        let mut manager = Manager::default();
+        let present = HashSet::from([absolute(&source)]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut next_request = Instant::now();
+        let mut found = false;
+        let mut failure = None;
+        while Instant::now() < deadline {
+            for event in manager.poll() {
+                match event {
+                    Event::Completion { list, encoding, .. } => {
+                        if let Some(item) = list.items.iter().find(|item| item.label == "width") {
+                            let mut doc = crate::document::Document::from_text(text);
+                            doc.row = row;
+                            doc.col = col;
+                            crate::completion::apply(&mut doc, item, encoding).unwrap();
+                            assert!(doc.lsp_text().contains("widget.width"));
+                            found = true;
+                        }
+                    }
+                    Event::Status(status)
+                        if status.contains("error")
+                            || status.contains("exited")
+                            || status.contains("failed") =>
+                    {
+                        failure = Some(status);
+                    }
+                    _ => {}
+                }
+            }
+            if found || failure.is_some() {
+                break;
+            }
+            manager.sync(&config, &source, 0, || text.into()).unwrap();
+            // Indexing can initially produce an empty list. A new invocation
+            // gets a fresh semantic snapshot, just as further typing does.
+            if Instant::now() >= next_request {
+                manager
+                    .request(&config, &source, 0, row, col, RequestKind::Completion)
+                    .unwrap();
+                next_request = Instant::now() + Duration::from_millis(300);
+            }
+            manager.flush(&present);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(failure.is_none(), "rust-analyzer failed: {failure:?}");
+        assert!(
+            found,
+            "rust-analyzer did not complete and insert a real field before timeout"
+        );
     }
 }

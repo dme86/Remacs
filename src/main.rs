@@ -1,5 +1,7 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
 mod clipboard;
+mod completion;
+mod completion_ui;
 mod document;
 mod finder_ui;
 mod function_select;
@@ -18,7 +20,7 @@ use std::{
     env,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clipboard::Clipboard;
@@ -53,7 +55,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const TAB_WIDTH: usize = 4;
 const MAX_UNDO: usize = 100;
 const MAX_UNDO_BYTES: usize = 32 * 1024 * 1024; // per-buffer snapshot budget
-                                                // Subtle current-line tint. The normal terminal background is unchanged.
+const COMPLETION_DELAY: Duration = Duration::from_millis(150);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+// Subtle current-line tint. The normal terminal background is unchanged.
 const CURRENT_LINE_BG: Color = Color::Rgb {
     r: 49,
     g: 50,
@@ -178,6 +182,7 @@ struct ScreenCache {
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
     finder: FinderCache,
+    completion: completion_ui::Cache,
     terminal: TerminalPopupCache,
     lines: Vec<Option<PaintedLine>>,
     status: Option<String>,
@@ -213,6 +218,28 @@ struct StoredBuffer {
 struct BufferPicker {
     query: String,
     selected: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CompletionContext {
+    origin: PathBuf,
+    revision: u64,
+    cursor: (usize, usize),
+}
+
+struct PendingCompletion {
+    context: CompletionContext,
+    since: Instant,
+    manual: bool,
+}
+
+struct CompletionMenu {
+    context: CompletionContext,
+    encoding: lsp::Encoding,
+    items: Vec<completion::Item>,
+    labels: Vec<String>,
+    selected: usize,
+    incomplete: bool,
 }
 
 // Only path and filename are compared for fuzzy matching. No filesystem scan
@@ -257,6 +284,9 @@ struct Editor {
     buffer_picker: Option<BufferPicker>,
     mason_picker: Option<BufferPicker>,
     hover_popup: Option<String>,
+    completion_menu: Option<CompletionMenu>,
+    completion_pending: Option<PendingCompletion>,
+    completion_due: Option<Instant>,
     mason: MasonManager,
     lsp_plugin: LspPlugin,
     lsp: LspManager,
@@ -303,6 +333,9 @@ impl Editor {
             buffer_picker: None,
             mason_picker: None,
             hover_popup: None,
+            completion_menu: None,
+            completion_pending: None,
+            completion_due: None,
             mason,
             lsp_plugin: LspPlugin::new().expect("bundled plugins/lsp.lua"),
             lsp: LspManager::default(),
@@ -460,6 +493,203 @@ impl Editor {
         }
     }
 
+    fn completion_eligible(&self) -> bool {
+        self.mode == Mode::Insert
+            && self.doc.path.is_some()
+            && self.prompt.is_none()
+            && self.buffer_picker.is_none()
+            && self.mason_picker.is_none()
+            && self.hover_popup.is_none()
+            && !self.tree.as_ref().is_some_and(|tree| tree.focused)
+            && self.toggleterm.active().ok().flatten().is_none()
+    }
+
+    fn completion_prefix(&self) -> String {
+        let line = &self.doc.line()[..self.doc.col];
+        let start = line
+            .iter()
+            .rposition(|ch| !ch.is_alphanumeric() && *ch != '_')
+            .map_or(0, |index| index + 1);
+        line[start..].iter().collect()
+    }
+
+    fn completion_trigger(&self) -> bool {
+        let line = &self.doc.line()[..self.doc.col];
+        line.last() == Some(&'.')
+            || line.ends_with(&[':', ':'])
+            || self.completion_prefix().chars().count() >= 2
+    }
+
+    fn completion_context_matches(&self, context: &CompletionContext) -> bool {
+        self.completion_eligible()
+            && self.doc.revision == context.revision
+            && (self.doc.row, self.doc.col) == context.cursor
+            && self
+                .doc
+                .path
+                .as_ref()
+                .is_some_and(|path| lsp::absolute(path) == context.origin)
+    }
+
+    fn dismiss_completion(&mut self) {
+        self.completion_menu = None;
+        self.completion_pending = None;
+        self.completion_due = None;
+        self.lsp.cancel_completion();
+    }
+
+    fn request_completion(&mut self, manual: bool) {
+        self.dismiss_completion();
+        if !self.completion_eligible() {
+            return;
+        }
+        let path = self.doc.path.as_ref().unwrap().clone();
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = match self.lsp_plugin.server_for(&path, &cwd) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                if manual {
+                    self.message = "No language server configured for this file".into();
+                }
+                return;
+            }
+            Err(error) => {
+                if manual {
+                    self.message = format!("Completion configuration: {error}");
+                }
+                return;
+            }
+        };
+        // Synchronize first so the server computes edits against this revision.
+        self.sync_lsp_documents();
+        match self.lsp.request(
+            &config,
+            &path,
+            self.doc.revision,
+            self.doc.row,
+            self.doc.col,
+            RequestKind::Completion,
+        ) {
+            Ok(true) => {
+                self.completion_pending = Some(PendingCompletion {
+                    context: CompletionContext {
+                        origin: lsp::absolute(&path),
+                        revision: self.doc.revision,
+                        cursor: (self.doc.row, self.doc.col),
+                    },
+                    since: Instant::now(),
+                    manual,
+                });
+                self.lsp.flush(&self.lsp_present);
+                if manual {
+                    self.message = "Completion requested".into();
+                }
+            }
+            Ok(false) => {
+                if manual {
+                    self.message = "No LSP completion provider available".into();
+                }
+            }
+            Err(error) => {
+                if manual {
+                    self.message = format!("Completion: {error}");
+                }
+            }
+        }
+    }
+
+    fn poll_completion(&mut self) {
+        if self
+            .completion_pending
+            .as_ref()
+            .is_some_and(|pending| pending.since.elapsed() >= COMPLETION_TIMEOUT)
+        {
+            let manual = self.completion_pending.as_ref().unwrap().manual;
+            self.dismiss_completion();
+            if manual {
+                self.message = "Completion timed out; Ctrl+Space retries".into();
+            }
+        }
+        if self.completion_due.is_some_and(|due| Instant::now() >= due) {
+            self.request_completion(false);
+        }
+    }
+
+    fn show_completions(
+        &mut self,
+        context: CompletionContext,
+        encoding: lsp::Encoding,
+        list: completion::List,
+    ) {
+        if self
+            .completion_pending
+            .as_ref()
+            .map(|pending| &pending.context)
+            != Some(&context)
+            || !self.completion_context_matches(&context)
+        {
+            return;
+        }
+        let manual = self.completion_pending.take().unwrap().manual;
+        let incomplete = list.incomplete;
+        let items = completion::suggestions(list, &self.doc, encoding);
+        if items.is_empty() {
+            self.completion_menu = None;
+            if manual {
+                self.message = "No completions at cursor".into();
+            }
+            return;
+        }
+        let labels = items
+            .iter()
+            .map(|item| {
+                let mut label: String = item.label.chars().take(160).collect();
+                if let Some(detail) = &item.detail {
+                    label.push_str("  ");
+                    label.extend(detail.chars().take(120));
+                }
+                label
+            })
+            .collect();
+        self.completion_menu = Some(CompletionMenu {
+            context,
+            encoding,
+            items,
+            labels,
+            selected: 0,
+            incomplete,
+        });
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(menu) = self.completion_menu.take() else {
+            return;
+        };
+        self.completion_pending = None;
+        self.completion_due = None;
+        self.lsp.cancel_completion();
+        if !self.completion_context_matches(&menu.context) {
+            return;
+        }
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        let before = Snapshot::capture(&self.doc);
+        let change = self.current_location();
+        match completion::apply(&mut self.doc, item, menu.encoding) {
+            Ok(()) => {
+                self.remember_snapshot(before);
+                if let Some(location) = change {
+                    if let Err(error) = self.jumps.record_change(location) {
+                        self.message = format!("Change history could not be saved: {error}");
+                    }
+                }
+                self.insert_changed = false;
+            }
+            Err(error) => self.message = format!("Cannot apply completion: {error}"),
+        }
+    }
+
     fn sync_lsp_documents(&mut self) {
         // Cursor movement and idle ticks do not change document identity or
         // text. Keep polling requests, but avoid filesystem/Lua work entirely.
@@ -606,9 +836,27 @@ impl Editor {
                         self.message = "No hover information at cursor".into();
                     }
                 }
+                LspEvent::Completion {
+                    origin,
+                    revision,
+                    cursor,
+                    encoding,
+                    list,
+                } => {
+                    self.show_completions(
+                        CompletionContext {
+                            origin,
+                            revision,
+                            cursor,
+                        },
+                        encoding,
+                        list,
+                    );
+                }
             }
         }
         self.sync_lsp_documents();
+        self.poll_completion();
     }
 
     fn hover_view(&self) -> Option<FinderView> {
@@ -1007,6 +1255,7 @@ impl Editor {
     }
 
     fn activate(&mut self, next: StoredBuffer, index: usize) {
+        self.dismiss_completion();
         self.doc = next.doc;
         self.undo = next.undo;
         self.redo = next.redo;
@@ -1277,6 +1526,10 @@ impl Editor {
     fn remember(&mut self) {
         self.record_current_change();
         let snapshot = Snapshot::capture(&self.doc);
+        self.remember_snapshot(snapshot);
+    }
+
+    fn remember_snapshot(&mut self, snapshot: Snapshot) {
         let next_bytes = snapshot.approx_bytes();
         let mut used = self.undo.iter().map(Snapshot::approx_bytes).sum::<usize>();
         while !self.undo.is_empty()
@@ -1464,6 +1717,7 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        self.dismiss_completion();
         if let Ok(Some(active)) = self.toggleterm.active() {
             if let Some(session) = self.terminals.get_mut(&active) {
                 if let Err(error) = session.paste(text) {
@@ -1905,6 +2159,85 @@ impl Editor {
     }
 
     fn key(&mut self, key: KeyEvent, page_height: usize) {
+        if self
+            .completion_menu
+            .as_ref()
+            .is_some_and(|menu| !self.completion_context_matches(&menu.context))
+        {
+            self.dismiss_completion();
+        }
+        if self.completion_eligible() {
+            // Legacy terminals encode Ctrl+Space as NUL; enhanced keyboard
+            // protocols can report Ctrl+Space or Ctrl+@ explicitly.
+            let invoke = key.code == KeyCode::Null
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char(' ' | '@')));
+            if invoke {
+                self.request_completion(true);
+                return;
+            }
+            if let Some(menu) = &mut self.completion_menu {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    match key.code {
+                        KeyCode::Tab => {
+                            self.accept_completion();
+                            return;
+                        }
+                        KeyCode::Down => {
+                            menu.selected = (menu.selected + 1) % menu.items.len();
+                            return;
+                        }
+                        KeyCode::Up | KeyCode::BackTab => {
+                            menu.selected =
+                                (menu.selected + menu.items.len() - 1) % menu.items.len();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let before = (
+            self.active_slot,
+            self.doc.path.clone(),
+            self.doc.revision,
+            self.doc.row,
+            self.doc.col,
+            self.mode,
+        );
+        self.key_inner(key, page_height);
+        let after = (
+            self.active_slot,
+            self.doc.path.clone(),
+            self.doc.revision,
+            self.doc.row,
+            self.doc.col,
+            self.mode,
+        );
+        let cancel = key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g'));
+        if before != after || !self.completion_eligible() || cancel {
+            self.dismiss_completion();
+            let typing = matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            ) && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if before.2 != after.2
+                && typing
+                && self.completion_eligible()
+                && self.completion_trigger()
+            {
+                self.completion_due = Some(Instant::now() + COMPLETION_DELAY);
+            }
+        }
+    }
+
+    fn key_inner(&mut self, key: KeyEvent, page_height: usize) {
         let shortcut = popup_shortcut(key);
         // A visible terminal receives every key, including Escape, instead of
         // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
@@ -2357,6 +2690,7 @@ impl Editor {
     fn draw_at(&mut self, output: &mut impl Write, cols: u16, rows: u16) -> io::Result<()> {
         let syntax_invalid = self.syntax.refresh(&mut self.doc);
         if cols == 0 || rows == 0 {
+            self.dismiss_completion();
             self.screen = ScreenCache::default();
             return Ok(());
         }
@@ -2446,6 +2780,40 @@ impl Editor {
             }
         }
 
+        let completion_rect =
+            if finder_rect.is_none() && popup_rect.is_none() && self.completion_eligible() {
+                self.completion_menu.as_ref().and_then(|menu| {
+                    completion_ui::rect_for(
+                        cols,
+                        height,
+                        (
+                            sidebar_width
+                                + gutter_width
+                                + visual_column(&self.doc.line()[..self.doc.col])
+                                    .saturating_sub(self.scroll_col),
+                            self.doc.row.saturating_sub(self.scroll_row),
+                        ),
+                        &menu.labels,
+                    )
+                })
+            } else {
+                None
+            };
+        // Never let Tab accept a suggestion that the terminal cannot show.
+        if completion_rect.is_none() && self.completion_menu.is_some() {
+            self.dismiss_completion();
+        }
+        if let Some(old) = self.screen.completion.set_rect(completion_rect) {
+            for y in old.y as usize..old.y as usize + old.height {
+                if let Some(line) = self.screen.lines.get_mut(y) {
+                    *line = None;
+                }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
+                    *line = None;
+                }
+            }
+        }
+
         let mut selected_tree_row = 0;
         let mut search_cursor: Option<usize> = None;
         if sidebar_width > 0 {
@@ -2526,6 +2894,9 @@ impl Editor {
                     self.screen
                         .terminal
                         .invalidate_underpaint(0, y, sidebar_width);
+                    self.screen
+                        .completion
+                        .invalidate_underpaint(0, y, sidebar_width);
                 }
             }
         }
@@ -2569,6 +2940,9 @@ impl Editor {
                     .invalidate_underpaint(sidebar_width, y, gutter_width);
                 self.screen
                     .terminal
+                    .invalidate_underpaint(sidebar_width, y, gutter_width);
+                self.screen
+                    .completion
                     .invalidate_underpaint(sidebar_width, y, gutter_width);
             }
             if paint_text {
@@ -2643,6 +3017,11 @@ impl Editor {
                     y,
                     text_width,
                 );
+                self.screen.completion.invalidate_underpaint(
+                    sidebar_width + gutter_width,
+                    y,
+                    text_width,
+                );
             }
             self.screen.lines[y] = Some(PaintedLine {
                 index,
@@ -2711,6 +3090,12 @@ impl Editor {
                     "MASON  ↑↓ Select · Enter Install · Ctrl+U Update · Ctrl+S Sync · Ctrl+R Update All".into(),
                 None if self.buffer_picker.is_some() =>
                     "BUFFERS  Type to filter · ↑↓ Choose · Enter Switch · Esc Cancel".into(),
+                None if self.completion_menu.is_some() => {
+                    let more = if self.completion_menu.as_ref().unwrap().incomplete {
+                        " · Type for more"
+                    } else { "" };
+                    format!("COMPLETE  ↑↓ Choose · Tab Accept · Ctrl+G Dismiss · Enter Newline{more}")
+                }
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
@@ -2737,6 +3122,12 @@ impl Editor {
                 self.screen.message = Some(message);
             }
         }
+        if let (Some(rect), Some(menu)) = (completion_rect, self.completion_menu.as_ref()) {
+            self.screen
+                .completion
+                .paint(output, rect, &menu.labels, menu.selected)?;
+        }
+
         // Overlay the fully visible fzf-style picker after the normal editor
         // and sidebar have painted; only changed popup rows are output.
         if let Some(rect) = finder_rect {
@@ -3159,7 +3550,10 @@ fn main() -> io::Result<()> {
         editor.poll_mason();
         editor.poll_lsp();
         editor.draw(&mut stdout)?;
-        let delay = if !editor.terminals.is_empty() {
+        let delay = if !editor.terminals.is_empty()
+            || editor.completion_due.is_some()
+            || editor.completion_pending.is_some()
+        {
             Duration::from_millis(24)
         } else {
             Duration::from_millis(90)
@@ -3197,13 +3591,15 @@ mod tests {
     }
 
     fn temporary_buffer_project() -> PathBuf {
+        static NEXT_PROJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "remacs-buffers-{}-{}",
+            "remacs-buffers-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_PROJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("one.rs"), "one\nsecond\nthird\n").unwrap();
@@ -4593,6 +4989,308 @@ mod tests {
             runs,
             vec![(Color::Blue, "a   ".into()), (Color::Red, "界x".into()),]
         );
+    }
+
+    fn completion_editor(text: &str) -> Editor {
+        let mut doc = Document::from_text(text);
+        doc.path = Some(PathBuf::from("completion-fixture.rs"));
+        doc.col = doc.line().len();
+        let mut editor = Editor::new(doc);
+        editor.begin_insert();
+        editor
+    }
+
+    fn provide_completions(editor: &mut Editor, value: serde_json::Value) -> CompletionContext {
+        let context = CompletionContext {
+            origin: lsp::absolute(editor.doc.path.as_ref().unwrap()),
+            revision: editor.doc.revision,
+            cursor: (editor.doc.row, editor.doc.col),
+        };
+        editor.completion_pending = Some(PendingCompletion {
+            context: context.clone(),
+            since: Instant::now(),
+            manual: true,
+        });
+        editor.show_completions(
+            context.clone(),
+            lsp::Encoding::Utf16,
+            completion::parse(&value),
+        );
+        context
+    }
+
+    #[test]
+    fn completion_acceptance_and_following_typing_have_separate_undo_steps() {
+        let mut editor = completion_editor("");
+        for ch in "pri".chars() {
+            press(&mut editor, KeyCode::Char(ch));
+        }
+        provide_completions(&mut editor, serde_json::json!([{"label":"println!"}]));
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(editor.doc.lsp_text(), "println!");
+        assert_eq!(editor.mode, Mode::Insert);
+        assert!(editor.completion_menu.is_none() && editor.completion_due.is_none());
+        press(&mut editor, KeyCode::Char('x'));
+        press(&mut editor, KeyCode::Esc);
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "println!");
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "pri");
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), "");
+    }
+
+    #[test]
+    fn completion_selection_uses_arrows_and_tab_while_enter_keeps_newline() {
+        let mut editor = completion_editor("pri");
+        let choices = serde_json::json!([{"label":"print"},{"label":"println"}]);
+        provide_completions(&mut editor, choices.clone());
+        press(&mut editor, KeyCode::Down);
+        assert_eq!(editor.completion_menu.as_ref().unwrap().selected, 1);
+        press(&mut editor, KeyCode::BackTab);
+        assert_eq!(editor.completion_menu.as_ref().unwrap().selected, 0);
+        press(&mut editor, KeyCode::Up);
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(editor.doc.lsp_text(), "println");
+        provide_completions(&mut editor, serde_json::json!([{"label":"println2"}]));
+        press(&mut editor, KeyCode::Enter);
+        assert_eq!(editor.doc.lsp_text(), "println\n");
+        assert!(editor.completion_menu.is_none());
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(editor.doc.lsp_text(), "println\n\t");
+    }
+
+    #[test]
+    fn completion_import_and_replacement_are_one_undoable_change() {
+        let original = "// header\nfn run() { pri }";
+        let mut editor = completion_editor(original);
+        editor.doc.row = 1;
+        editor.doc.col = 14;
+        provide_completions(
+            &mut editor,
+            serde_json::json!([{
+                "label":"println!",
+                "textEdit":{"range":{"start":{"line":1,"character":11},
+                    "end":{"line":1,"character":14}},"newText":"println!"},
+                "additionalTextEdits":[{"range":{"start":{"line":0,"character":0},
+                    "end":{"line":0,"character":0}},"newText":"use foo::Bar;\n"}]
+            }]),
+        );
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(
+            editor.doc.lsp_text(),
+            "use foo::Bar;\n// header\nfn run() { println! }"
+        );
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 19));
+        editor.undo();
+        assert_eq!(editor.doc.lsp_text(), original);
+        editor.redo();
+        assert!(editor.doc.lsp_text().contains("use foo::Bar;"));
+    }
+
+    #[test]
+    fn invalid_completion_preserves_document_and_undo_redo_history() {
+        let mut editor = completion_editor("pri");
+        editor.remember();
+        editor.doc.insert('x');
+        editor.undo();
+        let before = (
+            editor.doc.lsp_text(),
+            editor.doc.revision,
+            editor.undo.len(),
+            editor.redo.len(),
+        );
+        provide_completions(
+            &mut editor,
+            serde_json::json!([{
+                "label":"broken", "textEdit":{"range":{
+                    "start":{"line":0,"character":0},"end":{"line":99,"character":0}
+                },"newText":"bad"}
+            }]),
+        );
+        press(&mut editor, KeyCode::Tab);
+        assert_eq!(
+            (
+                editor.doc.lsp_text(),
+                editor.doc.revision,
+                editor.undo.len(),
+                editor.redo.len()
+            ),
+            before
+        );
+        assert!(editor.message.contains("Cannot apply completion"));
+    }
+
+    #[test]
+    fn completion_results_are_ignored_after_edit_movement_dismissal_and_switch() {
+        let choices = serde_json::json!([{"label":"print"}]);
+        let mut editor = completion_editor("pri");
+        let context = provide_completions(&mut editor, choices.clone());
+        press(&mut editor, KeyCode::Char('v'));
+        editor.show_completions(
+            context.clone(),
+            lsp::Encoding::Utf16,
+            completion::parse(&choices),
+        );
+        assert!(editor.completion_menu.is_none());
+        assert_eq!(editor.doc.lsp_text(), "priv");
+        let context = provide_completions(&mut editor, serde_json::json!([{"label":"private"}]));
+        press(&mut editor, KeyCode::Left);
+        editor.show_completions(context, lsp::Encoding::Utf16, completion::parse(&choices));
+        assert!(editor.completion_menu.is_none() && editor.completion_pending.is_none());
+        provide_completions(&mut editor, choices.clone());
+        editor.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL), 10);
+        assert!(editor.completion_menu.is_none());
+        assert_eq!(editor.mode, Mode::Insert);
+        assert!(editor.completion_due.is_none());
+        let root = temporary_buffer_project();
+        let context = provide_completions(&mut editor, choices.clone());
+        editor.open(root.join("two.md").display().to_string());
+        editor.begin_insert();
+        editor.show_completions(context, lsp::Encoding::Utf16, completion::parse(&choices));
+        assert!(editor.completion_menu.is_none() && editor.completion_pending.is_none());
+        assert_eq!(editor.doc.lsp_text(), "# two\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completion_is_debounced_and_cursor_movement_cancels_pending_work() {
+        let mut editor = completion_editor("");
+        press(&mut editor, KeyCode::Char('p'));
+        assert!(editor.completion_due.is_none());
+        press(&mut editor, KeyCode::Char('r'));
+        assert!(editor.completion_due.is_some());
+        press(&mut editor, KeyCode::Left);
+        assert!(editor.completion_due.is_none());
+        press(&mut editor, KeyCode::Char('.'));
+        assert!(editor.completion_due.is_some());
+        editor.pasted("literal");
+        assert!(editor.completion_due.is_none());
+        assert!(editor.completion_menu.is_none());
+    }
+
+    #[test]
+    fn completion_popup_is_cached_and_restores_covered_editor_rows() {
+        let mut editor = completion_editor("pri\ncovered-row\nthird\nfourth\nfifth");
+        editor.doc.row = 0;
+        editor.doc.col = 3;
+        paint(&mut editor);
+        provide_completions(&mut editor, serde_json::json!([{"label":"print"}]));
+        let popup = paint(&mut editor);
+        assert!(popup.contains("› print"));
+        assert!(!popup.contains("\x1b[2J"));
+        let same = paint(&mut editor);
+        assert!(!same.contains("› print"));
+        editor.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL), 10);
+        let restored = paint(&mut editor);
+        assert!(restored.contains("covered-row"));
+        assert!(!restored.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn legacy_ctrl_space_invokes_completion_without_inserting_nul() {
+        let mut editor = completion_editor("text");
+        editor.doc.path = Some(PathBuf::from("completion-fixture.md"));
+        press(&mut editor, KeyCode::Null);
+        assert_eq!(editor.doc.lsp_text(), "text");
+        assert!(editor.message.contains("No language server configured"));
+        assert!(!editor.doc.dirty);
+    }
+
+    #[test]
+    fn tiny_terminal_never_accepts_an_invisible_completion() {
+        for (cols, rows) in [(0, 0), (5, 20), (80, 4), (80, 5)] {
+            let mut editor = completion_editor("pri");
+            provide_completions(&mut editor, serde_json::json!([{"label":"print"}]));
+            editor.draw_at(&mut Vec::new(), cols, rows).unwrap();
+            assert!(editor.completion_menu.is_none());
+            press(&mut editor, KeyCode::Tab);
+            assert_eq!(editor.doc.lsp_text(), "pri\t");
+        }
+    }
+
+    #[test]
+    #[ignore = "run in CI with rustup component add rust-analyzer rust-src"]
+    fn actual_rust_analyzer_editor_completion_can_be_selected_rendered_and_undone() {
+        let root = temporary_buffer_project();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"),
+            "[package]\nname = \"remacs-editor-completion\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let text = "pub struct Widget { pub width: u32 }\npub fn run() { let widget = Widget { width: 42 }; widget.wid }\n";
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, text).unwrap();
+        let mut editor = Editor::new(Document::open(source).unwrap());
+        editor.begin_insert();
+        editor.doc.row = 1;
+        editor.doc.col =
+            text.lines().nth(1).unwrap().find("widget.wid").unwrap() + "widget.wid".len();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut retry = Instant::now();
+        let mut found = false;
+        while Instant::now() < deadline {
+            editor.poll_lsp();
+            if let Some(menu) = &mut editor.completion_menu {
+                if let Some(index) = menu
+                    .items
+                    .iter()
+                    .position(|item| item.filter_text == "width" || item.label == "width")
+                {
+                    menu.selected = index;
+                    found = true;
+                    break;
+                }
+            }
+            if Instant::now() >= retry {
+                // Invoking again after an initially empty result mirrors
+                // Ctrl+Space while the workspace finishes indexing.
+                editor.request_completion(true);
+                retry = Instant::now() + Duration::from_millis(400);
+            }
+            std::thread::sleep(Duration::from_millis(24));
+        }
+        if found {
+            let output = paint(&mut editor);
+            assert!(output.contains("width"));
+            press(&mut editor, KeyCode::Tab);
+            assert!(editor.doc.lsp_text().contains("widget.width"));
+            assert_eq!(editor.mode, Mode::Insert);
+            editor.undo();
+            assert_eq!(editor.doc.lsp_text(), text);
+            // Once indexed, a normal edit must invoke completion through
+            // the debounce timer without another manual request.
+            press(&mut editor, KeyCode::Backspace);
+            press(&mut editor, KeyCode::Char('d'));
+            assert!(editor.completion_due.is_some());
+            let automatic_deadline = Instant::now() + Duration::from_secs(5);
+            let mut automatic = false;
+            while Instant::now() < automatic_deadline {
+                editor.poll_lsp();
+                if let Some(menu) = &mut editor.completion_menu {
+                    if let Some(index) = menu
+                        .items
+                        .iter()
+                        .position(|item| item.filter_text == "width" || item.label == "width")
+                    {
+                        menu.selected = index;
+                        automatic = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(24));
+            }
+            assert!(
+                automatic,
+                "Typing did not automatically show completion: {}",
+                editor.message
+            );
+            paint(&mut editor);
+            press(&mut editor, KeyCode::Tab);
+            assert!(editor.doc.lsp_text().contains("widget.width"));
+        }
+        let status = editor.message.clone();
+        drop(editor);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(found, "Editor did not display a real completion: {status}");
     }
 
     #[test]

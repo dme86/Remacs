@@ -27,5 +27,5 @@ jobs:
         run: cargo check --all-targets
       - name: Install real rust-analyzer and standard-library sources
         run: rustup component add rust-analyzer rust-src
-      - name: Real rust-analyzer LSP integration (initialize / didOpen / definition)
-        run: REMACS_LSP_TRACE=1 cargo test actual_rust_analyzer_resolves_definition -- --ignored --nocapture
+      - name: Real rust-analyzer LSP integration (definition and completion)
+        run: REMACS_LSP_TRACE=1 cargo test actual_rust_analyzer_ -- --ignored --nocapture
