@@ -322,6 +322,15 @@ impl Server {
         let _ = self.send(json!({"jsonrpc":"2.0", "id":id, "result":result}));
     }
 
+    fn defer_retry(&mut self, mut request: Requested) {
+        request.retry_after = Some(Instant::now()
+            + Duration::from_millis(300 * request.attempts as u64));
+        if self.deferred.len() >= MAX_PENDING_REQUESTS {
+            self.deferred.remove(0);
+        }
+        self.deferred.push(request);
+    }
+
     fn handle_message(&mut self, message: Value) -> Vec<Event> {
         let mut events = Vec::new();
         if message.get("method").is_some() {
@@ -351,8 +360,19 @@ impl Server {
         }
         let Some(request) = self.waiting.remove(&id) else { return events };
         let result = &message["result"];
-        if message.get("error").is_some() {
-            events.push(Event::Status(format!("LSP request failed: {}", message["error"])));
+        if let Some(error) = message.get("error") {
+            // -32801 (ContentModified) means the server's semantic snapshot
+            // changed while it was processing the request. rust-analyzer can
+            // emit this during initial indexing, even without user edits.
+            // Retry only this transient error with the same bounded
+            // nonblocking backoff as early empty results.
+            if error["code"].as_i64() == Some(-32801)
+                && request.attempts < MAX_INITIAL_EMPTY_RETRIES
+            {
+                self.defer_retry(request);
+                return events;
+            }
+            events.push(Event::Status(format!("LSP request failed: {error}")));
             return events;
         }
         let target = if request.kind == RequestKind::Definition {
@@ -369,11 +389,7 @@ impl Server {
         if target.is_none() && hover.is_none()
             && request.attempts < MAX_INITIAL_EMPTY_RETRIES
         {
-            let mut retry = request;
-            retry.retry_after = Some(Instant::now() + Duration::from_millis(
-                300 * retry.attempts as u64
-            ));
-            self.deferred.push(retry);
+            self.defer_retry(request);
             return events;
         }
         let cursor = (request.row, request.character);
@@ -633,6 +649,13 @@ fn parse_hover(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn content_modified_error_code_matches_lsp_specification() {
+        let error = json!({"code":-32801,"message":"content modified"});
+        assert_eq!(error["code"].as_i64(), Some(-32801));
+        assert_ne!(error["code"].as_i64(), Some(-32800)); // cancellation is not retryable
+    }
 
     #[test]
     fn early_empty_definition_is_retried_with_backoff_and_limited() {
