@@ -543,9 +543,8 @@ impl Editor {
             }
         }
         if key.code == KeyCode::Esc {
-            if self.mode == Mode::Insert {
-                self.leave_insert();
-            }
+            if self.mode == Mode::Insert { self.leave_insert(); }
+            else if self.mode == Mode::Visual { self.leave_visual(); }
             self.sequence = Sequence::None;
             self.control_x = false;
             self.count = None;
@@ -600,6 +599,10 @@ impl Editor {
             }
             return;
         }
+        if self.mode == Mode::Visual {
+            self.visual_key(key);
+            return;
+        }
         self.normal_key(key, page_height);
     }
 
@@ -610,6 +613,8 @@ impl Editor {
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
                 (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
+                (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
+                (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
                 (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
@@ -648,6 +653,7 @@ impl Editor {
         let count = explicit_count.unwrap_or(1);
         match key.code {
             KeyCode::Char(' ') => self.sequence = Sequence::Leader,
+            KeyCode::Char('v') => self.enter_visual(),
             KeyCode::Char('i') => self.begin_insert(),
             KeyCode::Char('a') => {
                 if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
@@ -917,7 +923,7 @@ impl Editor {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".into());
             let mark = if self.doc.dirty { "**" } else { "--" };
-            let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT" };
+            let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
             let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
@@ -941,9 +947,11 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → f Files | o Panels | q Quit".into(),
+                    Sequence::Leader => "SPC → f Files | o Panels | v Visual | q Quit".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
+                    Sequence::Visual => "SPC v → f Select function".into(),
+                    Sequence::TextObjectAround => "VISUAL a → f Function".into(),
                     Sequence::Quit => "SPC q → q Quit".into(),
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
