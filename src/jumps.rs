@@ -89,6 +89,11 @@ impl JumpManager {
 
     pub fn entries(&self) -> &[Location] { &self.saved.history }
     pub fn cursor(&self) -> Option<usize> { self.saved.cursor }
+    /// Whether a forward jump is possible after Ctrl+O. This is also used
+    /// to interpret the ambiguous Tab/Ctrl+I byte in legacy terminals.
+    pub fn can_forward(&self) -> bool {
+        self.saved.cursor.is_some_and(|index| index + 1 < self.saved.history.len())
+    }
     pub fn changes(&self) -> &[Location] { &self.saved.changes }
 
     // History is a timeline, not a stream of every keystroke. Coalesce
@@ -295,6 +300,23 @@ mod tests {
         assert_eq!(store.back(Some(place("two.rs", 30, 4))).unwrap(), Some(place("one.rs", 10, 2)));
         assert_eq!(store.forward().unwrap(), Some(place("two.rs", 30, 4)));
         assert_eq!(store.forward().unwrap(), None);
+    }
+
+    #[test]
+    fn forward_available_only_while_retracing_older_jumps() {
+        let mut store = JumpManager::memory_only();
+        for row in [2, 12, 22] {
+            store.remember(place("main.rs", row, 0)).unwrap();
+        }
+        assert!(!store.can_forward());
+        assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 12, 0)));
+        assert!(store.can_forward());
+        assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 2, 0)));
+        assert!(store.can_forward());
+        assert_eq!(store.forward().unwrap(), Some(place("main.rs", 12, 0)));
+        assert!(store.can_forward());
+        assert_eq!(store.forward().unwrap(), Some(place("main.rs", 22, 0)));
+        assert!(!store.can_forward());
     }
 
     #[test]
