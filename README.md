@@ -56,9 +56,10 @@ shows incomplete sequences.
 | Toggle last buffer | **`SPC b l`** |
 | Close current buffer (only if saved) | **`SPC b d`** |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
-| Save file | **`SPC f s`** |
+| Save current buffer | **`SPC f s`** |
+| Save all modified named buffers | **`SPC b s`** or **`:wa`** / **`:wall`** |
 | Quit (prompts if modified) | **`SPC q q`** |
-| Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, `w FILE`, `buffers`, `bn`, `bp`, `b#`, `bd` or `bd!` |
+| Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, `w FILE`, `buffers`, `bn`, `bp`, `b#`, `bd`, `bd!`, `wa` or `wall` |
 | Legacy Emacs-style file shortcuts | **`Ctrl+X Ctrl+F`**, **`Ctrl+X Ctrl+S`**, **`Ctrl+X Ctrl+C`** |
 
 The editor supports multiple independent file buffers, a status line, a minibuffer,
@@ -93,7 +94,18 @@ to filter by name/path, use Up/Down (or Tab/Shift+Tab), and Enter to switch.
 A `●` denotes unsaved edits and `▶` marks the active buffer.
 **`SPC b n`** and **`SPC b p`** cycle through buffers;
 **`SPC b l`** toggles between the two most recently active buffers.
-The status line shows the current buffer index, total count, and modified count.
+The footer shows a compact **`B 2/4  ●2  SPC b s`** when you're in
+buffer 2 of 4 and two buffers have unsaved edits. The `●` count includes
+inactive buffers; when none are dirty it shows `●0` and hides the save hint.
+These counters are kept ahead of the filename so they remain visible
+even in narrower terminals.
+
+Use **`SPC b s`** in Normal mode (or **`:wa`** / **`:wall`**) to save
+**all modified, named buffers**, without switching files or losing their
+cursor, scroll, or undo state. If one write fails, Remacs continues saving
+the others and reports the failure; the affected buffer remains dirty.
+Unnamed unsaved buffers are skipped safely and reported so you can name
+and save them explicitly with `:w FILE`.
 
 **`SPC b d`** or `:bd` closes a clean buffer; a dirty buffer is protected
 until saved, unless you explicitly use `:bd!` to discard it.

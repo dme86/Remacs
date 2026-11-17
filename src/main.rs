@@ -698,6 +698,59 @@ impl Editor {
         }
     }
 
+    /// Save every modified, named document without changing the active buffer,
+    /// cursor, viewport or undo history. An unnamed document needs an explicit
+    /// filename; failures leave those buffers dirty and don't stop later saves.
+    fn save_all(&mut self) {
+        let mut saved = 0usize;
+        let mut unnamed = 0usize;
+        let mut failed = 0usize;
+        let mut first_error: Option<String> = None;
+
+        let mut save_if_dirty = |doc: &mut Document| {
+            if !doc.dirty {
+                return;
+            }
+            let Some(path) = doc.path.as_ref() else {
+                unnamed += 1;
+                return;
+            };
+            let name = path.display().to_string();
+            match doc.save() {
+                Ok(()) => saved += 1,
+                Err(error) => {
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(format!("{name}: {error}"));
+                    }
+                }
+            }
+        };
+
+        save_if_dirty(&mut self.doc);
+        for slot in self.slots.iter_mut().flatten() {
+            save_if_dirty(&mut slot.doc);
+        }
+
+        self.message = if saved == 0 && unnamed == 0 && failed == 0 {
+            "All buffers already saved".into()
+        } else if unnamed == 0 && failed == 0 {
+            format!("Saved {saved} buffer(s)")
+        } else {
+            let mut message = format!("Saved {saved}");
+            if unnamed > 0 {
+                message.push_str(&format!("; {unnamed} unnamed (use :w FILE)"));
+            }
+            if failed > 0 {
+                message.push_str(&format!("; {failed} failed"));
+                if let Some(error) = first_error {
+                    message.push_str(&format!(": {error}"));
+                }
+            }
+            message
+        };
+    }
+
     fn open(&mut self, name: String) {
         let path = PathBuf::from(&name);
         if let Some(index) = self.named_slot(&path) {
@@ -736,6 +789,7 @@ impl Editor {
     fn command(&mut self, command: &str) {
         match command.trim() {
             "w" => self.save(),
+            "wa" | "wall" => self.save_all(),
             "q" => self.quit(),
             "q!" => self.running = false,
             "syntax on" => {
@@ -943,6 +997,7 @@ impl Editor {
                 (Sequence::Buffer, KeyCode::Char('p')) => self.cycle_buffer(false),
                 (Sequence::Buffer, KeyCode::Char('l')) => self.last_buffer(),
                 (Sequence::Buffer, KeyCode::Char('d')) => self.close_buffer(false),
+                (Sequence::Buffer, KeyCode::Char('s')) => self.save_all(),
                 (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('f')) => self.prompt = Some(Prompt::Open(String::new())),
@@ -1293,9 +1348,15 @@ impl Editor {
             let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
-            let status = format!(" {mark} Remacs [{mode}] | Buf {}/{} ({} modified) | {filename} | {language}{pane} | Ln {}, Col {} ",
-                self.active_slot + 1, self.slots.len(), self.dirty_buffers(),
-                self.doc.row + 1, self.doc.col + 1);
+            // Keep global buffer counts before long paths so they stay visible
+            // even on smaller terminals. The dirty count includes inactive files.
+            let dirty = self.dirty_buffers();
+            let save_hint = if dirty > 0 { "  SPC b s" } else { "" };
+            let status = format!(
+                " {mark} Remacs [{mode}] | B {}/{}  ●{dirty}{save_hint} | {filename} | {language}{pane} | Ln {}, Col {} ",
+                self.active_slot + 1, self.slots.len(),
+                self.doc.row + 1, self.doc.col + 1
+            );
             let status = fit_cells(&status, width);
             if self.screen.status.as_deref() != Some(status.as_str()) {
                 queue!(output,
@@ -1321,7 +1382,7 @@ impl Editor {
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
                     Sequence::Leader => "SPC → b Buffers | f Files | o Panels | v Visual | q Quit".into(),
-                    Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | d Close".into(),
+                    Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | s Save All | d Close".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
                     Sequence::Visual => "SPC v → f Select function".into(),
@@ -1629,6 +1690,105 @@ mod tests {
         std::fs::write(root.join("one.rs"), "one\nsecond\nthird\n").unwrap();
         std::fs::write(root.join("two.md"), "# two\n").unwrap();
         root
+    }
+
+    #[test]
+    fn save_all_shortcut_persists_dirty_active_and_inactive_buffers() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('X'));
+        press(&mut editor, KeyCode::Esc);
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        press(&mut editor, KeyCode::Char('i'));
+        press(&mut editor, KeyCode::Char('Y'));
+        press(&mut editor, KeyCode::Esc);
+        editor.scroll_row = 2;
+        editor.scroll_col = 4;
+        assert_eq!(editor.dirty_buffers(), 2);
+        let before_undo = editor.undo.len();
+
+        let status = paint(&mut editor);
+        assert!(status.contains("B 2/2  ●2  SPC b s"));
+        // Drawing may normalize scroll offsets for short files. Save-all
+        // must preserve the viewport state as it stands at invocation time.
+        let before_scroll = (editor.scroll_row, editor.scroll_col);
+        for key in [' ', 'b', 's'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+
+        assert_eq!(editor.dirty_buffers(), 0);
+        assert_eq!(editor.active_slot, 1);
+        assert_eq!((editor.scroll_row, editor.scroll_col), before_scroll);
+        assert_eq!(editor.undo.len(), before_undo, "save-all must not wipe undo");
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        assert!(!editor.slots[0].as_ref().unwrap().doc.dirty);
+        assert!(editor.message.contains("Saved 2 buffer"));
+        assert!(paint(&mut editor).contains("B 2/2  ●0"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_all_skips_unnamed_buffers_without_discarding_changes() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::empty());
+        editor.doc.insert('!');
+        editor.open(root.join("one.rs").to_string_lossy().into_owned());
+        editor.doc.insert('X');
+
+        editor.command("wa");
+        assert_eq!(editor.dirty_buffers(), 1);
+        assert!(editor.message.contains("Saved 1"));
+        assert!(editor.message.contains("1 unnamed"));
+        assert!(editor.message.contains(":w FILE"));
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+
+        editor.switch_buffer(0);
+        assert!(editor.doc.path.is_none());
+        assert!(editor.doc.dirty);
+        assert_eq!(editor.doc.line().first(), Some(&'!'));
+        editor.set_path_and_save(root.join("scratch.txt"));
+        assert_eq!(editor.dirty_buffers(), 0);
+        assert_eq!(std::fs::read_to_string(root.join("scratch.txt")).unwrap(), "!");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_all_continues_after_error_and_reports_failed_buffer() {
+        let root = temporary_buffer_project();
+        let failed_path = root.join("does-not-exist").join("failed.rs");
+        let mut editor = Editor::new(Document::empty());
+        editor.doc.path = Some(failed_path.clone());
+        editor.doc.insert('!');
+        editor.open(root.join("one.rs").to_string_lossy().into_owned());
+        editor.doc.insert('X');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.doc.insert('Y');
+        assert_eq!(editor.dirty_buffers(), 3);
+
+        editor.command("wall");
+        assert_eq!(editor.active_slot, 2);
+        assert_eq!(editor.dirty_buffers(), 1);
+        assert_eq!(editor.slots[0].as_ref().unwrap().doc.path.as_ref(), Some(&failed_path));
+        assert!(editor.slots[0].as_ref().unwrap().doc.dirty);
+        assert!(editor.message.contains("Saved 2"));
+        assert!(editor.message.contains("1 failed"));
+        assert!(editor.message.contains("failed.rs"));
+        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_footer_stays_compact_and_save_all_is_noop() {
+        let mut editor = Editor::new(Document::from_text("unchanged"));
+        let status = paint(&mut editor);
+        assert!(status.contains("B 1/1  ●0"));
+        assert!(!status.contains("SPC b s"));
+        editor.command("wa");
+        assert_eq!(editor.message, "All buffers already saved");
+        assert_eq!(editor.dirty_buffers(), 0);
     }
 
     #[test]
