@@ -25,8 +25,16 @@ impl TextRange {
         if row < self.start.row || row > self.end.row || self.start >= self.end {
             return None;
         }
-        let start = if row == self.start.row { self.start.col } else { 0 };
-        let end = if row == self.end.row { self.end.col } else { line_len };
+        let start = if row == self.start.row {
+            self.start.col
+        } else {
+            0
+        };
+        let end = if row == self.end.row {
+            self.end.col
+        } else {
+            line_len
+        };
         if end > start {
             Some((start.min(line_len), end.min(line_len)))
         } else if row < self.end.row && start == line_len {
@@ -61,14 +69,27 @@ fn grammar(path: &Path) -> Option<Language> {
 }
 
 fn function_kind(kind: &str) -> bool {
-    matches!(kind,
-        "function_item" | "function_definition" | "function_declaration" |
-        "function_definition_statement" | "local_function" | "local_function_definition" |
-        "method_declaration" | "method_definition" | "constructor_declaration" |
-        "constructor_definition" | "generator_function_declaration" |
-        "generator_function" | "function_expression" | "arrow_function" |
-        "closure_expression" | "function_statement" | "method" |
-        "singleton_method" | "function_declaration_statement"
+    matches!(
+        kind,
+        "function_item"
+            | "function_definition"
+            | "function_declaration"
+            | "function_definition_statement"
+            | "local_function"
+            | "local_function_definition"
+            | "method_declaration"
+            | "method_definition"
+            | "constructor_declaration"
+            | "constructor_definition"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "function_expression"
+            | "arrow_function"
+            | "closure_expression"
+            | "function_statement"
+            | "method"
+            | "singleton_method"
+            | "function_declaration_statement"
     )
 }
 
@@ -89,8 +110,10 @@ fn selection_node(mut node: Node<'_>) -> Option<Node<'_>> {
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "variable_declarator" {
                         if let Some(declaration) = parent.parent() {
-                            if matches!(declaration.kind(), "lexical_declaration" | "variable_declaration")
-                                && declaration.named_child_count() == 1
+                            if matches!(
+                                declaration.kind(),
+                                "lexical_declaration" | "variable_declaration"
+                            ) && declaration.named_child_count() == 1
                             {
                                 return Some(declaration);
                             }
@@ -131,9 +154,12 @@ fn header_function<'a>(
             // Do not accidentally select a function from a preceding
             // unrelated statement on the same line.
             let is_declaration_prefix = leading.is_empty()
-                || ["pub ", "pub(", "pub", "async ", "unsafe ", "extern ",
-                    "default ", "export ", "const ", "let ", "var "]
-                    .iter().any(|keyword| leading.starts_with(keyword));
+                || [
+                    "pub ", "pub(", "pub", "async ", "unsafe ", "extern ", "default ", "export ",
+                    "const ", "let ", "var ",
+                ]
+                .iter()
+                .any(|keyword| leading.starts_with(keyword));
             if is_declaration_prefix && declaration_prefix.len() < 128 {
                 let leading_bytes = declaration_prefix.len() - leading.len();
                 let prefix_start = line_start + leading_bytes;
@@ -158,12 +184,17 @@ fn header_function<'a>(
 
 fn source_position(doc: &Document, row: usize, byte_col: usize) -> Position {
     let Some(line) = doc.lines.get(row) else {
-        return Position { row: doc.lines.len() - 1, col: doc.lines.last().map_or(0, Vec::len) };
+        return Position {
+            row: doc.lines.len() - 1,
+            col: doc.lines.last().map_or(0, Vec::len),
+        };
     };
     let mut count = 0usize;
     let mut bytes = 0usize;
     for ch in line {
-        if bytes + ch.len_utf8() > byte_col { break; }
+        if bytes + ch.len_utf8() > byte_col {
+            break;
+        }
         bytes += ch.len_utf8();
         count += 1;
     }
@@ -175,8 +206,11 @@ fn byte_offset(doc: &Document) -> usize {
     for line in &doc.lines[..doc.row] {
         offset += line.iter().map(|ch| ch.len_utf8()).sum::<usize>() + 1;
     }
-    offset + doc.lines[doc.row][..doc.col.min(doc.lines[doc.row].len())]
-        .iter().map(|ch| ch.len_utf8()).sum::<usize>()
+    offset
+        + doc.lines[doc.row][..doc.col.min(doc.lines[doc.row].len())]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum::<usize>()
 }
 
 /// Find the *innermost* function surrounding the cursor.
@@ -188,15 +222,24 @@ pub fn around_function(doc: &Document) -> Result<Option<TextRange>, String> {
         return Err("No Tree-sitter function grammar for this file type yet".into());
     };
     // Parse on demand. Don't temporarily block editing on enormous files.
-    let source = doc.lines.iter().map(|row| row.iter().collect::<String>())
-        .collect::<Vec<_>>().join("\n");
+    let source = doc
+        .lines
+        .iter()
+        .map(|row| row.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
     if source.len() > 12 * 1024 * 1024 {
         return Err("Function selection is limited to files up to 12 MiB for now".into());
     }
-    if source.is_empty() { return Ok(None); }
+    if source.is_empty() {
+        return Ok(None);
+    }
     let mut parser = Parser::new();
-    parser.set_language(&language).map_err(|e| format!("Tree-sitter language error: {e}"))?;
-    let tree = parser.parse(&source, None)
+    parser
+        .set_language(&language)
+        .map_err(|e| format!("Tree-sitter language error: {e}"))?;
+    let tree = parser
+        .parse(&source, None)
         .ok_or_else(|| "Tree-sitter could not parse the document".to_string())?;
     let byte = byte_offset(doc).min(source.len().saturating_sub(1));
     let root = tree.root_node();
@@ -225,7 +268,11 @@ pub fn around_function(doc: &Document) -> Result<Option<TextRange>, String> {
         start: from,
         end: source_position(doc, end.row, end.column),
     };
-    if selection.start >= selection.end { Ok(None) } else { Ok(Some(selection)) }
+    if selection.start >= selection.end {
+        Ok(None)
+    } else {
+        Ok(Some(selection))
+    }
 }
 
 #[cfg(test)]
@@ -236,15 +283,21 @@ mod tests {
     fn named(path: &str, text: &str, needle: &str) -> Document {
         let mut doc = Document::from_text(text);
         doc.path = Some(PathBuf::from(path));
-        let (row, col) = doc.lines.iter().enumerate().find_map(|(row, line)| {
-            let string: String = line.iter().collect();
-            string.find(needle).map(|offset| (row, string[..offset].chars().count()))
-        }).expect("needle");
+        let (row, col) = doc
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let string: String = line.iter().collect();
+                string
+                    .find(needle)
+                    .map(|offset| (row, string[..offset].chars().count()))
+            })
+            .expect("needle");
         doc.row = row;
         doc.col = col;
         doc
     }
-
 
     #[test]
     fn rust_function_header_is_selectable_at_every_position() {
@@ -252,7 +305,8 @@ mod tests {
         let text = "pub fn from_text(text: &str) -> Self {\n    let newline = if text.contains(\"\\r\\n\") { \"\\r\\n\" } else { \"\\n\" };\n    let lines = text.split('\\n').collect();\n    Self { lines }\n}\n";
         for needle in ["pub", "fn", "from_text", "text:", "&str", "Self", "{"] {
             let doc = named("src/document.rs", text, needle);
-            let selected = around_function(&doc).unwrap()
+            let selected = around_function(&doc)
+                .unwrap()
                 .unwrap_or_else(|| panic!("no function found at {needle}"));
             assert_eq!(selected.start, Position { row: 0, col: 0 }, "{needle}");
             assert_eq!(selected.end, Position { row: 4, col: 1 }, "{needle}");
@@ -272,7 +326,11 @@ mod tests {
 
     #[test]
     fn selecting_a_function_from_preceding_unrelated_line_is_not_allowed() {
-        let doc = named("src/lib.rs", "const ANSWER: i32 = 42;\n\npub fn answer() -> i32 { ANSWER }\n", "ANSWER:");
+        let doc = named(
+            "src/lib.rs",
+            "const ANSWER: i32 = 42;\n\npub fn answer() -> i32 { ANSWER }\n",
+            "ANSWER:",
+        );
         assert!(around_function(&doc).unwrap().is_none());
     }
 
@@ -300,10 +358,30 @@ mod tests {
     #[test]
     fn python_and_go_and_typescript_and_cpp() {
         for (path, source, needle, start) in [
-            ("m.py", "@decorator\ndef hello():\n    return 42\n", "return", 0),
-            ("m.go", "package main\nfunc say() {\n  println(\"ok\")\n}\n", "println", 1),
-            ("m.ts", "const say = (name: string) => {\n return name;\n};\n", "return", 0),
-            ("m.cpp", "int say(int x) {\n return x + 1;\n}\n", "return", 0),
+            (
+                "m.py",
+                "@decorator\ndef hello():\n    return 42\n",
+                "return",
+                0,
+            ),
+            (
+                "m.go",
+                "package main\nfunc say() {\n  println(\"ok\")\n}\n",
+                "println",
+                1,
+            ),
+            (
+                "m.ts",
+                "const say = (name: string) => {\n return name;\n};\n",
+                "return",
+                0,
+            ),
+            (
+                "m.cpp",
+                "int say(int x) {\n return x + 1;\n}\n",
+                "return",
+                0,
+            ),
         ] {
             let doc = named(path, source, needle);
             let range = around_function(&doc).unwrap().unwrap();
@@ -320,7 +398,11 @@ mod tests {
 
     #[test]
     fn no_function_outside_definition() {
-        let doc = named("main.rs", "const A: usize = 2;\nfn f() { println!(\"x\"); }\n", "const");
+        let doc = named(
+            "main.rs",
+            "const A: usize = 2;\nfn f() { println!(\"x\"); }\n",
+            "const",
+        );
         assert!(around_function(&doc).unwrap().is_none());
     }
 }

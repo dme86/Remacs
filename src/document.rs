@@ -21,10 +21,20 @@ impl Document {
 
     pub fn from_text(text: &str) -> Self {
         let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-        let lines = text.split('\n')
+        let lines = text
+            .split('\n')
             .map(|line| line.strip_suffix('\r').unwrap_or(line).chars().collect())
             .collect();
-        Self { lines, path: None, row: 0, col: 0, dirty: false, revision: 0, newline, syntax_invalid_from: None }
+        Self {
+            lines,
+            path: None,
+            row: 0,
+            col: 0,
+            dirty: false,
+            revision: 0,
+            newline,
+            syntax_invalid_from: None,
+        }
     }
 
     pub fn open(path: PathBuf) -> io::Result<Self> {
@@ -39,9 +49,10 @@ impl Document {
     }
 
     pub fn save(&mut self) -> io::Result<()> {
-        let path = self.path.as_ref().ok_or_else(|| io::Error::new(
-            io::ErrorKind::InvalidInput, "no filename specified"
-        ))?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no filename specified"))?;
         fs::write(path, self.lsp_text())?;
         self.dirty = false;
         Ok(())
@@ -51,7 +62,9 @@ impl Document {
     pub fn lsp_text(&self) -> String {
         let mut text = String::new();
         for (row, line) in self.lines.iter().enumerate() {
-            if row > 0 { text.push_str(self.newline); }
+            if row > 0 {
+                text.push_str(self.newline);
+            }
             text.extend(line.iter());
         }
         text
@@ -89,8 +102,12 @@ impl Document {
         self.col = self.col.min(self.line().len());
     }
 
-    pub fn home(&mut self) { self.col = 0; }
-    pub fn end(&mut self) { self.col = self.line().len(); }
+    pub fn home(&mut self) {
+        self.col = 0;
+    }
+    pub fn end(&mut self) {
+        self.col = self.line().len();
+    }
 
     pub fn invalidate_syntax_from(&mut self, row: usize) {
         self.revision = self.revision.wrapping_add(1);
@@ -126,7 +143,9 @@ impl Document {
             self.row -= 1;
             self.col = self.line().len();
             self.lines[self.row].extend(tail);
-        } else { return; }
+        } else {
+            return;
+        }
         self.dirty = true;
     }
 
@@ -138,7 +157,9 @@ impl Document {
             self.invalidate_syntax_from(self.row);
             let tail = self.lines.remove(self.row + 1);
             self.lines[self.row].extend(tail);
-        } else { return; }
+        } else {
+            return;
+        }
         self.dirty = true;
     }
 
@@ -176,7 +197,9 @@ impl Document {
         let mut row = self.row;
         let mut col = self.col;
         if col < self.lines[row].len() && is_word(self.lines[row][col]) {
-            while col < self.lines[row].len() && is_word(self.lines[row][col]) { col += 1; }
+            while col < self.lines[row].len() && is_word(self.lines[row][col]) {
+                col += 1;
+            }
         }
         loop {
             while col < self.lines[row].len() {
@@ -213,9 +236,13 @@ impl Document {
                 continue;
             }
             col -= 1;
-            while col > 0 && !is_word(self.lines[row][col]) { col -= 1; }
+            while col > 0 && !is_word(self.lines[row][col]) {
+                col -= 1;
+            }
             if is_word(self.lines[row][col]) {
-                while col > 0 && is_word(self.lines[row][col - 1]) { col -= 1; }
+                while col > 0 && is_word(self.lines[row][col - 1]) {
+                    col -= 1;
+                }
                 self.row = row;
                 self.col = col;
                 return;
@@ -235,10 +262,20 @@ impl Document {
         }
         let mut output = String::new();
         for row in range.start.row..=range.end.row {
-            if row > range.start.row { output.push('\n'); }
+            if row > range.start.row {
+                output.push('\n');
+            }
             let line = &self.lines[row];
-            let from = if row == range.start.row { range.start.col } else { 0 };
-            let to = if row == range.end.row { range.end.col } else { line.len() };
+            let from = if row == range.start.row {
+                range.start.col
+            } else {
+                0
+            };
+            let to = if row == range.end.row {
+                range.end.col
+            } else {
+                line.len()
+            };
             if from <= to && to <= line.len() {
                 output.extend(line[from..to].iter());
             }
@@ -247,7 +284,8 @@ impl Document {
     }
 
     pub fn delete_text_range(&mut self, range: TextRange) {
-        if range.start >= range.end || range.end.row >= self.lines.len()
+        if range.start >= range.end
+            || range.end.row >= self.lines.len()
             || range.start.col > self.lines[range.start.row].len()
             || range.end.col > self.lines[range.end.row].len()
         {
@@ -255,7 +293,8 @@ impl Document {
         }
         let mut joined = self.lines[range.start.row][..range.start.col].to_vec();
         joined.extend_from_slice(&self.lines[range.end.row][range.end.col..]);
-        self.lines.splice(range.start.row..=range.end.row, std::iter::once(joined));
+        self.lines
+            .splice(range.start.row..=range.end.row, std::iter::once(joined));
         self.row = range.start.row;
         self.col = range.start.col;
         self.dirty = true;
@@ -265,8 +304,12 @@ impl Document {
     /// Insert a paste as one document change. Splice the surrounding text only
     /// once so inserting a large paste before a long suffix stays linear.
     pub fn insert_text(&mut self, text: &str) {
-        if text.is_empty() { return; }
-        let mut inserted = text.split('\n').map(|line| line.chars().collect::<Vec<_>>());
+        if text.is_empty() {
+            return;
+        }
+        let mut inserted = text
+            .split('\n')
+            .map(|line| line.chars().collect::<Vec<_>>());
         let first = inserted.next().expect("split always yields a first line");
         let first_len = first.len();
         let mut following: Vec<Vec<char>> = inserted.collect();
@@ -326,9 +369,15 @@ mod tests {
             individual.row = 1;
             individual.col = 6;
             bulk.insert_text(text);
-            for ch in text.chars() { individual.insert(ch); }
+            for ch in text.chars() {
+                individual.insert(ch);
+            }
             assert_eq!(bulk.lines, individual.lines, "{text:?}");
-            assert_eq!((bulk.row, bulk.col), (individual.row, individual.col), "{text:?}");
+            assert_eq!(
+                (bulk.row, bulk.col),
+                (individual.row, individual.col),
+                "{text:?}"
+            );
             assert_eq!(bulk.revision, 1);
         }
     }
@@ -361,7 +410,13 @@ mod tests {
         let doc = Document::from_text("one\r\ntwo\r\n");
         assert_eq!(doc.lines.len(), 3);
         assert_eq!(doc.newline, "\r\n");
-        assert_eq!(doc.lines.iter().map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>().join(doc.newline), "one\r\ntwo\r\n");
+        assert_eq!(
+            doc.lines
+                .iter()
+                .map(|line| line.iter().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(doc.newline),
+            "one\r\ntwo\r\n"
+        );
     }
 }

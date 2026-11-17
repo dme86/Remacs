@@ -1,7 +1,10 @@
 //! Syntax highlighting with embedded Sublime/bat grammars. Enabled by default.
 //! Cache parser state after each line so normal cursor movement never reparses it.
 
-use std::{path::PathBuf, sync::{Arc, OnceLock}};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use crossterm::style::Color;
 use two_face::re_exports::syntect::{
@@ -41,8 +44,12 @@ impl SyntaxEngine {
         let (syntaxes, theme) = SHARED.get_or_init(|| {
             let syntaxes = Arc::new(two_face::syntax::extra_newlines());
             let mut themes = ThemeSet::load_defaults();
-            let theme = Arc::new(themes.themes.remove("base16-ocean.dark")
-                .expect("embedded highlighting theme"));
+            let theme = Arc::new(
+                themes
+                    .themes
+                    .remove("base16-ocean.dark")
+                    .expect("embedded highlighting theme"),
+            );
             (syntaxes, theme)
         });
         let name = Self::detect(syntaxes, doc).name.to_owned();
@@ -207,7 +214,10 @@ mod tests {
 
     #[test]
     fn defaults_to_highlighting_and_parses_markdown() {
-        let doc = doc_named("README.md", "# Hello\n\n**bold**\n\n```rust\nfn main() {}\n```");
+        let doc = doc_named(
+            "README.md",
+            "# Hello\n\n**bold**\n\n```rust\nfn main() {}\n```",
+        );
         let mut engine = SyntaxEngine::new(&doc);
         assert!(engine.enabled());
         assert!(engine.spans(&doc, 5).is_some());

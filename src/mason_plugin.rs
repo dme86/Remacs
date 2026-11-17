@@ -28,8 +28,10 @@ pub struct MasonPlugin {
 impl MasonPlugin {
     pub fn new() -> mlua::Result<Self> {
         let lua = Lua::new();
-        let table: Table = lua.load(include_str!("../plugins/mason.lua"))
-            .set_name("plugins/mason.lua").eval()?;
+        let table: Table = lua
+            .load(include_str!("../plugins/mason.lua"))
+            .set_name("plugins/mason.lua")
+            .eval()?;
         let plugin = lua.create_registry_value(table)?;
         Ok(Self { lua, plugin })
     }
@@ -52,36 +54,55 @@ impl MasonPlugin {
         for entry in list.sequence_values::<Table>() {
             let entry = entry?;
             let id: String = entry.get("id")?;
-            if id.is_empty() || !id.bytes().all(|ch| ch.is_ascii_lowercase()
-                || ch.is_ascii_digit() || ch == b'_') {
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'_')
+            {
                 return Err(mlua::Error::external(format!("Invalid LSP id: {id}")));
             }
-            let command = entry.get::<Table>("cmd")?
-                .sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?;
+            let command = entry
+                .get::<Table>("cmd")?
+                .sequence_values::<String>()
+                .collect::<mlua::Result<Vec<_>>>()?;
             if command.first().is_none_or(String::is_empty) {
                 return Err(mlua::Error::external(format!("Missing command for {id}")));
             }
             let recipe = entry.get::<Table>("install")?;
             let kind: String = recipe.get("kind")?;
             let recipe = match kind.as_str() {
-                "rustup" => Recipe::Rustup(recipe.get::<Table>("components")?
-                    .sequence_values::<String>().collect::<mlua::Result<_>>()?),
+                "rustup" => Recipe::Rustup(
+                    recipe
+                        .get::<Table>("components")?
+                        .sequence_values::<String>()
+                        .collect::<mlua::Result<_>>()?,
+                ),
                 "go" => Recipe::Go(recipe.get("module")?),
                 "npm" => Recipe::Npm(recipe.get("package")?),
                 "cargo" => Recipe::Cargo(recipe.get("package")?),
                 "brew" => Recipe::Brew(recipe.get("package")?),
-                _ => return Err(mlua::Error::external(
-                    format!("Unknown installer kind {kind} for {id}"))),
+                _ => {
+                    return Err(mlua::Error::external(format!(
+                        "Unknown installer kind {kind} for {id}"
+                    )))
+                }
             };
             // Package-manager arguments must be single, nonempty tokens.
             // They are passed as argv; never interpolated into a shell.
             let tokens: Vec<&str> = match &recipe {
                 Recipe::Rustup(args) => args.iter().map(String::as_str).collect(),
-                Recipe::Go(value) | Recipe::Npm(value) | Recipe::Cargo(value)
-                    | Recipe::Brew(value) => vec![value],
+                Recipe::Go(value)
+                | Recipe::Npm(value)
+                | Recipe::Cargo(value)
+                | Recipe::Brew(value) => vec![value],
             };
-            if tokens.is_empty() || tokens.iter().any(|token| token.is_empty()
-                || token.chars().any(char::is_whitespace) || token.starts_with('-')) {
+            if tokens.is_empty()
+                || tokens.iter().any(|token| {
+                    token.is_empty()
+                        || token.chars().any(char::is_whitespace)
+                        || token.starts_with('-')
+                })
+            {
                 return Err(mlua::Error::external(format!(
                     "Unsafe or empty install recipe for {id}"
                 )));
@@ -106,13 +127,19 @@ mod tests {
     fn single_lua_catalog_defines_installer_policy() {
         let lua = MasonPlugin::new().unwrap();
         let tools = lua.tools().unwrap();
-        let ids = tools.iter().map(|tool| tool.id.as_str()).collect::<Vec<_>>();
+        let ids = tools
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect::<Vec<_>>();
         assert!(ids.contains(&"rust_analyzer"));
         assert!(ids.contains(&"gopls"));
         assert!(ids.contains(&"lua_ls"));
         assert!(ids.contains(&"jsonls"));
         assert!(!ids.contains(&"ts_ls"));
-        let rust = tools.iter().find(|tool| tool.id == "rust_analyzer").unwrap();
+        let rust = tools
+            .iter()
+            .find(|tool| tool.id == "rust_analyzer")
+            .unwrap();
         assert_eq!(rust.command, ["rust-analyzer"]);
         assert!(matches!(&rust.recipe, Recipe::Rustup(components)
             if components == &["rust-analyzer", "rust-src"]));

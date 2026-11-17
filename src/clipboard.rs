@@ -51,7 +51,9 @@ impl Clipboard {
         }
         #[cfg(not(test))]
         {
-            self.system()?.set_text(text).map_err(|error| error.to_string())
+            self.system()?
+                .set_text(text)
+                .map_err(|error| error.to_string())
         }
     }
 }

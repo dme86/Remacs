@@ -2,6 +2,7 @@
 //! Only typed package-manager argv is executed; no shell evaluation, no
 //! arbitrary remote archive extraction and no background network on startup
 //! unless explicitly enabled in Lua. Managed binaries live under Remacs data.
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     env, fs,
@@ -11,7 +12,6 @@ use std::{
     process::{Child, Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
-use serde::{Deserialize, Serialize};
 
 use crate::mason_plugin::{MasonPlugin, Recipe, Tool};
 
@@ -33,7 +33,11 @@ struct History {
 }
 
 pub enum Event {
-    Done { id: String, language: String, updated: bool },
+    Done {
+        id: String,
+        language: String,
+        updated: bool,
+    },
     Message(String),
 }
 
@@ -49,15 +53,22 @@ pub struct Manager {
 pub fn default_root() -> PathBuf {
     if let Some(value) = env::var_os("REMACS_MASON_HOME") {
         let path = PathBuf::from(value);
-        if path.is_absolute() { return path; }
+        if path.is_absolute() {
+            return path;
+        }
     }
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     #[cfg(target_os = "macos")]
-    { home.join("Library/Application Support/Remacs/mason") }
+    {
+        home.join("Library/Application Support/Remacs/mason")
+    }
     #[cfg(not(target_os = "macos"))]
     {
         env::var_os("XDG_DATA_HOME")
-            .filter(|value| !value.is_empty()).map(PathBuf::from)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"))
             .join("remacs/mason")
     }
@@ -70,15 +81,21 @@ fn executable_on_path(program: &str) -> Option<PathBuf> {
     if name.is_absolute() {
         return name.is_file().then(|| name.to_path_buf());
     }
-    if name.components().count() != 1 { return None; }
+    if name.components().count() != 1 {
+        return None;
+    }
     env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path).map(|dir| dir.join(program)).find(|file| file.is_file())
+        env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|file| file.is_file())
     })
 }
 
 pub fn managed_executable(program: &str) -> Option<PathBuf> {
     let name = Path::new(program);
-    if name.components().count() != 1 { return None; }
+    if name.components().count() != 1 {
+        return None;
+    }
     let path = default_root().join("bin").join(program);
     path.is_file().then_some(path)
 }
@@ -92,17 +109,26 @@ pub fn resolve_command(program: &str) -> String {
 impl Manager {
     pub fn new(plugin: &MasonPlugin) -> mlua::Result<Self> {
         let root = default_root();
-        let history = fs::read(root.join("history.json")).ok()
+        let history = fs::read(root.join("history.json"))
+            .ok()
             .and_then(|bytes| serde_json::from_slice::<History>(&bytes).ok())
             .unwrap_or_default();
         Ok(Self {
-            tools: plugin.tools()?, root, pending: VecDeque::new(),
-            active: None, failures: HashMap::new(), history,
+            tools: plugin.tools()?,
+            root,
+            pending: VecDeque::new(),
+            active: None,
+            failures: HashMap::new(),
+            history,
         })
     }
 
-    pub fn tools(&self) -> &[Tool] { &self.tools }
-    pub fn log_path(&self) -> PathBuf { self.root.join("install.log") }
+    pub fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+    pub fn log_path(&self) -> PathBuf {
+        self.root.join("install.log")
+    }
 
     pub fn has(&self, tool: &Tool) -> bool {
         self.root.join("bin").join(&tool.command[0]).is_file()
@@ -112,7 +138,11 @@ impl Manager {
     pub fn status(&self, tool: &Tool) -> String {
         if let Some(job) = &self.active {
             if job.task.id == tool.id {
-                return if job.task.update { "updating…".into() } else { "installing…".into() };
+                return if job.task.update {
+                    "updating…".into()
+                } else {
+                    "installing…".into()
+                };
             }
         }
         if self.pending.iter().any(|job| job.id == tool.id) {
@@ -132,15 +162,21 @@ impl Manager {
 
     pub fn entries(&self, query: &str) -> Vec<(String, String)> {
         let query = query.to_lowercase();
-        self.tools.iter().filter(|tool| {
-            // Fuzzy subsequence on tool ID and visible language label.
-            let haystack = format!("{} {}", tool.id, tool.label).to_lowercase();
-            let mut letters = haystack.chars();
-            query.chars().all(|c| letters.by_ref().any(|ch| ch == c))
-        }).map(|tool| (
-            tool.id.clone(),
-            format!("{}  {} · {}", tool.id, tool.label, self.status(tool))
-        )).collect()
+        self.tools
+            .iter()
+            .filter(|tool| {
+                // Fuzzy subsequence on tool ID and visible language label.
+                let haystack = format!("{} {}", tool.id, tool.label).to_lowercase();
+                let mut letters = haystack.chars();
+                query.chars().all(|c| letters.by_ref().any(|ch| ch == c))
+            })
+            .map(|tool| {
+                (
+                    tool.id.clone(),
+                    format!("{}  {} · {}", tool.id, tool.label, self.status(tool)),
+                )
+            })
+            .collect()
     }
 
     pub fn queue(&mut self, id: &str, update: bool) -> Result<String, String> {
@@ -152,12 +188,19 @@ impl Manager {
             return Ok(format!("{} is already available", tool.id));
         }
         if self.active.as_ref().is_some_and(|job| job.task.id == id)
-            || self.pending.iter().any(|job| job.id == id) {
+            || self.pending.iter().any(|job| job.id == id)
+        {
             return Ok(format!("{id} already queued or installing"));
         }
         self.failures.remove(id);
-        self.pending.push_back(Task { id: id.to_string(), update });
-        Ok(format!("Queued {id} for {}", if update { "update" } else { "installation" }))
+        self.pending.push_back(Task {
+            id: id.to_string(),
+            update,
+        });
+        Ok(format!(
+            "Queued {id} for {}",
+            if update { "update" } else { "installation" }
+        ))
     }
 
     pub fn queue_all(&mut self, update: bool) -> usize {
@@ -166,22 +209,37 @@ impl Manager {
         for id in ids {
             let before = self.pending.len();
             let _ = self.queue(&id, update);
-            if self.pending.len() > before { queued += 1; }
+            if self.pending.len() > before {
+                queued += 1;
+            }
         }
         queued
     }
 
     pub fn auto_queue(&mut self, plugin: &MasonPlugin) -> mlua::Result<()> {
-        if plugin.auto_install()? { self.queue_all(false); }
+        if plugin.auto_install()? {
+            self.queue_all(false);
+        }
         let interval = plugin.auto_update_days()?;
         if interval > 0 {
             let now = now_secs();
             let interval = interval.saturating_mul(86_400);
-            let ids: Vec<_> = self.tools.iter().filter(|tool| self.has(tool)
-                && self.history.updated_at.get(&tool.id).is_some_and(|last|
-                    now.saturating_sub(*last) >= interval))
-                .map(|tool| tool.id.clone()).collect();
-            for id in ids { let _ = self.queue(&id, true); }
+            let ids: Vec<_> = self
+                .tools
+                .iter()
+                .filter(|tool| {
+                    self.has(tool)
+                        && self
+                            .history
+                            .updated_at
+                            .get(&tool.id)
+                            .is_some_and(|last| now.saturating_sub(*last) >= interval)
+                })
+                .map(|tool| tool.id.clone())
+                .collect();
+            for id in ids {
+                let _ = self.queue(&id, true);
+            }
         }
         Ok(())
     }
@@ -195,27 +253,43 @@ impl Manager {
             }
             Recipe::Go(module) => {
                 let mut command = Command::new("go");
-                command.arg("install").arg(module).env("GOBIN", self.root.join("bin"));
+                command
+                    .arg("install")
+                    .arg(module)
+                    .env("GOBIN", self.root.join("bin"));
                 command
             }
             Recipe::Npm(package) => {
                 let mut command = Command::new("npm");
-                command.args(["install", "--global", "--prefix"])
+                command
+                    .args(["install", "--global", "--prefix"])
                     .arg(&self.root)
                     .args(["--no-audit", "--no-fund", package]);
                 command
             }
             Recipe::Cargo(package) => {
                 let mut command = Command::new("cargo");
-                command.arg("install").arg("--locked").arg("--root").arg(&self.root)
+                command
+                    .arg("install")
+                    .arg("--locked")
+                    .arg("--root")
+                    .arg(&self.root)
                     .arg(package);
-                if update { command.arg("--force"); }
+                if update {
+                    command.arg("--force");
+                }
                 command
             }
             Recipe::Brew(package) => {
                 let mut command = Command::new("brew");
-                command.arg(if update && self.has(tool) { "upgrade" } else { "install" })
-                    .arg("--formula").arg(package);
+                command
+                    .arg(if update && self.has(tool) {
+                        "upgrade"
+                    } else {
+                        "install"
+                    })
+                    .arg("--formula")
+                    .arg(package);
                 command
             }
         };
@@ -243,24 +317,30 @@ impl Manager {
     }
 
     fn start_next(&mut self, events: &mut Vec<Event>) {
-        if self.active.is_some() { return; }
+        if self.active.is_some() {
+            return;
+        }
         while let Some(task) = self.pending.pop_front() {
-            let Some(tool) = self.tools.iter().find(|tool| tool.id == task.id) else { continue };
-            let setup = self.ensure_data_directory()
-                .and_then(|()| self.open_log());
+            let Some(tool) = self.tools.iter().find(|tool| tool.id == task.id) else {
+                continue;
+            };
+            let setup = self.ensure_data_directory().and_then(|()| self.open_log());
             let mut log = match setup {
                 Ok(log) => log,
                 Err(error) => {
                     self.failures.insert(task.id.clone(), error.to_string());
-                    events.push(Event::Message(format!(
-                        "Mason {} failed: {error}", task.id
-                    )));
+                    events.push(Event::Message(format!("Mason {} failed: {error}", task.id)));
                     continue;
                 }
             };
-            let _ = writeln!(log, "\n=== {} {} ===",
-                if task.update { "Update" } else { "Install" }, tool.id);
-            let child = self.command_for(tool, task.update)
+            let _ = writeln!(
+                log,
+                "\n=== {} {} ===",
+                if task.update { "Update" } else { "Install" },
+                tool.id
+            );
+            let child = self
+                .command_for(tool, task.update)
                 .stdout(Stdio::from(match log.try_clone() {
                     Ok(log) => log,
                     Err(error) => {
@@ -274,8 +354,13 @@ impl Manager {
                 Ok(child) => {
                     events.push(Event::Message(format!(
                         "Mason {} {} (see {})",
-                        if task.update { "updating" } else { "installing" },
-                        task.id, self.log_path().display()
+                        if task.update {
+                            "updating"
+                        } else {
+                            "installing"
+                        },
+                        task.id,
+                        self.log_path().display()
                     )));
                     self.active = Some(Active { task, child });
                     break;
@@ -283,7 +368,8 @@ impl Manager {
                 Err(error) => {
                     self.failures.insert(task.id.clone(), error.to_string());
                     events.push(Event::Message(format!(
-                        "Mason {} failed: {error} (installer unavailable?)", task.id
+                        "Mason {} failed: {error} (installer unavailable?)",
+                        task.id
                     )));
                 }
             }
@@ -300,7 +386,8 @@ impl Manager {
                     if status.success() {
                         if let Some(tool) = self.tools.iter().find(|tool| tool.id == id) {
                             events.push(Event::Done {
-                                id: id.clone(), language: tool.language.clone(),
+                                id: id.clone(),
+                                language: tool.language.clone(),
                                 updated: finished.task.update,
                             });
                         }
@@ -328,7 +415,9 @@ impl Manager {
     fn persist_history(&self) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(&self.history).map_err(io::Error::other)?;
         let target = self.root.join("history.json");
-        let temp = self.root.join(format!("history-{}.tmp", std::process::id()));
+        let temp = self
+            .root
+            .join(format!("history-{}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.create(true).truncate(true).write(true);
         #[cfg(unix)]
@@ -353,8 +442,10 @@ impl Drop for Manager {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -366,8 +457,12 @@ mod tests {
         let plugin = MasonPlugin::new().unwrap();
         let mut manager = Manager::new(&plugin).unwrap();
         manager.root = std::env::temp_dir().join(format!(
-            "remacs-mason-test-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            "remacs-mason-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         manager
     }
@@ -385,22 +480,40 @@ mod tests {
     #[test]
     fn installer_commands_use_argv_not_shell_and_write_to_managed_root() {
         let manager = fixture();
-        let rust = manager.tools.iter().find(|tool| tool.id == "rust_analyzer").unwrap();
+        let rust = manager
+            .tools
+            .iter()
+            .find(|tool| tool.id == "rust_analyzer")
+            .unwrap();
         let cmd = manager.command_for(rust, false);
         assert_eq!(cmd.get_program(), OsStr::new("rustup"));
-        assert_eq!(cmd.get_args().map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(), ["component", "add", "rust-analyzer", "rust-src"]);
-        let go = manager.tools.iter().find(|tool| tool.id == "gopls").unwrap();
+        assert_eq!(
+            cmd.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["component", "add", "rust-analyzer", "rust-src"]
+        );
+        let go = manager
+            .tools
+            .iter()
+            .find(|tool| tool.id == "gopls")
+            .unwrap();
         let cmd = manager.command_for(go, false);
         assert_eq!(cmd.get_program(), OsStr::new("go"));
         assert_eq!(cmd.get_args().next(), Some(OsStr::new("install")));
-        assert!(cmd.get_envs().any(|(key,val)| key == OsStr::new("GOBIN")
+        assert!(cmd.get_envs().any(|(key, val)| key == OsStr::new("GOBIN")
             && val.is_some_and(|val| val == manager.root.join("bin"))));
-        let npm = manager.tools.iter().find(|tool| tool.id == "yamlls").unwrap();
+        let npm = manager
+            .tools
+            .iter()
+            .find(|tool| tool.id == "yamlls")
+            .unwrap();
         let cmd = manager.command_for(npm, false);
         assert_eq!(cmd.get_program(), OsStr::new("npm"));
         assert!(cmd.get_args().any(|arg| arg == OsStr::new("--prefix")));
-        assert!(cmd.get_args().any(|arg| arg == OsStr::new("yaml-language-server@latest")));
+        assert!(cmd
+            .get_args()
+            .any(|arg| arg == OsStr::new("yaml-language-server@latest")));
     }
 
     #[cfg(unix)]
@@ -412,7 +525,11 @@ mod tests {
         // No package manager, shell string or network is involved in CI.
         let child = Command::new("/usr/bin/true").spawn().unwrap();
         manager.active = Some(Active {
-            task: Task { id: "gopls".into(), update: false }, child
+            task: Task {
+                id: "gopls".into(),
+                update: false,
+            },
+            child,
         });
         let mut completed = false;
         for _ in 0..50 {
@@ -423,10 +540,15 @@ mod tests {
                     completed = true;
                 }
             }
-            if completed { break; }
+            if completed {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(completed, "installer completion must be polled asynchronously");
+        assert!(
+            completed,
+            "installer completion must be polled asynchronously"
+        );
         assert!(manager.active.is_none());
         assert!(manager.history.updated_at.contains_key("gopls"));
         assert!(manager.root.join("history.json").exists());
@@ -439,16 +561,23 @@ mod tests {
         let mut manager = fixture();
         let child = Command::new("/usr/bin/false").spawn().unwrap();
         manager.active = Some(Active {
-            task: Task { id: "gopls".into(), update: true }, child
+            task: Task {
+                id: "gopls".into(),
+                update: true,
+            },
+            child,
         });
         for _ in 0..50 {
             manager.poll();
-            if manager.active.is_none() { break; }
+            if manager.active.is_none() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(manager.active.is_none());
         assert!(!manager.history.updated_at.contains_key("gopls"));
-        assert!(manager.status(manager.tools.iter().find(|t| t.id == "gopls").unwrap())
+        assert!(manager
+            .status(manager.tools.iter().find(|t| t.id == "gopls").unwrap())
             .contains("failed"));
     }
 
@@ -457,9 +586,12 @@ mod tests {
         let mut manager = fixture();
         assert!(manager.queue("does_not_exist", false).is_err());
         assert!(manager.queue("jsonls", true).unwrap().contains("Queued"));
-        assert!(manager.queue("jsonls", true).unwrap().contains("already queued"));
+        assert!(manager
+            .queue("jsonls", true)
+            .unwrap()
+            .contains("already queued"));
         assert_eq!(manager.pending.len(), 1);
-        assert!(manager.entries("yaml").iter().any(|(id,_)| id == "yamlls"));
+        assert!(manager.entries("yaml").iter().any(|(id, _)| id == "yamlls"));
     }
 
     #[test]
@@ -467,10 +599,17 @@ mod tests {
         let mut manager = fixture();
         fs::create_dir_all(manager.root.join("bin")).unwrap();
         fs::write(manager.root.join("bin/gopls"), b"fixture").unwrap();
-        let tool = manager.tools.iter().find(|tool| tool.id == "gopls").unwrap();
+        let tool = manager
+            .tools
+            .iter()
+            .find(|tool| tool.id == "gopls")
+            .unwrap();
         assert!(manager.has(tool));
         assert_eq!(manager.status(tool), "installed · managed");
-        assert!(manager.queue("gopls", false).unwrap().contains("already available"));
+        assert!(manager
+            .queue("gopls", false)
+            .unwrap()
+            .contains("already available"));
         assert!(manager.pending.is_empty());
         assert!(manager.queue("gopls", true).unwrap().contains("Queued"));
         let _ = fs::remove_dir_all(&manager.root);

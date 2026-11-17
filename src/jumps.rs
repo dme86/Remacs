@@ -47,7 +47,8 @@ pub fn default_state_path() -> Option<PathBuf> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty())
+        env::var_os("XDG_STATE_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| home.map(|dir| dir.join(".local/state")))
             .map(|base| base.join("remacs/jumps.json"))
@@ -56,7 +57,11 @@ pub fn default_state_path() -> Option<PathBuf> {
 
 impl JumpManager {
     pub fn memory_only() -> Self {
-        Self { saved: Saved::default(), state_path: None, change_cursor: 0 }
+        Self {
+            saved: Saved::default(),
+            state_path: None,
+            change_cursor: 0,
+        }
     }
 
     pub fn load_default() -> Self {
@@ -67,39 +72,70 @@ impl JumpManager {
     }
 
     pub fn from_path(path: PathBuf) -> Self {
-        let saved = fs::metadata(&path).ok().filter(|m| m.len() <= MAX_STATE_BYTES)
+        let saved = fs::metadata(&path)
+            .ok()
+            .filter(|m| m.len() <= MAX_STATE_BYTES)
             .and_then(|_| fs::read(&path).ok())
             .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
             .unwrap_or_default();
         let saved = Saved {
-            history: saved.history.into_iter()
+            history: saved
+                .history
+                .into_iter()
                 .filter(|entry| entry.path.is_absolute())
-                .rev().take(MAX_JUMPS).collect::<Vec<_>>()
-                .into_iter().rev().collect(),
+                .rev()
+                .take(MAX_JUMPS)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             cursor: None,
-            changes: saved.changes.into_iter().filter(|entry| entry.path.is_absolute())
-                .rev().take(MAX_CHANGES).collect::<Vec<_>>()
-                .into_iter().rev().collect(),
-            marks: saved.marks.into_iter()
-                .filter(|(_, loc)| loc.path.is_absolute()).take(MAX_MARKS).collect(),
+            changes: saved
+                .changes
+                .into_iter()
+                .filter(|entry| entry.path.is_absolute())
+                .rev()
+                .take(MAX_CHANGES)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            marks: saved
+                .marks
+                .into_iter()
+                .filter(|(_, loc)| loc.path.is_absolute())
+                .take(MAX_MARKS)
+                .collect(),
         };
         let cursor = saved.history.len().checked_sub(1);
         let change_cursor = saved.changes.len();
-        Self { saved: Saved { cursor, ..saved }, state_path: Some(path), change_cursor }
+        Self {
+            saved: Saved { cursor, ..saved },
+            state_path: Some(path),
+            change_cursor,
+        }
     }
 
-    pub fn entries(&self) -> &[Location] { &self.saved.history }
+    pub fn entries(&self) -> &[Location] {
+        &self.saved.history
+    }
     /// Whether a forward jump is possible after Ctrl+O. This is also used
     /// to interpret the ambiguous Tab/Ctrl+I byte in legacy terminals.
     pub fn can_forward(&self) -> bool {
-        self.saved.cursor.is_some_and(|index| index + 1 < self.saved.history.len())
+        self.saved
+            .cursor
+            .is_some_and(|index| index + 1 < self.saved.history.len())
     }
-    pub fn changes(&self) -> &[Location] { &self.saved.changes }
+    pub fn changes(&self) -> &[Location] {
+        &self.saved.changes
+    }
 
     // Explicit jumps preserve distinct columns, including same-line mark
     // and definition jumps. Only consecutive identical origins coalesce.
     pub fn remember(&mut self, location: Location) -> io::Result<()> {
-        if !location.path.is_absolute() { return Ok(()); }
+        if !location.path.is_absolute() {
+            return Ok(());
+        }
         // A new jump branches from the current history entry, even when
         // its origin exactly matches that entry. Otherwise Ctrl+O from the
         // new target would skip its origin and retain an unrelated future.
@@ -129,33 +165,46 @@ impl JumpManager {
     // through existing entries needs no disk write or synchronous fsync.
     pub fn back(&mut self, current: Option<Location>) -> io::Result<Option<Location>> {
         if self.saved.cursor == self.saved.history.len().checked_sub(1) {
-            if let Some(current) = current { self.remember(current)?; }
+            if let Some(current) = current {
+                self.remember(current)?;
+            }
         }
-        let Some(index) = self.saved.cursor else { return Ok(None); };
-        if index == 0 { return Ok(None); }
+        let Some(index) = self.saved.cursor else {
+            return Ok(None);
+        };
+        if index == 0 {
+            return Ok(None);
+        }
         self.saved.cursor = Some(index - 1);
         Ok(self.saved.history.get(index - 1).cloned())
     }
 
     pub fn forward(&mut self) -> io::Result<Option<Location>> {
-        let Some(index) = self.saved.cursor else { return Ok(None); };
-        if index + 1 >= self.saved.history.len() { return Ok(None); }
+        let Some(index) = self.saved.cursor else {
+            return Ok(None);
+        };
+        if index + 1 >= self.saved.history.len() {
+            return Ok(None);
+        }
         self.saved.cursor = Some(index + 1);
         Ok(self.saved.history.get(index + 1).cloned())
     }
 
     #[cfg(test)]
     fn at(&mut self, index: usize) -> io::Result<Option<Location>> {
-        if index >= self.saved.history.len() { return Ok(None); }
+        if index >= self.saved.history.len() {
+            return Ok(None);
+        }
         self.saved.cursor = Some(index);
         Ok(self.saved.history.get(index).cloned())
     }
 
-
     /// Remacs extension of Vim's changelist: edits across *all* open files,
     /// with position recording once per edit command / insert session.
     pub fn record_change(&mut self, location: Location) -> io::Result<()> {
-        if !location.path.is_absolute() { return Ok(()); }
+        if !location.path.is_absolute() {
+            return Ok(());
+        }
         // A new edit discards the forward traversal of the old change list.
         if self.change_cursor < self.saved.changes.len() {
             self.saved.changes.truncate(self.change_cursor + 1);
@@ -177,14 +226,18 @@ impl JumpManager {
 
     /// g; starts with the newest edit, then moves to older edit sites.
     pub fn older_change(&mut self) -> io::Result<Option<Location>> {
-        if self.change_cursor == 0 { return Ok(None); }
+        if self.change_cursor == 0 {
+            return Ok(None);
+        }
         self.change_cursor = self.change_cursor.saturating_sub(1);
         Ok(self.saved.changes.get(self.change_cursor).cloned())
     }
 
     /// g, moves forward through the previous edit sites.
     pub fn newer_change(&mut self) -> io::Result<Option<Location>> {
-        if self.change_cursor + 1 >= self.saved.changes.len() { return Ok(None); }
+        if self.change_cursor + 1 >= self.saved.changes.len() {
+            return Ok(None);
+        }
         self.change_cursor += 1;
         Ok(self.saved.changes.get(self.change_cursor).cloned())
     }
@@ -201,7 +254,9 @@ impl JumpManager {
     }
 
     pub fn set_mark(&mut self, name: char, location: Location) -> io::Result<bool> {
-        let Some(key) = Self::mark_key(name, &location.path) else { return Ok(false) };
+        let Some(key) = Self::mark_key(name, &location.path) else {
+            return Ok(false);
+        };
         if !self.saved.marks.contains_key(&key) && self.saved.marks.len() >= MAX_MARKS {
             // Retain a bounded number of persisted marks.
             self.saved.marks.pop_first();
@@ -217,9 +272,14 @@ impl JumpManager {
     }
 
     fn persist(&self) -> io::Result<()> {
-        let Some(path) = &self.state_path else { return Ok(()) };
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
         let Some(parent) = path.parent() else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid jump state path"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid jump state path",
+            ));
         };
         // Never chmod an existing parent directory. A custom state path
         // may be directly under /tmp or an XDG shared directory; changing
@@ -233,8 +293,7 @@ impl JumpManager {
             // and their permissions are left untouched.
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
-        let bytes = serde_json::to_vec(&self.saved)
-            .map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(&self.saved).map_err(io::Error::other)?;
         let nonce = TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), nonce));
         let mut options = fs::OpenOptions::new();
@@ -250,7 +309,9 @@ impl JumpManager {
             file.sync_all()?;
             fs::rename(&temp, path)
         })();
-        if result.is_err() { let _ = fs::remove_file(&temp); }
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
         result
     }
 }
@@ -260,9 +321,12 @@ mod tests {
     use super::*;
 
     fn place(file: &str, row: usize, col: usize) -> Location {
-        Location { path: std::env::temp_dir().join(file), row, col }
+        Location {
+            path: std::env::temp_dir().join(file),
+            row,
+            col,
+        }
     }
-
 
     #[test]
     fn global_changes_can_be_navigated_across_closed_buffers() {
@@ -271,10 +335,16 @@ mod tests {
         store.record_change(place("second.rs", 12, 4)).unwrap();
         store.record_change(place("third.md", 8, 3)).unwrap();
         assert_eq!(store.older_change().unwrap(), Some(place("third.md", 8, 3)));
-        assert_eq!(store.older_change().unwrap(), Some(place("second.rs", 12, 4)));
+        assert_eq!(
+            store.older_change().unwrap(),
+            Some(place("second.rs", 12, 4))
+        );
         assert_eq!(store.older_change().unwrap(), Some(place("first.rs", 2, 0)));
         assert_eq!(store.older_change().unwrap(), None);
-        assert_eq!(store.newer_change().unwrap(), Some(place("second.rs", 12, 4)));
+        assert_eq!(
+            store.newer_change().unwrap(),
+            Some(place("second.rs", 12, 4))
+        );
     }
 
     #[test]
@@ -290,7 +360,10 @@ mod tests {
         let mut store = JumpManager::memory_only();
         store.remember(place("one.rs", 10, 2)).unwrap();
         store.remember(place("two.rs", 30, 4)).unwrap();
-        assert_eq!(store.back(Some(place("two.rs", 30, 4))).unwrap(), Some(place("one.rs", 10, 2)));
+        assert_eq!(
+            store.back(Some(place("two.rs", 30, 4))).unwrap(),
+            Some(place("one.rs", 10, 2))
+        );
         assert_eq!(store.forward().unwrap(), Some(place("two.rs", 30, 4)));
         assert_eq!(store.forward().unwrap(), None);
     }
@@ -316,14 +389,19 @@ mod tests {
     fn captures_live_origin_then_uses_forward_history() {
         let mut store = JumpManager::memory_only();
         store.remember(place("one.rs", 10, 2)).unwrap();
-        assert_eq!(store.back(Some(place("two.rs", 40, 1))).unwrap(), Some(place("one.rs", 10, 2)));
+        assert_eq!(
+            store.back(Some(place("two.rs", 40, 1))).unwrap(),
+            Some(place("one.rs", 10, 2))
+        );
         assert_eq!(store.forward().unwrap(), Some(place("two.rs", 40, 1)));
     }
 
     #[test]
     fn editing_after_backward_jump_truncates_forward_history() {
         let mut store = JumpManager::memory_only();
-        for row in [1, 12, 22] { store.remember(place("main.rs", row, 0)).unwrap(); }
+        for row in [1, 12, 22] {
+            store.remember(place("main.rs", row, 0)).unwrap();
+        }
         assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 12, 0)));
         store.remember(place("other.rs", 5, 0)).unwrap();
         assert_eq!(store.forward().unwrap(), None);
@@ -333,13 +411,17 @@ mod tests {
     #[test]
     fn new_jump_from_exact_history_entry_discards_future_and_keeps_origin() {
         let mut store = JumpManager::memory_only();
-        for row in [1, 12, 22] { store.remember(place("main.rs", row, 0)).unwrap(); }
+        for row in [1, 12, 22] {
+            store.remember(place("main.rs", row, 0)).unwrap();
+        }
         assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 12, 0)));
         store.remember(place("main.rs", 12, 0)).unwrap();
         assert_eq!(store.entries().len(), 2);
         assert!(!store.can_forward());
-        assert_eq!(store.back(Some(place("target.rs", 4, 2))).unwrap(),
-            Some(place("main.rs", 12, 0)));
+        assert_eq!(
+            store.back(Some(place("target.rs", 4, 2))).unwrap(),
+            Some(place("main.rs", 12, 0))
+        );
         assert_eq!(store.forward().unwrap(), Some(place("target.rs", 4, 2)));
     }
 
@@ -348,8 +430,10 @@ mod tests {
         let mut store = JumpManager::memory_only();
         store.remember(place("main.rs", 8, 1)).unwrap();
         store.remember(place("main.rs", 8, 30)).unwrap();
-        assert_eq!(store.back(Some(place("main.rs", 8, 50))).unwrap(),
-            Some(place("main.rs", 8, 30)));
+        assert_eq!(
+            store.back(Some(place("main.rs", 8, 50))).unwrap(),
+            Some(place("main.rs", 8, 30))
+        );
         assert_eq!(store.back(None).unwrap(), Some(place("main.rs", 8, 1)));
         assert_eq!(store.forward().unwrap(), Some(place("main.rs", 8, 30)));
         assert_eq!(store.forward().unwrap(), Some(place("main.rs", 8, 50)));
@@ -358,7 +442,8 @@ mod tests {
     #[test]
     fn traversal_does_not_rewrite_persisted_history() {
         let file = std::env::temp_dir().join(format!(
-            "remacs-jump-traversal-{}-{}.json", std::process::id(),
+            "remacs-jump-traversal-{}-{}.json",
+            std::process::id(),
             TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let mut store = JumpManager::from_path(file.clone());
@@ -387,7 +472,8 @@ mod tests {
     #[test]
     fn loading_oversized_history_keeps_the_newest_locations() {
         let file = std::env::temp_dir().join(format!(
-            "remacs-jump-bounds-{}-{}.json", std::process::id(),
+            "remacs-jump-bounds-{}-{}.json",
+            std::process::id(),
             TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let saved = Saved {
@@ -409,7 +495,10 @@ mod tests {
         store.remember(place("lib.rs", 8, 1)).unwrap();
         store.remember(place("lib.rs", 8, 8)).unwrap();
         store.remember(place("lib.rs", 8, 8)).unwrap();
-        assert_eq!(store.entries(), &[place("lib.rs", 8, 1), place("lib.rs", 8, 8)]);
+        assert_eq!(
+            store.entries(),
+            &[place("lib.rs", 8, 1), place("lib.rs", 8, 8)]
+        );
     }
 
     #[test]
@@ -418,20 +507,25 @@ mod tests {
         let source = place("one.rs", 10, 2);
         store.set_mark('a', source.clone()).unwrap();
         store.set_mark('A', source.clone()).unwrap();
-        assert_eq!(store.mark('a', &place("one.rs", 1, 0).path), Some(source.clone()));
+        assert_eq!(
+            store.mark('a', &place("one.rs", 1, 0).path),
+            Some(source.clone())
+        );
         assert_eq!(store.mark('a', &place("two.rs", 1, 0).path), None);
         assert_eq!(store.mark('A', &place("two.rs", 1, 0).path), Some(source));
     }
-
 
     #[cfg(unix)]
     #[test]
     fn state_save_never_chmods_existing_parent_directory() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
-            "remacs-state-perms-{}-{}", std::process::id(),
+            "remacs-state-perms-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -439,7 +533,10 @@ mod tests {
         let mut store = JumpManager::from_path(path.clone());
         store.remember(place("one.rs", 1, 0)).unwrap();
         let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "existing directory permissions must be preserved");
+        assert_eq!(
+            mode, 0o755,
+            "existing directory permissions must be preserved"
+        );
         let file_mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "state file should be private");
         fs::remove_dir_all(root).unwrap();
@@ -448,8 +545,12 @@ mod tests {
     #[test]
     fn disk_state_restores_closed_file_locations_and_marks() {
         let file = std::env::temp_dir().join(format!(
-            "remacs-jumps-test-{}-{}.json", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            "remacs-jumps-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         {
             let mut store = JumpManager::from_path(file.clone());
@@ -460,8 +561,10 @@ mod tests {
         let mut restored = JumpManager::from_path(file.clone());
         assert_eq!(restored.entries().len(), 2);
         assert_eq!(restored.back(None).unwrap(), Some(place("main.rs", 22, 5)));
-        assert_eq!(restored.mark('A', &place("document.rs", 0, 0).path),
-            Some(place("main.rs", 22, 5)));
+        assert_eq!(
+            restored.mark('A', &place("document.rs", 0, 0).path),
+            Some(place("main.rs", 22, 5))
+        );
         let _ = fs::remove_file(file);
     }
 
@@ -476,7 +579,9 @@ mod tests {
     #[test]
     fn long_jumplist_is_bounded() {
         let mut store = JumpManager::memory_only();
-        for row in 0..350 { store.remember(place("main.rs", row, 0)).unwrap(); }
+        for row in 0..350 {
+            store.remember(place("main.rs", row, 0)).unwrap();
+        }
         assert_eq!(store.entries().len(), MAX_JUMPS);
         assert_eq!(store.entries().first().unwrap().row, 150);
     }

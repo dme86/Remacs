@@ -17,20 +17,25 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     io::{self, Write},
-    time::Duration,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use clipboard::Clipboard;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use clipboard::Clipboard;
 use document::Document;
-use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
+use finder_ui::{
+    rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind,
+};
 use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
 use lsp::{Event as LspEvent, Manager as LspManager, RequestKind};
@@ -38,20 +43,42 @@ use lsp_plugin::LspPlugin;
 use mason::{Event as MasonEvent, Manager as MasonManager};
 use mason_plugin::MasonPlugin;
 use plugins::{FinderView, TreeAction, TreePlugin};
-use popup_terminal::{popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession};
-use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
+use popup_terminal::{
+    popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession,
+};
 use syntax::{Span, SyntaxEngine};
+use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TAB_WIDTH: usize = 4;
 const MAX_UNDO: usize = 100;
 const MAX_UNDO_BYTES: usize = 32 * 1024 * 1024; // per-buffer snapshot budget
-// Subtle current-line tint. The normal terminal background is unchanged.
-const CURRENT_LINE_BG: Color = Color::Rgb { r: 49, g: 50, b: 57 };
-const GUTTER_BG: Color = Color::Rgb { r: 35, g: 36, b: 42 };
-const GUTTER_FG: Color = Color::Rgb { r: 116, g: 119, b: 132 };
-const CURRENT_NUMBER_FG: Color = Color::Rgb { r: 223, g: 211, b: 255 };
-const VISUAL_SELECTION_BG: Color = Color::Rgb { r: 83, g: 69, b: 111 };
+                                                // Subtle current-line tint. The normal terminal background is unchanged.
+const CURRENT_LINE_BG: Color = Color::Rgb {
+    r: 49,
+    g: 50,
+    b: 57,
+};
+const GUTTER_BG: Color = Color::Rgb {
+    r: 35,
+    g: 36,
+    b: 42,
+};
+const GUTTER_FG: Color = Color::Rgb {
+    r: 116,
+    g: 119,
+    b: 132,
+};
+const CURRENT_NUMBER_FG: Color = Color::Rgb {
+    r: 223,
+    g: 211,
+    b: 255,
+};
+const VISUAL_SELECTION_BG: Color = Color::Rgb {
+    r: 83,
+    g: 69,
+    b: 111,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -98,10 +125,12 @@ struct Snapshot {
 impl Snapshot {
     fn capture(doc: &Document) -> Self {
         let lines = doc.lines.clone();
-        let bytes = lines.iter().map(|line| {
-            std::mem::size_of::<Vec<char>>()
-                + line.capacity() * std::mem::size_of::<char>()
-        }).sum();
+        let bytes = lines
+            .iter()
+            .map(|line| {
+                std::mem::size_of::<Vec<char>>() + line.capacity() * std::mem::size_of::<char>()
+            })
+            .sum();
         Self {
             lines,
             row: doc.row,
@@ -170,7 +199,6 @@ struct PaintedLine {
     selected: Option<(usize, usize)>,
 }
 
-
 /// Inactive buffers retain their unsaved content and independent undo/redo,
 /// cursor and scroll state. Switching moves ownership without cloning text.
 struct StoredBuffer {
@@ -191,7 +219,10 @@ struct BufferPicker {
 // is needed: a buffer picker typically only contains a handful of entries.
 fn matches_buffer(label: &str, query: &str) -> bool {
     let mut letters = label.to_lowercase().chars().collect::<Vec<_>>().into_iter();
-    query.to_lowercase().chars().all(|wanted| letters.by_ref().any(|actual| actual == wanted))
+    query
+        .to_lowercase()
+        .chars()
+        .all(|wanted| letters.by_ref().any(|actual| actual == wanted))
 }
 
 fn normalize_pasted_text(text: &str) -> String {
@@ -205,10 +236,13 @@ fn path_identity(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     };
     // Normalise the parent even for a newly created, not-yet-existing file.
-    absolute.parent()
+    absolute
+        .parent()
         .and_then(|parent| std::fs::canonicalize(parent).ok())
         .and_then(|parent| absolute.file_name().map(|file| parent.join(file)))
         .unwrap_or(absolute)
@@ -255,8 +289,7 @@ impl Editor {
     fn new(doc: Document) -> Self {
         let syntax = SyntaxEngine::new(&doc);
         let mason_plugin = MasonPlugin::new().expect("bundled plugins/mason.lua");
-        let mut mason = MasonManager::new(&mason_plugin)
-            .expect("valid Mason Lua catalog");
+        let mut mason = MasonManager::new(&mason_plugin).expect("valid Mason Lua catalog");
         if !cfg!(test) {
             // No network activity unless expressly enabled in mason.lua.
             let _ = mason.auto_queue(&mason_plugin);
@@ -328,7 +361,12 @@ impl Editor {
             }
         };
         match action {
-            TerminalAction::Open { kind, command, cwd, title } => {
+            TerminalAction::Open {
+                kind,
+                command,
+                cwd,
+                title,
+            } => {
                 let (cols, rows) = terminal::size().unwrap_or((100, 35));
                 let Some(rect) = terminal_rect(cols, rows.saturating_sub(2) as usize) else {
                     let _ = self.toggleterm.exited(&kind);
@@ -367,7 +405,7 @@ impl Editor {
         for (kind, session) in &mut self.terminals {
             match session.poll() {
                 Ok(true) => ended.push(kind.clone()),
-                Ok(false) => {},
+                Ok(false) => {}
                 Err(error) => {
                     self.message = format!("Terminal process error: {error}");
                     ended.push(kind.clone());
@@ -406,10 +444,18 @@ impl Editor {
                 return;
             }
         };
-        match self.lsp.request(&config, path, self.doc.revision,
-            self.doc.row, self.doc.col, kind) {
+        match self.lsp.request(
+            &config,
+            path,
+            self.doc.revision,
+            self.doc.row,
+            self.doc.col,
+            kind,
+        ) {
             Ok(true) => self.message = format!("{}: {action} requested", config.language),
-            Ok(false) => self.message = format!("{} LSP unavailable; check rust-analyzer", config.language),
+            Ok(false) => {
+                self.message = format!("{} LSP unavailable; check rust-analyzer", config.language)
+            }
             Err(error) => self.message = format!("Cannot start {} LSP: {error}", config.language),
         }
     }
@@ -428,12 +474,17 @@ impl Editor {
             return;
         }
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let docs = std::iter::once(&self.doc)
-            .chain(self.slots.iter().filter_map(|entry| entry.as_ref().map(|b| &b.doc)));
+        let docs = std::iter::once(&self.doc).chain(
+            self.slots
+                .iter()
+                .filter_map(|entry| entry.as_ref().map(|b| &b.doc)),
+        );
         let mut present = HashSet::new();
         let mut synced = true;
         for doc in docs {
-            let Some(path) = doc.path.as_ref() else { continue };
+            let Some(path) = doc.path.as_ref() else {
+                continue;
+            };
             present.insert(lsp::absolute(path));
             let config = match self.lsp_plugin.server_for(path, &cwd) {
                 Ok(Some(config)) => config,
@@ -444,7 +495,10 @@ impl Editor {
                     continue;
                 }
             };
-            if let Err(error) = self.lsp.sync(&config, path, doc.revision, ||doc.lsp_text()) {
+            if let Err(error) = self
+                .lsp
+                .sync(&config, path, doc.revision, || doc.lsp_text())
+            {
                 self.message = format!("{} LSP: {error}", config.language);
                 synced = false;
             }
@@ -453,59 +507,99 @@ impl Editor {
         self.lsp_present = present;
         // A starting server has not received didOpen yet. Retry after its
         // initialize response even when no text has changed in the meantime.
-        self.lsp_document_versions = (synced && !self.lsp.has_starting_servers())
-            .then_some(versions);
+        self.lsp_document_versions =
+            (synced && !self.lsp.has_starting_servers()).then_some(versions);
     }
 
     fn apply_lsp_definition(&mut self, target: lsp::Target) {
         // LSP coordinates are UTF-16 code units (or negotiated UTF-8/32).
         // Remacs stores Unicode scalar indices in Vec<char>.
-        let line_in_buffer = if self.doc.path.as_ref().is_some_and(|p|
-            lsp::absolute(p) == lsp::absolute(&target.path)) {
+        let line_in_buffer = if self
+            .doc
+            .path
+            .as_ref()
+            .is_some_and(|p| lsp::absolute(p) == lsp::absolute(&target.path))
+        {
             self.doc.lines.get(target.row)
         } else {
-            self.slots.iter().flatten()
-                .find(|entry| entry.doc.path.as_ref().is_some_and(|path|
-                    lsp::absolute(path) == lsp::absolute(&target.path)))
+            self.slots
+                .iter()
+                .flatten()
+                .find(|entry| {
+                    entry
+                        .doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| lsp::absolute(path) == lsp::absolute(&target.path))
+                })
                 .and_then(|entry| entry.doc.lines.get(target.row))
         };
         let col = if let Some(line) = line_in_buffer {
             lsp::char_index(line, target.character, target.encoding)
         } else {
-            std::fs::read_to_string(&target.path).ok()
-                .and_then(|text| text.split('\n').nth(target.row)
-                    .map(|line| line.trim_end_matches('\r').chars().collect::<Vec<_>>()))
+            std::fs::read_to_string(&target.path)
+                .ok()
+                .and_then(|text| {
+                    text.split('\n')
+                        .nth(target.row)
+                        .map(|line| line.trim_end_matches('\r').chars().collect::<Vec<_>>())
+                })
                 .map(|line| lsp::char_index(&line, target.character, target.encoding))
                 .unwrap_or(target.character)
         };
         self.record_current_jump();
-        self.visit_location(Location {
-            path: target.path,
-            row: target.row,
-            col,
-        }, false);
+        self.visit_location(
+            Location {
+                path: target.path,
+                row: target.row,
+                col,
+            },
+            false,
+        );
     }
 
     fn poll_lsp(&mut self) {
         for event in self.lsp.poll() {
             match event {
                 LspEvent::Status(text) => self.message = text,
-                LspEvent::Definition { origin, revision, cursor, target } => {
-                    let still_current = self.doc.path.as_ref().is_some_and(|path|
-                        lsp::absolute(path) == origin) && self.doc.revision == revision
+                LspEvent::Definition {
+                    origin,
+                    revision,
+                    cursor,
+                    target,
+                } => {
+                    let still_current = self
+                        .doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| lsp::absolute(path) == origin)
+                        && self.doc.revision == revision
                         && (self.doc.row, self.doc.col) == cursor;
-                    if !still_current { continue; }
+                    if !still_current {
+                        continue;
+                    }
                     if let Some(target) = target {
                         self.apply_lsp_definition(target);
                     } else {
                         self.message = "No definition found".into();
                     }
                 }
-                LspEvent::Hover { origin, revision, cursor, text } => {
-                    let still_current = self.doc.path.as_ref().is_some_and(|path|
-                        lsp::absolute(path) == origin) && self.doc.revision == revision
+                LspEvent::Hover {
+                    origin,
+                    revision,
+                    cursor,
+                    text,
+                } => {
+                    let still_current = self
+                        .doc
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| lsp::absolute(path) == origin)
+                        && self.doc.revision == revision
                         && (self.doc.row, self.doc.col) == cursor;
-                    if !still_current { continue; }
+                    if !still_current {
+                        continue;
+                    }
                     if let Some(text) = text {
                         self.hover_popup = Some(text);
                     } else {
@@ -519,7 +613,11 @@ impl Editor {
 
     fn hover_view(&self) -> Option<FinderView> {
         let content = self.hover_popup.as_ref()?;
-        let matches = content.lines().take(150).map(str::to_owned).collect::<Vec<_>>();
+        let matches = content
+            .lines()
+            .take(150)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         Some(FinderView {
             query: String::new(),
             selected: 0,
@@ -534,7 +632,8 @@ impl Editor {
         self.buffer_picker = None;
         self.hover_popup = None;
         self.sequence = Sequence::None;
-        self.message = "Mason: Enter install · Ctrl+U update · Ctrl+S sync · Ctrl+R update all".into();
+        self.message =
+            "Mason: Enter install · Ctrl+U update · Ctrl+S sync · Ctrl+R update all".into();
     }
 
     fn mason_view(&self) -> Option<FinderView> {
@@ -544,27 +643,35 @@ impl Editor {
         Some(FinderView {
             query: picker.query.clone(),
             matches: entries.into_iter().map(|(_, display)| display).collect(),
-            selected: if total == 0 { 0 }
-                else { picker.selected.min(total.saturating_sub(1)) + 1 },
+            selected: if total == 0 {
+                0
+            } else {
+                picker.selected.min(total.saturating_sub(1)) + 1
+            },
             total_matches: total,
             scanned: self.mason.tools().len(),
         })
     }
 
     fn mason_picker_key(&mut self, key: KeyEvent) {
-        let Some(picker) = self.mason_picker.as_ref() else { return; };
+        let Some(picker) = self.mason_picker.as_ref() else {
+            return;
+        };
         let entries = self.mason.entries(&picker.query);
         let selected = entries.get(picker.selected).map(|(id, _)| id.clone());
         let count = entries.len();
         match key.code {
             KeyCode::Esc => self.mason_picker = None,
-            KeyCode::Enter => if let Some(id) = selected {
-                self.message = self.mason.queue(&id, false).unwrap_or_else(|error| error);
-            },
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            KeyCode::Enter => {
+                if let Some(id) = selected {
+                    self.message = self.mason.queue(&id, false).unwrap_or_else(|error| error);
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(id) = selected {
                     self.message = self.mason.queue(&id, true).unwrap_or_else(|error| error);
-                },
+                }
+            }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let n = self.mason.queue_all(false);
                 self.message = format!("Mason queued {n} missing servers");
@@ -573,29 +680,40 @@ impl Editor {
                 let n = self.mason.queue_all(true);
                 self.message = format!("Mason queued {n} server updates");
             }
-            KeyCode::Down | KeyCode::Tab => if let Some(picker) = &mut self.mason_picker {
-                picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
-            },
-            KeyCode::Up | KeyCode::BackTab => if let Some(picker) = &mut self.mason_picker {
-                picker.selected = picker.selected.saturating_sub(1);
-            },
-            KeyCode::Backspace => if let Some(picker) = &mut self.mason_picker {
-                picker.query.pop();
-                picker.selected = 0;
-            },
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(picker) = &mut self.mason_picker {
+                    picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(picker) = &mut self.mason_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = &mut self.mason_picker {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(picker) = &mut self.mason_picker {
                     picker.query.clear();
                     picker.selected = 0;
-                },
-            KeyCode::Char(c) if !key.modifiers.intersects(
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            ) => if let Some(picker) = &mut self.mason_picker {
-                if picker.query.len() < 128 {
-                    picker.query.push(c);
-                    picker.selected = 0;
                 }
-            },
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = &mut self.mason_picker {
+                    if picker.query.len() < 128 {
+                        picker.query.push(c);
+                        picker.selected = 0;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -603,12 +721,18 @@ impl Editor {
     fn poll_mason(&mut self) {
         for event in self.mason.poll() {
             match event {
-                MasonEvent::Done { id, language, updated } => {
+                MasonEvent::Done {
+                    id,
+                    language,
+                    updated,
+                } => {
                     self.lsp_plugin.clear_cache();
                     self.lsp_document_versions = None;
                     self.lsp.reset_language(&language);
-                    self.message = format!("Mason {} {id}; LSP ready to restart",
-                        if updated { "updated" } else { "installed" });
+                    self.message = format!(
+                        "Mason {} {id}; LSP ready to restart",
+                        if updated { "updated" } else { "installed" }
+                    );
                 }
                 MasonEvent::Message(message) => self.message = message,
             }
@@ -616,16 +740,19 @@ impl Editor {
     }
 
     fn active_name(&self) -> String {
-        self.doc.path.as_ref()
+        self.doc
+            .path
+            .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "[No Name]".into())
     }
 
     fn buffer_name(doc: &Document) -> String {
-        doc.path.as_ref().map(|p| p.to_string_lossy().into_owned())
+        doc.path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "[No Name]".into())
     }
-
 
     fn current_location(&self) -> Option<Location> {
         self.doc.path.as_ref().map(|path| Location {
@@ -675,10 +802,16 @@ impl Editor {
             let index = self.slots.len();
             self.slots.push(None);
             self.last_slot = Some(previous);
-            self.activate(StoredBuffer {
-                doc: next, undo: Vec::new(), redo: Vec::new(),
-                scroll_row: 0, scroll_col: 0,
-            }, index);
+            self.activate(
+                StoredBuffer {
+                    doc: next,
+                    undo: Vec::new(),
+                    redo: Vec::new(),
+                    scroll_row: 0,
+                    scroll_col: 0,
+                },
+                index,
+            );
             self.move_to_location(target, linewise);
             return true;
         };
@@ -703,9 +836,15 @@ impl Editor {
         self.visual_anchor = None;
         self.sequence = Sequence::None;
         self.return_to_editor_after_switch();
-        self.message = format!("Jump: {}:{}:{}",
-            self.doc.path.as_ref().map_or(String::new(), |p| p.display().to_string()),
-            self.doc.row + 1, self.doc.col + 1);
+        self.message = format!(
+            "Jump: {}:{}:{}",
+            self.doc
+                .path
+                .as_ref()
+                .map_or(String::new(), |p| p.display().to_string()),
+            self.doc.row + 1,
+            self.doc.col + 1
+        );
     }
 
     fn jump_back(&mut self) {
@@ -715,12 +854,16 @@ impl Editor {
         loop {
             match result {
                 Ok(Some(place)) => {
-                    if self.visit_location(place, false) { return; }
+                    if self.visit_location(place, false) {
+                        return;
+                    }
                     skipped = true;
                     result = self.jumps.back(None);
                 }
                 Ok(None) => {
-                    if !skipped { self.message = "At oldest jump".into(); }
+                    if !skipped {
+                        self.message = "At oldest jump".into();
+                    }
                     return;
                 }
                 Err(error) => {
@@ -736,11 +879,15 @@ impl Editor {
         loop {
             match self.jumps.forward() {
                 Ok(Some(place)) => {
-                    if self.visit_location(place, false) { return; }
+                    if self.visit_location(place, false) {
+                        return;
+                    }
                     skipped = true;
                 }
                 Ok(None) => {
-                    if !skipped { self.message = "At newest jump".into(); }
+                    if !skipped {
+                        self.message = "At newest jump".into();
+                    }
                     return;
                 }
                 Err(error) => {
@@ -762,11 +909,13 @@ impl Editor {
                 self.record_current_jump();
                 self.visit_location(place, false);
             }
-            Ok(None) => self.message = if older {
-                "No older edit location".into()
-            } else {
-                "No newer edit location".into()
-            },
+            Ok(None) => {
+                self.message = if older {
+                    "No older edit location".into()
+                } else {
+                    "No newer edit location".into()
+                }
+            }
             Err(error) => self.message = format!("Change history error: {error}"),
         }
     }
@@ -798,21 +947,40 @@ impl Editor {
 
     fn dirty_buffers(&self) -> usize {
         usize::from(self.doc.dirty)
-            + self.slots.iter().flatten().filter(|buffer| buffer.doc.dirty).count()
+            + self
+                .slots
+                .iter()
+                .flatten()
+                .filter(|buffer| buffer.doc.dirty)
+                .count()
     }
 
     fn named_slot(&self, path: &Path) -> Option<usize> {
         let target = path_identity(path);
-        if self.doc.path.as_ref().is_some_and(|p| path_identity(p) == target) {
+        if self
+            .doc
+            .path
+            .as_ref()
+            .is_some_and(|p| path_identity(p) == target)
+        {
             return Some(self.active_slot);
         }
-        self.slots.iter().position(|entry| entry.as_ref().is_some_and(|buffer| {
-            buffer.doc.path.as_ref().is_some_and(|path| path_identity(path) == target)
-        }))
+        self.slots.iter().position(|entry| {
+            entry.as_ref().is_some_and(|buffer| {
+                buffer
+                    .doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path_identity(path) == target)
+            })
+        })
     }
 
     fn set_path_and_save(&mut self, path: PathBuf) {
-        if self.named_slot(&path).is_some_and(|index| index != self.active_slot) {
+        if self
+            .named_slot(&path)
+            .is_some_and(|index| index != self.active_slot)
+        {
             self.message = "That file is already open in another buffer".into();
             return;
         }
@@ -857,10 +1025,17 @@ impl Editor {
         self.insert_changed = false;
         // Only visible text rows are invalidated; tree and terminal geometry
         // are unchanged, so there is no destructive whole-screen clear.
-        for line in &mut self.screen.lines { *line = None; }
+        for line in &mut self.screen.lines {
+            *line = None;
+        }
         self.screen.status = None;
         self.screen.origin = None;
-        self.message = format!("Buffer {}/{}: {}", index + 1, self.slots.len(), self.active_name());
+        self.message = format!(
+            "Buffer {}/{}: {}",
+            index + 1,
+            self.slots.len(),
+            self.active_name()
+        );
     }
 
     fn switch_buffer(&mut self, index: usize) {
@@ -871,9 +1046,15 @@ impl Editor {
         if index == self.active_slot || index >= self.slots.len() {
             return;
         }
-        if self.slots[index].is_none() { return; }
-        if record_jump { self.record_current_jump(); }
-        let Some(next) = self.slots[index].take() else { return; };
+        if self.slots[index].is_none() {
+            return;
+        }
+        if record_jump {
+            self.record_current_jump();
+        }
+        let Some(next) = self.slots[index].take() else {
+            return;
+        };
         let previous = self.active_slot;
         let current = self.take_current();
         self.slots[previous] = Some(current);
@@ -918,7 +1099,9 @@ impl Editor {
     fn open_buffer_picker(&mut self) {
         // Make the most recently visited buffer the initial selection.
         // Ctrl+P then Enter quickly jumps back without typing a filename.
-        let selected = self.last_slot.unwrap_or(self.active_slot)
+        let selected = self
+            .last_slot
+            .unwrap_or(self.active_slot)
             .min(self.slots.len().saturating_sub(1));
         self.buffer_picker = Some(BufferPicker {
             query: String::new(),
@@ -929,8 +1112,11 @@ impl Editor {
     }
 
     fn buffer_candidates(&self, query: &str) -> Vec<(usize, String)> {
-        let mut entries: Vec<(usize, String, bool)> = self.slots.iter()
-            .enumerate().filter_map(|(index, slot)| {
+        let mut entries: Vec<(usize, String, bool)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
                 let (doc, active) = if index == self.active_slot {
                     (&self.doc, true)
                 } else {
@@ -939,28 +1125,45 @@ impl Editor {
                 let name = Self::buffer_name(doc);
                 // Filename comes first so long absolute paths never hide
                 // the useful part of an entry in a narrower terminal.
-                let basename = doc.path.as_ref()
+                let basename = doc
+                    .path
+                    .as_ref()
                     .and_then(|path| path.file_name())
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "[No Name]".into());
                 let file_match = matches_buffer(&basename, query);
-                if !file_match && !matches_buffer(&name, query) { return None; }
-                let parent = doc.path.as_ref().and_then(|path| path.parent())
+                if !file_match && !matches_buffer(&name, query) {
+                    return None;
+                }
+                let parent = doc
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.parent())
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                Some((index, format!(
-                    "{} {}{}  {}  {}",
-                    if active { "▶" } else { " " },
-                    if doc.dirty { "● " } else { "  " },
-                    index + 1, basename, parent
-                ), file_match))
-            }).collect();
+                Some((
+                    index,
+                    format!(
+                        "{} {}{}  {}  {}",
+                        if active { "▶" } else { " " },
+                        if doc.dirty { "● " } else { "  " },
+                        index + 1,
+                        basename,
+                        parent
+                    ),
+                    file_match,
+                ))
+            })
+            .collect();
         // Filename hits take precedence over unrelated matches created by
         // combining characters across the absolute parent directory.
         if !query.is_empty() && entries.iter().any(|(_, _, file_match)| *file_match) {
             entries.retain(|(_, _, file_match)| *file_match);
         }
-        entries.into_iter().map(|(index, label, _)| (index, label)).collect()
+        entries
+            .into_iter()
+            .map(|(index, label, _)| (index, label))
+            .collect()
     }
 
     fn buffer_picker_view(&self) -> Option<FinderView> {
@@ -977,10 +1180,14 @@ impl Editor {
     }
 
     fn buffer_picker_key(&mut self, key: KeyEvent) {
-        let Some(picker) = self.buffer_picker.as_ref() else { return; };
+        let Some(picker) = self.buffer_picker.as_ref() else {
+            return;
+        };
         let count = self.buffer_candidates(&picker.query).len();
         match key.code {
-            KeyCode::Esc => { self.buffer_picker = None; }
+            KeyCode::Esc => {
+                self.buffer_picker = None;
+            }
             KeyCode::Enter => {
                 let results = self.buffer_candidates(&picker.query);
                 let index = results.get(picker.selected).map(|(index, _)| *index);
@@ -1012,7 +1219,11 @@ impl Editor {
                     picker.selected = 0;
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 if let Some(picker) = &mut self.buffer_picker {
                     if picker.query.len() < 128 {
                         picker.query.push(c);
@@ -1045,7 +1256,9 @@ impl Editor {
             self.mode = Mode::Normal;
             self.selection = None;
             self.visual_anchor = None;
-            for line in &mut self.screen.lines { *line = None; }
+            for line in &mut self.screen.lines {
+                *line = None;
+            }
             self.screen.status = None;
             self.message = "Empty buffer".into();
             return;
@@ -1067,8 +1280,7 @@ impl Editor {
         let next_bytes = snapshot.approx_bytes();
         let mut used = self.undo.iter().map(Snapshot::approx_bytes).sum::<usize>();
         while !self.undo.is_empty()
-            && (self.undo.len() >= MAX_UNDO
-                || used.saturating_add(next_bytes) > MAX_UNDO_BYTES)
+            && (self.undo.len() >= MAX_UNDO || used.saturating_add(next_bytes) > MAX_UNDO_BYTES)
         {
             used = used.saturating_sub(self.undo.remove(0).approx_bytes());
         }
@@ -1131,7 +1343,8 @@ impl Editor {
             if let Err(error) = tree.toggle() {
                 self.message = format!("Tree plugin error: {error}");
             } else if tree.visible {
-                self.message = "Tree: / or f fuzzy find  j/k move  Enter open  Tab/Esc editor".into();
+                self.message =
+                    "Tree: / or f fuzzy find  j/k move  Enter open  Tab/Esc editor".into();
             }
         }
         self.sequence = Sequence::None;
@@ -1139,8 +1352,13 @@ impl Editor {
 
     fn tree_key(&mut self, key: KeyEvent) {
         let name = match key.code {
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                c.to_string(),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                c.to_string()
+            }
             KeyCode::Enter => "enter".into(),
             KeyCode::Esc => "esc".into(),
             KeyCode::Tab => "tab".into(),
@@ -1165,17 +1383,26 @@ impl Editor {
         match action {
             TreeAction::None => {}
             TreeAction::Editor => {
-                if let Some(tree) = &mut self.tree { tree.leave(); }
+                if let Some(tree) = &mut self.tree {
+                    tree.leave();
+                }
             }
             TreeAction::Close => {
-                if let Some(tree) = &mut self.tree { tree.close(); }
+                if let Some(tree) = &mut self.tree {
+                    tree.close();
+                }
             }
             TreeAction::Open(path) => {
                 self.open(path.to_string_lossy().into_owned());
-                if self.doc.path.as_ref().is_some_and(|current| {
-                    path_identity(current) == path_identity(&path)
-                }) {
-                    if let Some(tree) = &mut self.tree { tree.leave(); }
+                if self
+                    .doc
+                    .path
+                    .as_ref()
+                    .is_some_and(|current| path_identity(current) == path_identity(&path))
+                {
+                    if let Some(tree) = &mut self.tree {
+                        tree.leave();
+                    }
                 }
             }
         }
@@ -1193,12 +1420,16 @@ impl Editor {
     }
 
     fn paste_value(&mut self, value: Register) {
-        if matches!(&value, Register::Text(text) if text.is_empty()) { return; }
+        if matches!(&value, Register::Text(text) if text.is_empty()) {
+            return;
+        }
         self.remember();
         match value {
             Register::Line(line) => self.doc.insert_line_below(line),
             Register::Text(text) => {
-                if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
+                if self.doc.col < self.doc.line().len() {
+                    self.doc.col += 1;
+                }
                 self.doc.insert_text(&normalize_pasted_text(&text));
                 self.doc.col = self.doc.col.saturating_sub(1);
             }
@@ -1211,7 +1442,9 @@ impl Editor {
     fn paste_clipboard(&mut self) {
         let value = match self.clipboard.read() {
             Ok(text) => {
-                if text.is_empty() { return; }
+                if text.is_empty() {
+                    return;
+                }
                 match self.register.as_ref() {
                     Some(register) if register.clipboard_text() == text => register.clone(),
                     _ => Register::Text(text),
@@ -1228,7 +1461,9 @@ impl Editor {
     /// Bracketed paste arrives as one event instead of a stream of hotkeys.
     /// In Insert mode this is one undoable edit, even with multiline Unicode.
     fn pasted(&mut self, text: &str) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         if let Ok(Some(active)) = self.toggleterm.active() {
             if let Some(session) = self.terminals.get_mut(&active) {
                 if let Err(error) = session.paste(text) {
@@ -1242,8 +1477,11 @@ impl Editor {
         if let Some(prompt) = &mut self.prompt {
             match prompt {
                 Prompt::Open(value) | Prompt::SaveAs(value) | Prompt::Command(value) => {
-                    value.extend(text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
-                        .filter(|ch| !ch.is_control()));
+                    value.extend(
+                        text.chars()
+                            .take_while(|ch| *ch != '\r' && *ch != '\n')
+                            .filter(|ch| !ch.is_control()),
+                    );
                 }
                 Prompt::Quit => {}
             }
@@ -1252,17 +1490,24 @@ impl Editor {
         if let Some(picker) = self.mason_picker.as_mut().or(self.buffer_picker.as_mut()) {
             let remaining = 128usize.saturating_sub(picker.query.len());
             let mut used = 0;
-            picker.query.extend(text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
-                .filter(|ch| !ch.is_control()).take_while(|ch| {
-                    used += ch.len_utf8();
-                    used <= remaining
-                }));
+            picker.query.extend(
+                text.chars()
+                    .take_while(|ch| *ch != '\r' && *ch != '\n')
+                    .filter(|ch| !ch.is_control())
+                    .take_while(|ch| {
+                        used += ch.len_utf8();
+                        used <= remaining
+                    }),
+            );
             picker.selected = 0;
             return;
         }
         if let Some(tree) = self.tree.as_ref().filter(|tree| tree.focused) {
-            let query: String = text.chars().take_while(|ch| *ch != '\r' && *ch != '\n')
-                .filter(|ch| !ch.is_control()).collect();
+            let query: String = text
+                .chars()
+                .take_while(|ch| *ch != '\r' && *ch != '\n')
+                .filter(|ch| !ch.is_control())
+                .collect();
             if let Err(error) = tree.paste_query(&query) {
                 self.message = format!("Tree paste: {error}");
             }
@@ -1302,22 +1547,36 @@ impl Editor {
 
     fn enter_visual(&mut self) {
         self.mode = Mode::Visual;
-        self.visual_anchor = Some(Position { row: self.doc.row, col: self.doc.col });
+        self.visual_anchor = Some(Position {
+            row: self.doc.row,
+            col: self.doc.col,
+        });
         self.update_visual_selection();
         self.message = "VISUAL: a f Function | y Yank | d Delete | Esc Cancel".into();
     }
 
     fn update_visual_selection(&mut self) {
-        let Some(anchor) = self.visual_anchor else { return };
-        let here = Position { row: self.doc.row, col: self.doc.col };
+        let Some(anchor) = self.visual_anchor else {
+            return;
+        };
+        let here = Position {
+            row: self.doc.row,
+            col: self.doc.col,
+        };
         let inclusive_end = |position: Position, doc: &Document| Position {
             row: position.row,
             col: (position.col + 1).min(doc.lines[position.row].len()),
         };
         self.selection = Some(if anchor <= here {
-            TextRange { start: anchor, end: inclusive_end(here, &self.doc) }
+            TextRange {
+                start: anchor,
+                end: inclusive_end(here, &self.doc),
+            }
         } else {
-            TextRange { start: here, end: inclusive_end(anchor, &self.doc) }
+            TextRange {
+                start: here,
+                end: inclusive_end(anchor, &self.doc),
+            }
         });
     }
 
@@ -1473,10 +1732,16 @@ impl Editor {
                 let index = self.slots.len();
                 self.slots.push(None);
                 self.last_slot = Some(previous);
-                self.activate(StoredBuffer {
-                    doc, undo: Vec::new(), redo: Vec::new(),
-                    scroll_row: 0, scroll_col: 0,
-                }, index);
+                self.activate(
+                    StoredBuffer {
+                        doc,
+                        undo: Vec::new(),
+                        redo: Vec::new(),
+                        scroll_row: 0,
+                        scroll_col: 0,
+                    },
+                    index,
+                );
             }
             Err(error) => self.message = format!("Open error: {error}"),
         }
@@ -1517,7 +1782,10 @@ impl Editor {
                 self.message = format!("Mason queued {count} server updates");
             }
             "mason log" => {
-                self.message = format!("Mason installation log: {}", self.mason.log_path().display());
+                self.message = format!(
+                    "Mason installation log: {}",
+                    self.mason.log_path().display()
+                );
             }
             value if value.starts_with("mason install ") => {
                 let id = value.trim_start_matches("mason install ").trim();
@@ -1533,12 +1801,18 @@ impl Editor {
             "b#" => self.last_buffer(),
             "bd" => self.close_buffer(false),
             "bd!" => self.close_buffer(true),
-            "jumps" => self.message = format!(
-                "{} jump locations (Ctrl+O older, Alt+Right newer)", self.jumps.entries().len()
-            ),
-            "changes" => self.message = format!(
-                "{} recent edits (g; older, g, newer)", self.jumps.changes().len()
-            ),
+            "jumps" => {
+                self.message = format!(
+                    "{} jump locations (Ctrl+O older, Alt+Right newer)",
+                    self.jumps.entries().len()
+                )
+            }
+            "changes" => {
+                self.message = format!(
+                    "{} recent edits (g; older, g, newer)",
+                    self.jumps.changes().len()
+                )
+            }
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
@@ -1556,13 +1830,15 @@ impl Editor {
                     self.set_path_and_save(PathBuf::from(name));
                 }
             }
-            "" => {},
+            "" => {}
             other => self.message = format!("Unknown command: {other}"),
         }
     }
 
     fn prompt_key(&mut self, key: KeyEvent) {
-        let Some(prompt) = self.prompt.take() else { return; };
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
         if key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
@@ -1584,7 +1860,9 @@ impl Editor {
                     self.prompt = Some(Prompt::SaveAs(name));
                 }
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     name.push(c);
                     self.prompt = Some(Prompt::SaveAs(name));
@@ -1598,7 +1876,9 @@ impl Editor {
                     self.prompt = Some(Prompt::Open(name));
                 }
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     name.push(c);
                     self.prompt = Some(Prompt::Open(name));
@@ -1612,7 +1892,9 @@ impl Editor {
                     self.prompt = Some(Prompt::Command(command));
                 }
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     command.push(c);
                     self.prompt = Some(Prompt::Command(command));
@@ -1628,9 +1910,10 @@ impl Editor {
         // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
         // the PTY; the session continues while hidden.
         if let Ok(Some(active)) = self.toggleterm.active() {
-            if shortcut.as_deref().is_some_and(|name| {
-                self.toggleterm.dismiss(name).unwrap_or(false)
-            }) {
+            if shortcut
+                .as_deref()
+                .is_some_and(|name| self.toggleterm.dismiss(name).unwrap_or(false))
+            {
                 let _ = self.toggleterm.hide();
                 return;
             }
@@ -1643,7 +1926,9 @@ impl Editor {
         }
         if self.hover_popup.is_some() {
             self.hover_popup = None;
-            if key.code == KeyCode::Esc { return; }
+            if key.code == KeyCode::Esc {
+                return;
+            }
         }
         if self.prompt.is_some() {
             self.prompt_key(key);
@@ -1682,17 +1967,35 @@ impl Editor {
         if self.mode == Mode::Normal {
             if key.modifiers == KeyModifiers::ALT {
                 match key.code {
-                    KeyCode::Char('j') => { self.cycle_buffer(true); return; }
-                    KeyCode::Char('k') => { self.cycle_buffer(false); return; }
-                    KeyCode::Left => { self.jump_back(); return; }
-                    KeyCode::Right => { self.jump_forward(); return; }
+                    KeyCode::Char('j') => {
+                        self.cycle_buffer(true);
+                        return;
+                    }
+                    KeyCode::Char('k') => {
+                        self.cycle_buffer(false);
+                        return;
+                    }
+                    KeyCode::Left => {
+                        self.jump_back();
+                        return;
+                    }
+                    KeyCode::Right => {
+                        self.jump_forward();
+                        return;
+                    }
                     _ => {}
                 }
             }
             if key.modifiers == KeyModifiers::CONTROL {
                 match key.code {
-                    KeyCode::PageDown => { self.cycle_buffer(true); return; }
-                    KeyCode::PageUp => { self.cycle_buffer(false); return; }
+                    KeyCode::PageDown => {
+                        self.cycle_buffer(true);
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        self.cycle_buffer(false);
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -1722,8 +2025,10 @@ impl Editor {
             self.jump_forward();
             return;
         }
-        if self.mode == Mode::Normal && key.code == KeyCode::Tab
-            && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self.mode == Mode::Normal
+            && key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             if let Some(tree) = &mut self.tree {
                 if tree.visible {
                     tree.focus();
@@ -1732,8 +2037,11 @@ impl Editor {
             }
         }
         if key.code == KeyCode::Esc {
-            if self.mode == Mode::Insert { self.leave_insert(); }
-            else if self.mode == Mode::Visual { self.leave_visual(); }
+            if self.mode == Mode::Insert {
+                self.leave_insert();
+            } else if self.mode == Mode::Visual {
+                self.leave_visual();
+            }
             self.sequence = Sequence::None;
             self.control_x = false;
             self.count = None;
@@ -1754,12 +2062,18 @@ impl Editor {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('x') => self.control_x = true,
-                KeyCode::Char('g') => { self.sequence = Sequence::None; self.count = None; self.message = "Cancelled".into(); }
+                KeyCode::Char('g') => {
+                    self.sequence = Sequence::None;
+                    self.count = None;
+                    self.message = "Cancelled".into();
+                }
                 KeyCode::Char('r') if self.mode == Mode::Normal => self.redo(),
                 KeyCode::Char('o') if self.mode == Mode::Normal => self.jump_back(),
-                KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => self.jump_forward(),
+                KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => {
+                    self.jump_forward()
+                }
                 KeyCode::Char('v') if self.mode == Mode::Normal => self.page_down(page_height),
-                _ => {},
+                _ => {}
             }
             return;
         }
@@ -1779,14 +2093,27 @@ impl Editor {
                 KeyCode::End => self.doc.end(),
                 KeyCode::Backspace => {
                     if self.doc.col > 0 || self.doc.row > 0 {
-                        self.insert_change(); self.doc.backspace();
+                        self.insert_change();
+                        self.doc.backspace();
                     }
                 }
-                KeyCode::Delete => { self.insert_change(); self.doc.delete(); }
-                KeyCode::Enter => { self.insert_change(); self.doc.insert('\n'); }
-                KeyCode::Tab => { self.insert_change(); self.doc.insert('\t'); }
-                KeyCode::Char(c) => { self.insert_change(); self.doc.insert(c); }
-                _ => {},
+                KeyCode::Delete => {
+                    self.insert_change();
+                    self.doc.delete();
+                }
+                KeyCode::Enter => {
+                    self.insert_change();
+                    self.doc.insert('\n');
+                }
+                KeyCode::Tab => {
+                    self.insert_change();
+                    self.doc.insert('\t');
+                }
+                KeyCode::Char(c) => {
+                    self.insert_change();
+                    self.doc.insert(c);
+                }
+                _ => {}
             }
             return;
         }
@@ -1838,7 +2165,9 @@ impl Editor {
                 (Sequence::Buffer, KeyCode::Char('s')) => self.save_all(),
                 (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
-                (Sequence::File, KeyCode::Char('f')) => self.prompt = Some(Prompt::Open(String::new())),
+                (Sequence::File, KeyCode::Char('f')) => {
+                    self.prompt = Some(Prompt::Open(String::new()))
+                }
                 (Sequence::File, KeyCode::Char('s')) => self.save(),
                 (Sequence::Quit, KeyCode::Char('q')) => self.quit(),
                 (Sequence::Delete, KeyCode::Char('d')) => {
@@ -1851,7 +2180,10 @@ impl Editor {
                 }
                 (Sequence::Go, KeyCode::Char('g')) => {
                     self.record_current_jump();
-                    self.doc.row = count.unwrap_or(1).saturating_sub(1).min(self.doc.lines.len() - 1);
+                    self.doc.row = count
+                        .unwrap_or(1)
+                        .saturating_sub(1)
+                        .min(self.doc.lines.len() - 1);
                     self.doc.home();
                 }
                 (Sequence::Go, KeyCode::Char(';')) => self.jump_to_change(true),
@@ -1868,7 +2200,8 @@ impl Editor {
         if let KeyCode::Char(digit @ '0'..='9') = key.code {
             if digit != '0' || self.count.is_some() {
                 self.count = Some(
-                    self.count.unwrap_or(0)
+                    self.count
+                        .unwrap_or(0)
                         .saturating_mul(10)
                         .saturating_add((digit as u8 - b'0') as usize),
                 );
@@ -1882,11 +2215,19 @@ impl Editor {
             KeyCode::Char('v') => self.enter_visual(),
             KeyCode::Char('i') => self.begin_insert(),
             KeyCode::Char('a') => {
-                if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
+                if self.doc.col < self.doc.line().len() {
+                    self.doc.col += 1;
+                }
                 self.begin_insert();
             }
-            KeyCode::Char('I') => { self.doc.home(); self.begin_insert(); }
-            KeyCode::Char('A') => { self.doc.end(); self.begin_insert(); }
+            KeyCode::Char('I') => {
+                self.doc.home();
+                self.begin_insert();
+            }
+            KeyCode::Char('A') => {
+                self.doc.end();
+                self.begin_insert();
+            }
             KeyCode::Char('o') => {
                 self.remember();
                 self.doc.insert_line_below(Vec::new());
@@ -1903,45 +2244,58 @@ impl Editor {
                 self.doc.col = self.doc.col.saturating_sub(count);
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                if !self.doc.line().is_empty() { self.doc.col = self.doc.col.saturating_add(count).min(self.doc.line().len() - 1); }
+                if !self.doc.line().is_empty() {
+                    self.doc.col = self
+                        .doc
+                        .col
+                        .saturating_add(count)
+                        .min(self.doc.line().len() - 1);
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.doc.row = self.doc.row.saturating_add(count).min(self.doc.lines.len() - 1);
+                self.doc.row = self
+                    .doc
+                    .row
+                    .saturating_add(count)
+                    .min(self.doc.lines.len() - 1);
                 self.doc.col = self.doc.col.min(self.doc.line().len());
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.doc.row = self.doc.row.saturating_sub(count);
                 self.doc.col = self.doc.col.min(self.doc.line().len());
-            },
+            }
             KeyCode::Char('0') | KeyCode::Home => self.doc.home(),
             KeyCode::Char('$') | KeyCode::End => {
                 self.doc.end();
                 self.doc.col = self.doc.col.saturating_sub(1);
             }
             KeyCode::Char('w') => {
-                for _ in 0..count.min(100_000) { self.doc.word_forward(); }
+                for _ in 0..count.min(100_000) {
+                    self.doc.word_forward();
+                }
             }
             KeyCode::Char('b') => {
-                for _ in 0..count.min(100_000) { self.doc.word_backward(); }
+                for _ in 0..count.min(100_000) {
+                    self.doc.word_backward();
+                }
             }
             KeyCode::Char('g') => {
                 self.count = explicit_count;
                 self.sequence = Sequence::Go;
-            },
+            }
             KeyCode::Char('K') => {
                 if let Ok(Some(action)) = self.lsp_plugin.binding("K") {
                     self.lsp_action(&action);
                 }
-            },
+            }
             KeyCode::Char('m') => self.sequence = Sequence::MarkSet,
             KeyCode::Char('\'') => self.sequence = Sequence::MarkLine,
             KeyCode::Char('`') => self.sequence = Sequence::MarkExact,
             KeyCode::Char('G') => {
                 self.record_current_jump();
-                self.doc.row = explicit_count.map_or(
-                    self.doc.lines.len() - 1,
-                    |line| line.saturating_sub(1).min(self.doc.lines.len() - 1),
-                );
+                self.doc.row = explicit_count.map_or(self.doc.lines.len() - 1, |line| {
+                    line.saturating_sub(1).min(self.doc.lines.len() - 1)
+                });
                 self.doc.home();
             }
             KeyCode::Char('d') => self.sequence = Sequence::Delete,
@@ -1959,26 +2313,34 @@ impl Editor {
             KeyCode::Char(':') => self.prompt = Some(Prompt::Command(String::new())),
             KeyCode::PageDown => self.page_down(page_height),
             KeyCode::PageUp => self.page_up(page_height),
-            _ => {},
+            _ => {}
         }
     }
 
     fn page_down(&mut self, height: usize) {
         self.record_current_jump();
-        for _ in 0..height.max(1) { self.doc.down(); }
+        for _ in 0..height.max(1) {
+            self.doc.down();
+        }
     }
     fn page_up(&mut self, height: usize) {
         self.record_current_jump();
-        for _ in 0..height.max(1) { self.doc.up(); }
+        for _ in 0..height.max(1) {
+            self.doc.up();
+        }
     }
 
     fn ensure_visible(&mut self, width: usize, height: usize) {
-        if self.doc.row < self.scroll_row { self.scroll_row = self.doc.row; }
+        if self.doc.row < self.scroll_row {
+            self.scroll_row = self.doc.row;
+        }
         if height > 0 && self.doc.row >= self.scroll_row + height {
             self.scroll_row = self.doc.row - height + 1;
         }
         let column = visual_column(&self.doc.line()[..self.doc.col]);
-        if column < self.scroll_col { self.scroll_col = column; }
+        if column < self.scroll_col {
+            self.scroll_col = column;
+        }
         if width > 0 && column >= self.scroll_col + width {
             self.scroll_col = column - width + 1;
         }
@@ -2001,7 +2363,8 @@ impl Editor {
 
         let width = cols as usize;
         let height = rows.saturating_sub(2) as usize;
-        let sidebar_width = tree_sidebar_width(width, self.tree.as_ref().is_some_and(|tree| tree.visible));
+        let sidebar_width =
+            tree_sidebar_width(width, self.tree.as_ref().is_some_and(|tree| tree.visible));
         let editor_width = width - sidebar_width;
         let gutter_width = gutter_width(editor_width, self.doc.lines.len());
         let text_width = editor_width - gutter_width;
@@ -2021,7 +2384,11 @@ impl Editor {
         }
         self.screen.lines.resize_with(height, || None);
 
-        let tree_view = match self.tree.as_ref().map(|tree| tree.view(height.saturating_sub(1))) {
+        let tree_view = match self
+            .tree
+            .as_ref()
+            .map(|tree| tree.view(height.saturating_sub(1)))
+        {
             Some(Ok(view)) => Some(view),
             Some(Err(error)) => {
                 self.message = format!("Tree render error: {error}");
@@ -2032,9 +2399,13 @@ impl Editor {
         let buffer_view = self.buffer_picker_view();
         let mason_view = self.mason_view();
         let hover_view = self.hover_view();
-        let finder_rect = if buffer_view.is_some() || mason_view.is_some()
+        let finder_rect = if buffer_view.is_some()
+            || mason_view.is_some()
             || hover_view.is_some()
-            || tree_view.as_ref().and_then(|view| view.finder.as_ref()).is_some()
+            || tree_view
+                .as_ref()
+                .and_then(|view| view.finder.as_ref())
+                .is_some()
         {
             finder_rect_for(cols, height)
         } else {
@@ -2046,21 +2417,32 @@ impl Editor {
         // whole screen or affecting the incremental renderer's other rows.
         if let Some(old) = self.screen.finder.set_rect(finder_rect) {
             for y in old.y as usize..old.y as usize + old.height {
-                if let Some(line) = self.screen.lines.get_mut(y) { *line = None; }
-                if let Some(line) = self.screen.sidebar_lines.get_mut(y) { *line = None; }
+                if let Some(line) = self.screen.lines.get_mut(y) {
+                    *line = None;
+                }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
+                    *line = None;
+                }
             }
         }
 
         let active_terminal = self.toggleterm.active().ok().flatten();
-        let popup_rect = active_terminal.as_ref()
+        let popup_rect = active_terminal
+            .as_ref()
             .filter(|kind| self.terminals.contains_key(kind.as_str()))
             .and_then(|_| terminal_rect(cols, height));
         if let Some(old) = self.screen.terminal.set_rect(popup_rect) {
             // Repaint only the previously covered region when hiding.
             for y in old.y as usize..old.y as usize + old.height as usize {
-                if let Some(line) = self.screen.lines.get_mut(y) { *line = None; }
-                if let Some(line) = self.screen.sidebar_lines.get_mut(y) { *line = None; }
-                self.screen.finder.invalidate_underpaint(old.x as usize, y, old.width as usize);
+                if let Some(line) = self.screen.lines.get_mut(y) {
+                    *line = None;
+                }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
+                    *line = None;
+                }
+                self.screen
+                    .finder
+                    .invalidate_underpaint(old.x as usize, y, old.width as usize);
             }
         }
 
@@ -2079,29 +2461,58 @@ impl Editor {
                         view.lines.get(y - 1).cloned().unwrap_or_default()
                     };
                     let active = y > 0 && y == view.selected;
-                    let cell = SidebarPaint { text, active, focused };
+                    let cell = SidebarPaint {
+                        text,
+                        active,
+                        focused,
+                    };
                     if self.screen.sidebar_lines[y].as_ref() == Some(&cell) {
                         continue;
                     }
                     let background = if active && focused {
-                        Color::Rgb { r: 65, g: 64, b: 78 }
+                        Color::Rgb {
+                            r: 65,
+                            g: 64,
+                            b: 78,
+                        }
                     } else if active {
-                        Color::Rgb { r: 49, g: 48, b: 59 }
+                        Color::Rgb {
+                            r: 49,
+                            g: 48,
+                            b: 59,
+                        }
                     } else {
-                        Color::Rgb { r: 34, g: 35, b: 42 }
+                        Color::Rgb {
+                            r: 34,
+                            g: 35,
+                            b: 42,
+                        }
                     };
                     let foreground = if active {
-                        Color::Rgb { r: 226, g: 213, b: 255 }
+                        Color::Rgb {
+                            r: 226,
+                            g: 213,
+                            b: 255,
+                        }
                     } else {
-                        Color::Rgb { r: 174, g: 179, b: 194 }
+                        Color::Rgb {
+                            r: 174,
+                            g: 179,
+                            b: 194,
+                        }
                     };
-                    queue!(output,
+                    queue!(
+                        output,
                         MoveTo(0, y as u16),
                         SetBackgroundColor(background),
                         SetForegroundColor(foreground),
                         Print(fit_cells(&cell.text, sidebar_width.saturating_sub(1))),
                         ResetColor,
-                        SetForegroundColor(Color::Rgb { r: 82, g: 84, b: 96 }),
+                        SetForegroundColor(Color::Rgb {
+                            r: 82,
+                            g: 84,
+                            b: 96
+                        }),
                         Print("│"),
                         ResetColor
                     )?;
@@ -2109,8 +2520,12 @@ impl Editor {
                     // This row may lie behind the centered finder. If the
                     // sidebar just repainted it, the popup must redraw that
                     // portion even when its own text is unchanged.
-                    self.screen.finder.invalidate_underpaint(0, y, sidebar_width);
-                    self.screen.terminal.invalidate_underpaint(0, y, sidebar_width);
+                    self.screen
+                        .finder
+                        .invalidate_underpaint(0, y, sidebar_width);
+                    self.screen
+                        .terminal
+                        .invalidate_underpaint(0, y, sidebar_width);
                 }
             }
         }
@@ -2127,29 +2542,41 @@ impl Editor {
                 painted.index != index || painted.content.as_deref() != content
             });
             let highlight_changed = old.is_none_or(|painted| painted.active != active);
-            let selected = self.selection.and_then(|range| range.columns(index, line.map_or(0, Vec::len)));
+            let selected = self
+                .selection
+                .and_then(|range| range.columns(index, line.map_or(0, Vec::len)));
             let selection_changed = old.is_none_or(|painted| painted.selected != selected);
             let gutter_changed = old.is_none_or(|painted| painted.gutter != number);
-            let syntax_stale = self.syntax.enabled()
-                && syntax_invalid.is_some_and(|first| index >= first);
-            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale || selection_changed;
+            let syntax_stale =
+                self.syntax.enabled() && syntax_invalid.is_some_and(|first| index >= first);
+            let paint_text =
+                repaint_all || text_stale || highlight_changed || syntax_stale || selection_changed;
 
             if !paint_text && !gutter_changed {
                 continue;
             }
             if gutter_width > 0 && (paint_text || gutter_changed) {
-                queue!(output,
+                queue!(
+                    output,
                     MoveTo(sidebar_width as u16, y as u16),
                     SetBackgroundColor(GUTTER_BG),
                     SetForegroundColor(if active { CURRENT_NUMBER_FG } else { GUTTER_FG }),
                     Print(&number),
                     ResetColor
                 )?;
-                self.screen.finder.invalidate_underpaint(sidebar_width, y, gutter_width);
-                self.screen.terminal.invalidate_underpaint(sidebar_width, y, gutter_width);
+                self.screen
+                    .finder
+                    .invalidate_underpaint(sidebar_width, y, gutter_width);
+                self.screen
+                    .terminal
+                    .invalidate_underpaint(sidebar_width, y, gutter_width);
             }
             if paint_text {
-                queue!(output, MoveTo((sidebar_width + gutter_width) as u16, y as u16), ResetColor)?;
+                queue!(
+                    output,
+                    MoveTo((sidebar_width + gutter_width) as u16, y as u16),
+                    ResetColor
+                )?;
                 if active {
                     queue!(output, SetBackgroundColor(CURRENT_LINE_BG))?;
                 }
@@ -2159,14 +2586,30 @@ impl Editor {
                     if let Some(columns) = selected {
                         let spans = self.syntax.spans(&self.doc, index);
                         for (foreground, background, text) in render_selected_line(
-                            line, spans.unwrap_or(&[]), self.scroll_col, text_width, columns, active
+                            line,
+                            spans.unwrap_or(&[]),
+                            self.scroll_col,
+                            text_width,
+                            columns,
+                            active,
                         ) {
                             visible_width += UnicodeWidthStr::width(text.as_str());
-                            queue!(output, SetForegroundColor(foreground), SetBackgroundColor(background), Print(text))?;
+                            queue!(
+                                output,
+                                SetForegroundColor(foreground),
+                                SetBackgroundColor(background),
+                                Print(text)
+                            )?;
                         }
                         queue!(output, ResetColor)?;
-                    } else if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
-                        for (color, text) in render_color_line(line, spans, self.scroll_col, text_width) {
+                    } else if let Some(spans) = self
+                        .syntax
+                        .spans(&self.doc, index)
+                        .filter(|s| !s.is_empty())
+                    {
+                        for (color, text) in
+                            render_color_line(line, spans, self.scroll_col, text_width)
+                        {
                             visible_width += UnicodeWidthStr::width(text.as_str());
                             queue!(output, SetForegroundColor(color), Print(text))?;
                         }
@@ -2179,7 +2622,8 @@ impl Editor {
                 if active {
                     // Fill to the right edge without clearing the terminal.
                     // This also highlights empty lines and trailing whitespace.
-                    queue!(output,
+                    queue!(
+                        output,
                         SetBackgroundColor(CURRENT_LINE_BG),
                         SetForegroundColor(Color::Reset),
                         Print(" ".repeat(text_width.saturating_sub(visible_width))),
@@ -2190,10 +2634,14 @@ impl Editor {
                     queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
                 }
                 self.screen.finder.invalidate_underpaint(
-                    sidebar_width + gutter_width, y, text_width
+                    sidebar_width + gutter_width,
+                    y,
+                    text_width,
                 );
                 self.screen.terminal.invalidate_underpaint(
-                    sidebar_width + gutter_width, y, text_width
+                    sidebar_width + gutter_width,
+                    y,
+                    text_width,
                 );
             }
             self.screen.lines[y] = Some(PaintedLine {
@@ -2206,13 +2654,28 @@ impl Editor {
         }
 
         if rows >= 2 {
-            let filename = self.doc.path.as_ref()
+            let filename = self
+                .doc
+                .path
+                .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".into());
             let mark = if self.doc.dirty { "**" } else { "--" };
-            let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
-            let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
-            let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
+            let mode = match self.mode {
+                Mode::Normal => "NORMAL",
+                Mode::Insert => "INSERT",
+                Mode::Visual => "VISUAL",
+            };
+            let language = if self.syntax.enabled() {
+                self.syntax.name()
+            } else {
+                "Highlight off"
+            };
+            let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) {
+                " | TREE"
+            } else {
+                ""
+            };
             // Keep global buffer counts before long paths so they stay visible
             // even on smaller terminals. The dirty count includes inactive files.
             let dirty = self.dirty_buffers();
@@ -2224,10 +2687,13 @@ impl Editor {
             );
             let status = fit_cells(&status, width);
             if self.screen.status.as_deref() != Some(status.as_str()) {
-                queue!(output,
+                queue!(
+                    output,
                     MoveTo(0, rows - 2),
-                    SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White),
-                    Print(&status), ResetColor
+                    SetBackgroundColor(Color::DarkGrey),
+                    SetForegroundColor(Color::White),
+                    Print(&status),
+                    ResetColor
                 )?;
                 self.screen.status = Some(status);
             }
@@ -2275,13 +2741,21 @@ impl Editor {
         // and sidebar have painted; only changed popup rows are output.
         if let Some(rect) = finder_rect {
             if let Some(finder) = mason_view.as_ref() {
-                self.screen.finder.paint(output, rect, finder, PickerKind::Mason)?;
+                self.screen
+                    .finder
+                    .paint(output, rect, finder, PickerKind::Mason)?;
             } else if let Some(finder) = hover_view.as_ref() {
-                self.screen.finder.paint(output, rect, finder, PickerKind::Hover)?;
+                self.screen
+                    .finder
+                    .paint(output, rect, finder, PickerKind::Hover)?;
             } else if let Some(finder) = buffer_view.as_ref() {
-                self.screen.finder.paint(output, rect, finder, PickerKind::Buffers)?;
+                self.screen
+                    .finder
+                    .paint(output, rect, finder, PickerKind::Buffers)?;
             } else if let Some(finder) = tree_view.as_ref().and_then(|view| view.finder.as_ref()) {
-                self.screen.finder.paint(output, rect, finder, PickerKind::Files)?;
+                self.screen
+                    .finder
+                    .paint(output, rect, finder, PickerKind::Files)?;
             }
         }
 
@@ -2302,31 +2776,49 @@ impl Editor {
                 let kind = active_terminal.as_ref().unwrap();
                 let (x, y) = self.terminals.get(kind).unwrap().cursor(rect);
                 (x as usize, y)
-            },
-            Some(Prompt::SaveAs(name)) => ("Save file: ".len() + name.chars().count(), rows.saturating_sub(1)),
-            Some(Prompt::Open(name)) => ("Find file: ".len() + name.chars().count(), rows.saturating_sub(1)),
+            }
+            Some(Prompt::SaveAs(name)) => (
+                "Save file: ".len() + name.chars().count(),
+                rows.saturating_sub(1),
+            ),
+            Some(Prompt::Open(name)) => (
+                "Find file: ".len() + name.chars().count(),
+                rows.saturating_sub(1),
+            ),
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if finder_rect.is_some() => {
                 let rect = finder_rect.unwrap();
-                let query = mason_view.as_ref().or(buffer_view.as_ref()).or_else(|| {
-                    tree_view.as_ref().and_then(|view| view.finder.as_ref())
-                }).map_or("", |finder| finder.query.as_str());
+                let query = mason_view
+                    .as_ref()
+                    .or(buffer_view.as_ref())
+                    .or_else(|| tree_view.as_ref().and_then(|view| view.finder.as_ref()))
+                    .map_or("", |finder| finder.query.as_str());
                 let (x, y) = finder_cursor(rect, query);
                 (x as usize, y)
             }
             None if sidebar_width > 0 && self.tree.as_ref().is_some_and(|tree| tree.focused) => (
                 search_cursor.map_or(2, |x| x.min(sidebar_width.saturating_sub(2))),
-                if search_cursor.is_some() { 0 } else { selected_tree_row as u16 },
+                if search_cursor.is_some() {
+                    0
+                } else {
+                    selected_tree_row as u16
+                },
             ),
             None => (
-                sidebar_width + gutter_width
-                    + visual_column(&self.doc.line()[..self.doc.col]).saturating_sub(self.scroll_col),
+                sidebar_width
+                    + gutter_width
+                    + visual_column(&self.doc.line()[..self.doc.col])
+                        .saturating_sub(self.scroll_col),
                 self.doc.row.saturating_sub(self.scroll_row) as u16,
             ),
         };
         if cols > 0 && rows > 0 {
-            queue!(output, MoveTo((x.min(width - 1)) as u16, y.min(rows - 1)), Show)?;
+            queue!(
+                output,
+                MoveTo((x.min(width - 1)) as u16, y.min(rows - 1)),
+                Show
+            )?;
         }
         self.screen.size = Some((cols, rows));
         self.screen.origin = Some((self.scroll_row, self.scroll_col));
@@ -2335,7 +2827,6 @@ impl Editor {
         output.flush()
     }
 }
-
 
 // Convert terminal key events into Lua plugin binding names. This is a
 // generic dispatcher, not a hardcoded terminal-plugin shortcut table.
@@ -2368,7 +2859,9 @@ fn project_root_for(file: Option<&Path>, cwd: &Path) -> PathBuf {
     }
     for dir in start.ancestors() {
         if ["Cargo.toml", "go.mod", "package.json"]
-            .iter().any(|marker| dir.join(marker).exists()) {
+            .iter()
+            .any(|marker| dir.join(marker).exists())
+        {
             return dir.to_path_buf();
         }
     }
@@ -2377,7 +2870,9 @@ fn project_root_for(file: Option<&Path>, cwd: &Path) -> PathBuf {
 }
 
 fn popup_shortcut(key: KeyEvent) -> Option<String> {
-    let KeyCode::Char(c) = key.code else { return None };
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
     let modifiers = key.modifiers;
     if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
         Some(format!("ctrl-{}", c.to_ascii_lowercase()))
@@ -2389,19 +2884,33 @@ fn popup_shortcut(key: KeyEvent) -> Option<String> {
 }
 
 fn tree_sidebar_width(columns: usize, visible: bool) -> usize {
-    if !visible || columns < 48 { return 0; }
+    if !visible || columns < 48 {
+        return 0;
+    }
     (columns / 3).clamp(24, 34).min(columns - 20)
 }
 
 fn gutter_width(columns: usize, total_lines: usize) -> usize {
     // Never sacrifice the entire text area when the terminal is narrow.
-    if columns < 5 { 0 } else { (total_lines.to_string().len().max(2) + 2).min(columns - 1) }
+    if columns < 5 {
+        0
+    } else {
+        (total_lines.to_string().len().max(2) + 2).min(columns - 1)
+    }
 }
 
 fn gutter_number(index: usize, cursor: usize, total_lines: usize, width: usize) -> String {
-    if width == 0 { return String::new(); }
-    if index >= total_lines { return " ".repeat(width); }
-    let number = if index == cursor { index + 1 } else { index.abs_diff(cursor) };
+    if width == 0 {
+        return String::new();
+    }
+    if index >= total_lines {
+        return " ".repeat(width);
+    }
+    let number = if index == cursor {
+        index + 1
+    } else {
+        index.abs_diff(cursor)
+    };
     let digits = number.to_string();
     let available = width.saturating_sub(2);
     // On exceptionally narrow screens, keep the gutter inside the viewport.
@@ -2410,13 +2919,18 @@ fn gutter_number(index: usize, cursor: usize, total_lines: usize, width: usize) 
 }
 
 fn char_width(c: char, column: usize) -> usize {
-    if c == '\t' { TAB_WIDTH - (column % TAB_WIDTH) }
-    else { UnicodeWidthChar::width(c).unwrap_or(0) }
+    if c == '\t' {
+        TAB_WIDTH - (column % TAB_WIDTH)
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
 }
 
 fn visual_column(line: &[char]) -> usize {
     let mut column = 0;
-    for &c in line { column += char_width(c, column); }
+    for &c in line {
+        column += char_width(c, column);
+    }
     column
 }
 
@@ -2426,18 +2940,26 @@ fn render_line(line: &[char], start: usize, width: usize) -> String {
     let end = start.saturating_add(width);
     for &c in line {
         let size = char_width(c, column);
-        if column >= end { break; }
+        if column >= end {
+            break;
+        }
         if c == '\t' || c.is_control() {
             for i in 0..size.max(usize::from(c.is_control())) {
-                if column + i >= start && column + i < end { output.push(' '); }
+                if column + i >= start && column + i < end {
+                    output.push(' ');
+                }
             }
         } else if size == 0 {
-            if column > start && column <= end { output.push(c); }
+            if column > start && column <= end {
+                output.push(c);
+            }
         } else if column >= start && column + size <= end {
             output.push(c);
         } else {
             for i in 0..size {
-                if column + i >= start && column + i < end { output.push(' '); }
+                if column + i >= start && column + i < end {
+                    output.push(' ');
+                }
             }
         }
         column += size;
@@ -2445,26 +2967,39 @@ fn render_line(line: &[char], start: usize, width: usize) -> String {
     output
 }
 
-fn render_color_line(line: &[char], spans: &[Span], start: usize, width: usize) -> Vec<(Color, String)> {
+fn render_color_line(
+    line: &[char],
+    spans: &[Span],
+    start: usize,
+    width: usize,
+) -> Vec<(Color, String)> {
     let mut runs: Vec<(Color, String)> = Vec::new();
     let mut column = 0;
     let end = start.saturating_add(width);
     for span in spans {
         for &c in &line[span.start..span.end] {
-            if column >= end { break; }
+            if column >= end {
+                break;
+            }
             let size = char_width(c, column);
             let mut visible = String::new();
             if c == '\t' || c.is_control() {
                 for i in 0..size.max(usize::from(c.is_control())) {
-                    if column + i >= start && column + i < end { visible.push(' '); }
+                    if column + i >= start && column + i < end {
+                        visible.push(' ');
+                    }
                 }
             } else if size == 0 {
-                if column > start && column <= end { visible.push(c); }
+                if column > start && column <= end {
+                    visible.push(c);
+                }
             } else if column >= start && column + size <= end {
                 visible.push(c);
             } else {
                 for i in 0..size {
-                    if column + i >= start && column + i < end { visible.push(' '); }
+                    if column + i >= start && column + i < end {
+                        visible.push(' ');
+                    }
                 }
             }
             if !visible.is_empty() {
@@ -2485,19 +3020,26 @@ fn render_color_line(line: &[char], spans: &[Span], start: usize, width: usize) 
 }
 
 fn render_selected_line(
-    line: &[char], spans: &[Span], scroll: usize, width: usize,
-    selection: (usize, usize), active: bool,
+    line: &[char],
+    spans: &[Span],
+    scroll: usize,
+    width: usize,
+    selection: (usize, usize),
+    active: bool,
 ) -> Vec<(Color, Color, String)> {
     let mut runs: Vec<(Color, Color, String)> = Vec::new();
     let mut visual_col = 0;
     let mut syntax_index = 0;
     let end = scroll.saturating_add(width);
     for (index, &ch) in line.iter().enumerate() {
-        if visual_col >= end { break; }
+        if visual_col >= end {
+            break;
+        }
         while syntax_index < spans.len() && index >= spans[syntax_index].end {
             syntax_index += 1;
         }
-        let foreground = spans.get(syntax_index)
+        let foreground = spans
+            .get(syntax_index)
             .filter(|span| index >= span.start && index < span.end)
             .map_or(Color::Reset, |span| span.foreground);
         let background = if (selection.0..selection.1).contains(&index) {
@@ -2516,7 +3058,9 @@ fn render_selected_line(
                 }
             }
         } else if size == 0 {
-            if visual_col > scroll && visual_col <= end { visible.push(ch); }
+            if visual_col > scroll && visual_col <= end {
+                visible.push(ch);
+            }
         } else if visual_col >= scroll && visual_col + size <= end {
             visible.push(ch);
         } else {
@@ -2547,7 +3091,9 @@ fn fit_cells(input: &str, width: usize) -> String {
     let mut used = 0;
     for c in input.chars() {
         let size = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + size > width { break; }
+        if used + size > width {
+            break;
+        }
         result.push(c);
         used += size;
     }
@@ -2559,7 +3105,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste) {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            Hide,
+            EnableBracketedPaste
+        ) {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
@@ -2568,7 +3119,13 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, Show, ResetColor, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            Show,
+            ResetColor,
+            LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -2609,7 +3166,9 @@ fn main() -> io::Result<()> {
         };
         if event::poll(delay)? {
             match event::read()? {
-                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     let height = terminal::size()?.1.saturating_sub(2) as usize;
                     editor.key(key, height);
                 }
@@ -2629,8 +3188,9 @@ mod tests {
         editor.key(KeyEvent::new(key, KeyModifiers::NONE), 10);
     }
 
-
     fn paint(editor: &mut Editor) -> String {
+        // Color assertions must not depend on the test runner's NO_COLOR.
+        crossterm::style::force_color_output(true);
         let mut output = Vec::new();
         editor.draw_at(&mut output, 80, 18).unwrap();
         String::from_utf8(output).unwrap()
@@ -2641,7 +3201,9 @@ mod tests {
             "remacs-buffers-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("one.rs"), "one\nsecond\nthird\n").unwrap();
@@ -2765,9 +3327,17 @@ mod tests {
         assert_eq!(editor.dirty_buffers(), 0);
         assert_eq!(editor.active_slot, 1);
         assert_eq!((editor.scroll_row, editor.scroll_col), before_scroll);
-        assert_eq!(editor.undo.len(), before_undo, "save-all must not wipe undo");
-        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
-        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        assert_eq!(
+            editor.undo.len(),
+            before_undo,
+            "save-all must not wipe undo"
+        );
+        assert!(std::fs::read_to_string(root.join("one.rs"))
+            .unwrap()
+            .starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md"))
+            .unwrap()
+            .starts_with('Y'));
         assert!(!editor.slots[0].as_ref().unwrap().doc.dirty);
         assert!(editor.message.contains("Saved 2 buffer"));
         assert!(paint(&mut editor).contains("B 2/2  ●0"));
@@ -2787,7 +3357,9 @@ mod tests {
         assert!(editor.message.contains("Saved 1"));
         assert!(editor.message.contains("1 unnamed"));
         assert!(editor.message.contains(":w FILE"));
-        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("one.rs"))
+            .unwrap()
+            .starts_with('X'));
 
         editor.switch_buffer(0);
         assert!(editor.doc.path.is_none());
@@ -2795,7 +3367,10 @@ mod tests {
         assert_eq!(editor.doc.line().first(), Some(&'!'));
         editor.set_path_and_save(root.join("scratch.txt"));
         assert_eq!(editor.dirty_buffers(), 0);
-        assert_eq!(std::fs::read_to_string(root.join("scratch.txt")).unwrap(), "!");
+        assert_eq!(
+            std::fs::read_to_string(root.join("scratch.txt")).unwrap(),
+            "!"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2815,13 +3390,20 @@ mod tests {
         editor.command("wall");
         assert_eq!(editor.active_slot, 2);
         assert_eq!(editor.dirty_buffers(), 1);
-        assert_eq!(editor.slots[0].as_ref().unwrap().doc.path.as_ref(), Some(&failed_path));
+        assert_eq!(
+            editor.slots[0].as_ref().unwrap().doc.path.as_ref(),
+            Some(&failed_path)
+        );
         assert!(editor.slots[0].as_ref().unwrap().doc.dirty);
         assert!(editor.message.contains("Saved 2"));
         assert!(editor.message.contains("1 failed"));
         assert!(editor.message.contains("failed.rs"));
-        assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
-        assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
+        assert!(std::fs::read_to_string(root.join("one.rs"))
+            .unwrap()
+            .starts_with('X'));
+        assert!(std::fs::read_to_string(root.join("two.md"))
+            .unwrap()
+            .starts_with('Y'));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2955,26 +3537,33 @@ mod tests {
             editor.jumps = JumpManager::from_path(state.clone());
             editor.doc.row = 2;
             editor.doc.col = 1;
-            for key in ['m', 'A'] { press(&mut editor, KeyCode::Char(key)); }
-            for key in ['m', 'a'] { press(&mut editor, KeyCode::Char(key)); }
+            for key in ['m', 'A'] {
+                press(&mut editor, KeyCode::Char(key));
+            }
+            for key in ['m', 'a'] {
+                press(&mut editor, KeyCode::Char(key));
+            }
             assert!(editor.message.contains("Mark a"));
             editor.open(root.join("two.md").to_string_lossy().into_owned());
             editor.switch_buffer(0);
             editor.close_buffer(false);
-            for key in ['`', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+            for key in ['`', 'A'] {
+                press(&mut editor, KeyCode::Char(key));
+            }
             assert_eq!(editor.doc.row, 2);
             assert_eq!(editor.doc.col, 1);
         }
 
         let mut editor = Editor::new(Document::open(root.join("two.md")).unwrap());
         editor.jumps = JumpManager::from_path(state);
-        for key in ['\'', 'A'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['\'', 'A'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
         assert_eq!(editor.doc.row, 2);
         assert_eq!(editor.doc.col, 0);
         let _ = std::fs::remove_dir_all(root);
     }
-
 
     #[test]
     fn closing_clean_buffer_preserves_its_last_jump_position() {
@@ -2999,12 +3588,22 @@ mod tests {
         // path_identity() when storing and comparing jump locations.
         let root = std::fs::canonicalize(temporary_buffer_project()).unwrap();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
-        editor.jumps.remember(Location {
-            path: root.join("missing.rs"), row: 5, col: 0
-        }).unwrap();
-        editor.jumps.remember(Location {
-            path: root.join("one.rs"), row: 0, col: 0
-        }).unwrap();
+        editor
+            .jumps
+            .remember(Location {
+                path: root.join("missing.rs"),
+                row: 5,
+                col: 0,
+            })
+            .unwrap();
+        editor
+            .jumps
+            .remember(Location {
+                path: root.join("one.rs"),
+                row: 0,
+                col: 0,
+            })
+            .unwrap();
         editor.jump_back();
         assert!(editor.message.contains("Jump target missing"));
         assert!(!root.join("missing.rs").exists());
@@ -3017,7 +3616,9 @@ mod tests {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.doc.row = 2;
-        for key in ['g', 'g'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['g', 'g'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.row, 0);
         editor.jump_back();
         assert_eq!(editor.doc.row, 2);
@@ -3025,11 +3626,17 @@ mod tests {
         editor.remember();
         editor.doc.row = 2;
         editor.remember();
-        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['g', ';'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.row, 2);
-        for key in ['g', ';'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['g', ';'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.row, 1);
-        for key in ['g', ','] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['g', ','] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.row, 2);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3061,11 +3668,17 @@ mod tests {
         assert_eq!(editor.scroll_row, 1);
         assert_eq!(editor.scroll_col, 3);
         assert_eq!(editor.doc.row, 1);
-        assert!(editor.doc.lines[1].iter().collect::<String>().starts_with('X'));
+        assert!(editor.doc.lines[1]
+            .iter()
+            .collect::<String>()
+            .starts_with('X'));
         editor.undo();
         assert_eq!(editor.doc.lines[1].iter().collect::<String>(), "second");
         editor.switch_buffer(1);
-        assert!(editor.doc.lines[0].iter().collect::<String>().starts_with('Y'));
+        assert!(editor.doc.lines[0]
+            .iter()
+            .collect::<String>()
+            .starts_with('Y'));
         editor.undo();
         assert_eq!(editor.doc.lines[0].iter().collect::<String>(), "# two");
         let _ = std::fs::remove_dir_all(root);
@@ -3082,7 +3695,11 @@ mod tests {
         // Sorted root: one.rs, two.md.
         editor.tree_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         editor.tree_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(editor.doc.path.as_ref().is_some_and(|p| p.ends_with("two.md")));
+        assert!(editor
+            .doc
+            .path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("two.md")));
         assert_eq!(editor.slots.len(), 2);
         assert!(editor.slots[0].as_ref().unwrap().doc.dirty);
         assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
@@ -3100,7 +3717,10 @@ mod tests {
         assert_eq!(editor.active_slot, 1);
         editor.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), 12);
         assert_eq!(editor.active_slot, 0);
-        assert!(editor.doc.dirty, "modified buffer must survive direct switching");
+        assert!(
+            editor.doc.dirty,
+            "modified buffer must survive direct switching"
+        );
         assert_eq!(editor.doc.line().first(), Some(&'!'));
 
         editor.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), 12);
@@ -3158,11 +3778,19 @@ mod tests {
         assert!(paint(&mut editor).contains("SWITCH BUFFER"));
         editor.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 12);
         assert!(editor.buffer_picker.is_none());
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
         editor.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), 12);
         assert_eq!(editor.active_slot, 0);
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && !tree.focused),
-            "fast buffer switching should return focus to the editor");
+        assert!(
+            editor
+                .tree
+                .as_ref()
+                .is_some_and(|tree| tree.visible && !tree.focused),
+            "fast buffer switching should return focus to the editor"
+        );
         // Opening the chooser must not re-read or discard files.
         assert_eq!(editor.slots.len(), 2);
         let _ = std::fs::remove_dir_all(root);
@@ -3188,11 +3816,17 @@ mod tests {
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.open(root.join("two.md").to_string_lossy().into_owned());
         assert_eq!(editor.active_slot, 1);
-        for key in [' ', 'b', 'p'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'b', 'p'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.active_slot, 0);
-        for key in [' ', 'b', 'l'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'b', 'l'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.active_slot, 1);
-        for key in [' ', 'b', 'n'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'b', 'n'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.active_slot, 0);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3203,14 +3837,18 @@ mod tests {
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.doc.insert('!');
         editor.open(root.join("two.md").to_string_lossy().into_owned());
-        for key in [' ', 'b', 'b'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'b', 'b'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert!(editor.buffer_picker.is_some());
         let popup = paint(&mut editor);
         assert!(popup.contains("SWITCH BUFFER"));
         assert!(popup.contains("one.rs"));
         assert!(popup.contains("two.md"));
         assert!(popup.contains('●'), "dirty buffers are marked");
-        for key in ['o', 'n', 'e'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['o', 'n', 'e'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.buffer_picker_view().unwrap().total_matches, 1);
         press(&mut editor, KeyCode::Enter);
         assert!(editor.buffer_picker.is_none());
@@ -3229,13 +3867,18 @@ mod tests {
         editor.doc.insert('!');
         editor.open(root.join("two.md").to_string_lossy().into_owned());
         editor.quit();
-        assert!(matches!(editor.prompt, Some(Prompt::Quit)),
-            "quit must notice an unsaved inactive buffer");
+        assert!(
+            matches!(editor.prompt, Some(Prompt::Quit)),
+            "quit must notice an unsaved inactive buffer"
+        );
         editor.prompt_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(editor.running);
         editor.close_buffer(false);
         assert_eq!(editor.slots.len(), 1);
-        assert!(editor.doc.dirty, "closing clean buffer must restore dirty buffer");
+        assert!(
+            editor.doc.dirty,
+            "closing clean buffer must restore dirty buffer"
+        );
         editor.close_buffer(false);
         assert_eq!(editor.slots.len(), 1, "cannot close an unsaved buffer");
         editor.close_buffer(true);
@@ -3253,14 +3896,18 @@ mod tests {
         assert_eq!(editor.active_slot, 1);
         assert_eq!(editor.slots.len(), 2);
         editor.set_path_and_save(root.join("one.rs"));
-        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"),
-            "save-as cannot overwrite a file already open in another buffer");
+        assert!(
+            editor.doc.path.as_ref().unwrap().ends_with("two.md"),
+            "save-as cannot overwrite a file already open in another buffer"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn moving_up_and_down_never_repaints_the_file() {
-        let mut editor = Editor::new(Document::from_text("Unique first line\nUnique second line\nUnique third line"));
+        let mut editor = Editor::new(Document::from_text(
+            "Unique first line\nUnique second line\nUnique third line",
+        ));
         let first = paint(&mut editor);
         assert!(first.contains("Unique first line"));
         // Only old and new active rows repaint. Other text stays untouched.
@@ -3301,7 +3948,10 @@ mod tests {
     #[test]
     fn scrolling_and_resize_refresh_visible_content() {
         let mut editor = Editor::new(Document::from_text(
-            &(0..30).map(|i| format!("row number {i}")).collect::<Vec<_>>().join("\n")
+            &(0..30)
+                .map(|i| format!("row number {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         ));
         paint(&mut editor);
         for _ in 0..20 {
@@ -3325,7 +3975,6 @@ mod tests {
         assert!(repainted.contains("# A heading"));
         assert!(!repainted.contains("\x1b[2J"));
     }
-
 
     #[test]
     fn tree_layout_preserves_text_width() {
@@ -3362,19 +4011,32 @@ mod tests {
     #[test]
     fn counted_vertical_jumps_work_on_large_files() {
         let mut editor = Editor::new(Document::from_text(
-            &(0..500).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n")
+            &(0..500)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         ));
-        for c in "125j".chars() { press(&mut editor, KeyCode::Char(c)); }
+        for c in "125j".chars() {
+            press(&mut editor, KeyCode::Char(c));
+        }
         assert_eq!(editor.doc.row, 125);
-        for c in "40k".chars() { press(&mut editor, KeyCode::Char(c)); }
+        for c in "40k".chars() {
+            press(&mut editor, KeyCode::Char(c));
+        }
         assert_eq!(editor.doc.row, 85);
-        for c in "420G".chars() { press(&mut editor, KeyCode::Char(c)); }
+        for c in "420G".chars() {
+            press(&mut editor, KeyCode::Char(c));
+        }
         assert_eq!(editor.doc.row, 419);
-        for c in "17gg".chars() { press(&mut editor, KeyCode::Char(c)); }
+        for c in "17gg".chars() {
+            press(&mut editor, KeyCode::Char(c));
+        }
         assert_eq!(editor.doc.row, 16);
         press(&mut editor, KeyCode::Char('G'));
         assert_eq!(editor.doc.row, 499);
-        for c in "gg".chars() { press(&mut editor, KeyCode::Char(c)); }
+        for c in "gg".chars() {
+            press(&mut editor, KeyCode::Char(c));
+        }
         assert_eq!(editor.doc.row, 0);
     }
 
@@ -3408,32 +4070,58 @@ mod tests {
 
         // From the editor: open the tree and focus it.
         press_ctrl_n(&mut editor);
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
 
         // From the focused tree: Ctrl+N must close it (regression).
         press_ctrl_n(&mut editor);
-        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible && !tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| !tree.visible && !tree.focused));
 
         // Re-open the tree and enter the fuzzy finder.
         press_ctrl_n(&mut editor);
         editor.tree_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_some());
+        assert!(editor
+            .tree
+            .as_ref()
+            .unwrap()
+            .view(10)
+            .unwrap()
+            .search_cursor
+            .is_some());
 
         // Ctrl+N remains the global toggle even while searching.
         press_ctrl_n(&mut editor);
-        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible && !tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| !tree.visible && !tree.focused));
 
         // Reopening returns to the tree, not to the stale search prompt.
         press_ctrl_n(&mut editor);
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
-        assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_none());
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .unwrap()
+            .view(10)
+            .unwrap()
+            .search_cursor
+            .is_none());
         assert_eq!(editor.doc.line().iter().collect::<String>(), "editor text");
     }
 
     #[test]
     fn overlay_is_repainted_after_sidebar_redraw_during_fuzzy_search() {
         let mut editor = Editor::new(Document::from_text(
-            &vec!["SOME-EDITOR-CONTENT"; 60].join("\n")
+            &vec!["SOME-EDITOR-CONTENT"; 60].join("\n"),
         ));
         let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
         tree.toggle().unwrap();
@@ -3460,16 +4148,22 @@ mod tests {
         editor.screen.sidebar_lines[overlap_y] = None;
         press(&mut editor, KeyCode::Char('p'));
         let frame = draw(&mut editor);
-        assert!(frame.contains("FIND FILES"),
-            "unchanged popup header must be repainted after tree overlap");
-        assert!(frame.contains("  > p"),
-            "search input must remain intact when the tree repaints");
+        assert!(
+            frame.contains("FIND FILES"),
+            "unchanged popup header must be repainted after tree overlap"
+        );
+        assert!(
+            frame.contains("  > p"),
+            "search input must remain intact when the tree repaints"
+        );
 
         // Simulate an underlying editor repaint on the popup header too.
         editor.screen.lines[overlap_y] = None;
         let frame = draw(&mut editor);
-        assert!(frame.contains("FIND FILES"),
-            "popup border must survive redraws from the editor pane");
+        assert!(
+            frame.contains("FIND FILES"),
+            "popup border must survive redraws from the editor pane"
+        );
         assert!(!frame.contains("\x1b[2J"), "no fullscreen clear needed");
     }
 
@@ -3479,7 +4173,9 @@ mod tests {
             "remacs-finder-ui-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(temp.join("src")).unwrap();
         std::fs::write(temp.join("src/main.rs"), "fn main() {}").unwrap();
@@ -3495,8 +4191,14 @@ mod tests {
         press(&mut editor, KeyCode::Char('/'));
         let opened = paint(&mut editor);
         assert!(opened.contains("FIND FILES"), "finder must visibly open");
-        assert!(opened.contains("README.md"), "unfiltered project files must be listed");
-        assert!(!opened.contains("\x1b[2J"), "search must not erase entire screen");
+        assert!(
+            opened.contains("README.md"),
+            "unfiltered project files must be listed"
+        );
+        assert!(
+            !opened.contains("\x1b[2J"),
+            "search must not erase entire screen"
+        );
 
         // Live fuzzy search should narrow to the nested file.
         for key in "mainrs".chars() {
@@ -3506,7 +4208,10 @@ mod tests {
         assert!(matches.contains("src/main.rs"));
         assert!(matches.contains("mainrs"));
         press(&mut editor, KeyCode::Enter);
-        assert_eq!(editor.doc.path.as_deref(), Some(temp.join("src/main.rs").as_path()));
+        assert_eq!(
+            editor.doc.path.as_deref(),
+            Some(temp.join("src/main.rs").as_path())
+        );
         assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
         let restored = paint(&mut editor);
         assert!(!restored.contains("FIND FILES"));
@@ -3516,7 +4221,7 @@ mod tests {
     #[test]
     fn fuzzy_search_esc_closes_only_popup_not_the_tree() {
         let mut editor = Editor::new(Document::from_text(
-            &vec!["EDITOR_CONTENT_STAYS_VISIBLE"; 30].join("\n")
+            &vec!["EDITOR_CONTENT_STAYS_VISIBLE"; 30].join("\n"),
         ));
         let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
         tree.toggle().unwrap();
@@ -3528,7 +4233,10 @@ mod tests {
         let restored = paint(&mut editor);
         assert!(!restored.contains("FIND FILES"));
         assert!(restored.contains("EDITOR_CONTENT_STAYS_VISIBLE"));
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
         assert!(!restored.contains("\x1b[2J"));
     }
 
@@ -3536,7 +4244,10 @@ mod tests {
     fn opening_tree_keeps_editor_buffer_and_renders_sidebar() {
         let mut editor = Editor::new(Document::from_text("UNCHANGED-EDITOR-CONTENT"));
         editor.toggle_tree();
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
         let mut output = Vec::new();
         editor.draw_at(&mut output, 90, 18).unwrap();
         let first = String::from_utf8(output).unwrap();
@@ -3548,20 +4259,30 @@ mod tests {
         let second = String::from_utf8(output).unwrap();
         assert!(!second.contains("UNCHANGED-EDITOR-CONTENT"));
         editor.tree_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && !tree.focused));
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && !tree.focused));
         editor.toggle_tree();
         assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible));
-        assert_eq!(editor.doc.line().iter().collect::<String>(), "UNCHANGED-EDITOR-CONTENT");
+        assert_eq!(
+            editor.doc.line().iter().collect::<String>(),
+            "UNCHANGED-EDITOR-CONTENT"
+        );
     }
 
     #[test]
     fn visual_function_selection_and_yank() {
-        let mut doc = Document::from_text("pub fn from_text(text: &str) -> Self {\n  let v = { 42 };\n  Self { v }\n}\n");
+        let mut doc = Document::from_text(
+            "pub fn from_text(text: &str) -> Self {\n  let v = { 42 };\n  Self { v }\n}\n",
+        );
         doc.path = Some(PathBuf::from("src/document.rs"));
         doc.row = 1;
         doc.col = 5;
         let mut editor = Editor::new(doc);
-        for key in ['v', 'a', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['v', 'a', 'f'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.mode, Mode::Visual);
         let selected = editor.selection.unwrap();
         assert_eq!(selected.start, Position { row: 0, col: 0 });
@@ -3584,14 +4305,22 @@ mod tests {
         doc.path = Some(PathBuf::from("src/lib.rs"));
         doc.row = 1;
         let mut editor = Editor::new(doc);
-        for key in [' ', 'v', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'v', 'f'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.mode, Mode::Visual);
         press(&mut editor, KeyCode::Char('d'));
         assert_eq!(editor.mode, Mode::Normal);
         assert!(editor.doc.lines[0].is_empty());
-        assert!(editor.doc.lines[1].iter().collect::<String>().contains("fn g"));
+        assert!(editor.doc.lines[1]
+            .iter()
+            .collect::<String>()
+            .contains("fn g"));
         press(&mut editor, KeyCode::Char('u'));
-        assert!(editor.doc.lines[0].iter().collect::<String>().starts_with("fn f"));
+        assert!(editor.doc.lines[0]
+            .iter()
+            .collect::<String>()
+            .starts_with("fn f"));
     }
 
     #[test]
@@ -3627,20 +4356,28 @@ mod tests {
     #[test]
     fn leader_open_and_save() {
         let mut editor = Editor::new(Document::empty());
-        for key in [' ', 'f', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'f', 'f'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert!(matches!(editor.prompt, Some(Prompt::Open(_))));
         editor.prompt = None;
-        for key in [' ', 'f', 's'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in [' ', 'f', 's'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert!(matches!(editor.prompt, Some(Prompt::SaveAs(_))));
     }
 
     #[test]
     fn yank_delete_paste() {
         let mut editor = Editor::new(Document::from_text("one\ntwo"));
-        for key in ['y', 'y', 'j', 'p'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['y', 'y', 'j', 'p'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.lines.len(), 3);
         assert_eq!(editor.doc.line().iter().collect::<String>(), "one");
-        for key in ['d', 'd'] { press(&mut editor, KeyCode::Char(key)); }
+        for key in ['d', 'd'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
         assert_eq!(editor.doc.lines.len(), 2);
     }
 
@@ -3756,7 +4493,10 @@ mod tests {
     #[test]
     fn pasted_search_query_is_literal_bounded_and_selects_first_match() {
         let mut editor = Editor::new(Document::empty());
-        editor.buffer_picker = Some(BufferPicker { query: "a".into(), selected: 4 });
+        editor.buffer_picker = Some(BufferPicker {
+            query: "a".into(),
+            selected: 4,
+        });
         editor.pasted("β\r\nignored");
         let picker = editor.buffer_picker.as_ref().unwrap();
         assert_eq!(picker.query, "aβ");
@@ -3784,12 +4524,25 @@ mod tests {
         let root = std::fs::canonicalize(temporary_buffer_project()).unwrap();
         let mut editor = Editor::new(Document::open(root.join("two.rs")).unwrap());
         for name in ["one.rs", "missing.rs"] {
-            editor.jumps.remember(Location { path: root.join(name), row: 0, col: 0 }).unwrap();
+            editor
+                .jumps
+                .remember(Location {
+                    path: root.join(name),
+                    row: 0,
+                    col: 0,
+                })
+                .unwrap();
         }
         editor.jump_back();
-        assert_eq!(editor.doc.path.as_deref(), Some(root.join("one.rs").as_path()));
+        assert_eq!(
+            editor.doc.path.as_deref(),
+            Some(root.join("one.rs").as_path())
+        );
         editor.jump_forward();
-        assert_eq!(editor.doc.path.as_deref(), Some(root.join("two.rs").as_path()));
+        assert_eq!(
+            editor.doc.path.as_deref(),
+            Some(root.join("two.rs").as_path())
+        );
         assert!(!root.join("missing.rs").exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3814,26 +4567,40 @@ mod tests {
     #[test]
     fn tab_expansion() {
         assert_eq!(visual_column(&"a\tb".chars().collect::<Vec<_>>()), 5);
-        assert_eq!(render_line(&"a\tb".chars().collect::<Vec<_>>(), 0, 8), "a   b");
+        assert_eq!(
+            render_line(&"a\tb".chars().collect::<Vec<_>>(), 0, 8),
+            "a   b"
+        );
     }
 
     #[test]
     fn colored_lines_preserve_tabs_and_wide_characters() {
         let line: Vec<char> = "a\t界x".chars().collect();
         let spans = vec![
-            Span { start: 0, end: 2, foreground: Color::Blue },
-            Span { start: 2, end: 4, foreground: Color::Red },
+            Span {
+                start: 0,
+                end: 2,
+                foreground: Color::Blue,
+            },
+            Span {
+                start: 2,
+                end: 4,
+                foreground: Color::Red,
+            },
         ];
         let runs = render_color_line(&line, &spans, 0, 9);
-        assert_eq!(runs, vec![
-            (Color::Blue, "a   ".into()),
-            (Color::Red, "界x".into()),
-        ]);
+        assert_eq!(
+            runs,
+            vec![(Color::Blue, "a   ".into()), (Color::Red, "界x".into()),]
+        );
     }
 
     #[test]
     fn unicode_width() {
         assert_eq!(visual_column(&"世界".chars().collect::<Vec<_>>()), 4);
-        assert_eq!(render_line(&"世界".chars().collect::<Vec<_>>(), 1, 3), " 界");
+        assert_eq!(
+            render_line(&"世界".chars().collect::<Vec<_>>(), 1, 3),
+            " 界"
+        );
     }
 }

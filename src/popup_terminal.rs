@@ -18,8 +18,16 @@ use crossterm::{
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use unicode_width::UnicodeWidthChar;
 
-const BG: Color = Color::Rgb { r: 33, g: 34, b: 41 };
-const BORDER: Color = Color::Rgb { r: 215, g: 153, b: 33 };
+const BG: Color = Color::Rgb {
+    r: 33,
+    g: 34,
+    b: 41,
+};
+const BORDER: Color = Color::Rgb {
+    r: 215,
+    g: 153,
+    b: 33,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rect {
@@ -36,7 +44,9 @@ impl Rect {
 }
 
 pub fn popup_rect(cols: u16, editor_rows: usize) -> Option<Rect> {
-    if cols < 54 || editor_rows < 14 { return None; }
+    if cols < 54 || editor_rows < 14 {
+        return None;
+    }
     let width = ((cols as usize * 9 / 10).max(54)).min(cols as usize - 2) as u16;
     let height = ((editor_rows * 4 / 5).max(12)).min(editor_rows - 2) as u16;
     Some(Rect {
@@ -60,11 +70,21 @@ pub struct Session {
 impl Session {
     pub fn spawn(command: &str, cwd: &Path, title: String, rect: Rect) -> io::Result<Self> {
         if !cwd.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "project directory missing"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "project directory missing",
+            ));
         }
         let (rows, cols) = rect.inner();
-        let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
-        let pair = native_pty_system().openpty(size).map_err(io::Error::other)?;
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = native_pty_system()
+            .openpty(size)
+            .map_err(io::Error::other)?;
         // No shell interpolation: the Lua plugin chooses one executable.
         // The "shell" sentinel selects the user's preferred login shell.
         let binary = if command == "shell" {
@@ -76,26 +96,35 @@ impl Session {
         builder.cwd(cwd);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
-        let child = pair.slave.spawn_command(builder).map_err(io::Error::other)?;
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(io::Error::other)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
         let writer = pair.master.take_writer().map_err(io::Error::other)?;
         // Bounded channel avoids unbounded memory growth if a hidden shell
         // produces a lot of output. Poll continuously even while hidden.
         let (tx, receiver) = mpsc::sync_channel(64);
-        thread::Builder::new().name("remacs-toggleterm-pty".into()).spawn(move || {
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() { break; }
-            }
-        })?;
+        thread::Builder::new()
+            .name("remacs-toggleterm-pty".into())
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            })?;
         Ok(Self {
             master: pair.master,
             child,
             writer,
             receiver,
             parser: vt100::Parser::new(
-                NonZeroU16::new(rows).unwrap(), NonZeroU16::new(cols).unwrap(), 1000
+                NonZeroU16::new(rows).unwrap(),
+                NonZeroU16::new(cols).unwrap(),
+                1000,
             ),
             title,
             size: (rows, cols),
@@ -104,12 +133,20 @@ impl Session {
 
     pub fn resize(&mut self, rect: Rect) -> io::Result<()> {
         let size = rect.inner();
-        if self.size == size { return Ok(()); }
-        self.master.resize(PtySize {
-            rows: size.0, cols: size.1, pixel_width: 0, pixel_height: 0
-        }).map_err(io::Error::other)?;
+        if self.size == size {
+            return Ok(());
+        }
+        self.master
+            .resize(PtySize {
+                rows: size.0,
+                cols: size.1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)?;
         self.parser.set_size(
-            NonZeroU16::new(size.0).unwrap(), NonZeroU16::new(size.1).unwrap()
+            NonZeroU16::new(size.0).unwrap(),
+            NonZeroU16::new(size.1).unwrap(),
         );
         self.size = size;
         Ok(())
@@ -142,12 +179,17 @@ impl Session {
 
     pub fn cursor(&self, rect: Rect) -> (u16, u16) {
         let (row, col) = self.parser.screen().cursor_position();
-        (rect.x + 1 + col.min(rect.width - 3), rect.y + 1 + row.min(rect.height - 3))
+        (
+            rect.x + 1 + col.min(rect.width - 3),
+            rect.y + 1 + row.min(rect.height - 3),
+        )
     }
 }
 
 impl Drop for Session {
-    fn drop(&mut self) { let _ = self.child.kill(); }
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
 }
 
 /// Encode the keys needed by interactive full-screen terminal programs.
@@ -158,8 +200,9 @@ pub fn encode_key(event: KeyEvent, application_cursor: bool) -> Vec<u8> {
     let alt = event.modifiers.contains(KeyModifiers::ALT);
     let shift = event.modifiers.contains(KeyModifiers::SHIFT);
     let code = match event.code {
-        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() =>
-            vec![c.to_ascii_lowercase() as u8 - b'a' + 1],
+        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
+            vec![c.to_ascii_lowercase() as u8 - b'a' + 1]
+        }
         KeyCode::Char(' ') if ctrl => vec![0],
         KeyCode::Char(c) => c.to_string().into_bytes(),
         KeyCode::Enter => b"\r".to_vec(),
@@ -179,8 +222,20 @@ pub fn encode_key(event: KeyEvent, application_cursor: bool) -> Vec<u8> {
             (true, _, _) => b"\x1bOB".to_vec(),
             _ => b"\x1b[B".to_vec(),
         },
-        KeyCode::Right => if ctrl { b"\x1b[1;5C".to_vec() } else { b"\x1b[C".to_vec() },
-        KeyCode::Left => if ctrl { b"\x1b[1;5D".to_vec() } else { b"\x1b[D".to_vec() },
+        KeyCode::Right => {
+            if ctrl {
+                b"\x1b[1;5C".to_vec()
+            } else {
+                b"\x1b[C".to_vec()
+            }
+        }
+        KeyCode::Left => {
+            if ctrl {
+                b"\x1b[1;5D".to_vec()
+            } else {
+                b"\x1b[D".to_vec()
+            }
+        }
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
@@ -188,16 +243,20 @@ pub fn encode_key(event: KeyEvent, application_cursor: bool) -> Vec<u8> {
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::F(n) if (1..=4).contains(&n) => vec![0x1b, b'O', b'P' + n - 1],
-        KeyCode::F(n) if (5..=12).contains(&n) => {
-            format!("\x1b[{}~", [15,17,18,19,20,21,23,24][(n-5) as usize]).into_bytes()
-        }
+        KeyCode::F(n) if (5..=12).contains(&n) => format!(
+            "\x1b[{}~",
+            [15, 17, 18, 19, 20, 21, 23, 24][(n - 5) as usize]
+        )
+        .into_bytes(),
         _ => Vec::new(),
     };
     if alt && !code.is_empty() && !matches!(event.code, KeyCode::Up | KeyCode::Down) {
         let mut out = vec![0x1b];
         out.extend_from_slice(&code);
         out
-    } else { code }
+    } else {
+        code
+    }
 }
 
 #[derive(Default)]
@@ -208,7 +267,9 @@ pub struct PopupCache {
 
 impl PopupCache {
     pub fn set_rect(&mut self, next: Option<Rect>) -> Option<Rect> {
-        if self.rect == next { return None; }
+        if self.rect == next {
+            return None;
+        }
         let old = self.rect;
         self.rect = next;
         self.rows.clear();
@@ -216,11 +277,19 @@ impl PopupCache {
     }
 
     pub fn invalidate_underpaint(&mut self, x: usize, y: usize, width: usize) {
-        let Some(rect) = self.rect else { return; };
-        if width == 0 || x >= (rect.x + rect.width) as usize
-            || x.saturating_add(width) <= rect.x as usize { return; }
+        let Some(rect) = self.rect else {
+            return;
+        };
+        if width == 0
+            || x >= (rect.x + rect.width) as usize
+            || x.saturating_add(width) <= rect.x as usize
+        {
+            return;
+        }
         if let Some(local) = y.checked_sub(rect.y as usize) {
-            if let Some(row) = self.rows.get_mut(local) { *row = None; }
+            if let Some(row) = self.rows.get_mut(local) {
+                *row = None;
+            }
         }
     }
 
@@ -229,8 +298,11 @@ impl PopupCache {
         let interior = (rect.width - 2) as usize;
         // Query rows just once. VT100 may output SGR formatting; never emit
         // the child stream's raw cursor-addressing sequences into Remacs.
-        let content: Vec<String> = session.parser.screen()
-            .rows_formatted(0, rect.width - 2).collect();
+        let content: Vec<String> = session
+            .parser
+            .screen()
+            .rows_formatted(0, rect.width - 2)
+            .collect();
         let title = format!("─ {} ", session.title);
         for i in 0..rect.height as usize {
             let line = if i == 0 {
@@ -241,22 +313,39 @@ impl PopupCache {
             } else {
                 content.get(i - 1).cloned().unwrap_or_default()
             };
-            if self.rows[i].as_ref() == Some(&line) { continue; }
+            if self.rows[i].as_ref() == Some(&line) {
+                continue;
+            }
             let y = rect.y + i as u16;
             if i == 0 || i == rect.height as usize - 1 {
-                queue!(out, MoveTo(rect.x, y),
-                    SetBackgroundColor(BG), SetForegroundColor(BORDER),
-                    Print(&line), ResetColor)?;
+                queue!(
+                    out,
+                    MoveTo(rect.x, y),
+                    SetBackgroundColor(BG),
+                    SetForegroundColor(BORDER),
+                    Print(&line),
+                    ResetColor
+                )?;
             } else {
                 // Paint the complete row before adding the colored PTY text.
                 // This removes remnants from the file tree or old TUI frames.
-                queue!(out, MoveTo(rect.x, y),
-                    SetBackgroundColor(BG), SetForegroundColor(BORDER), Print("│"),
-                    SetForegroundColor(Color::Reset), Print(" ".repeat(interior)),
-                    SetForegroundColor(BORDER), Print("│"),
-                    ResetColor, MoveTo(rect.x + 1, y),
-                    SetBackgroundColor(BG), SetForegroundColor(Color::Reset),
-                    Print(&line), ResetColor)?;
+                queue!(
+                    out,
+                    MoveTo(rect.x, y),
+                    SetBackgroundColor(BG),
+                    SetForegroundColor(BORDER),
+                    Print("│"),
+                    SetForegroundColor(Color::Reset),
+                    Print(" ".repeat(interior)),
+                    SetForegroundColor(BORDER),
+                    Print("│"),
+                    ResetColor,
+                    MoveTo(rect.x + 1, y),
+                    SetBackgroundColor(BG),
+                    SetForegroundColor(Color::Reset),
+                    Print(&line),
+                    ResetColor
+                )?;
             }
             self.rows[i] = Some(line);
         }
@@ -269,7 +358,9 @@ fn fit(text: &str, width: usize) -> String {
     let mut n = 0;
     for ch in text.chars() {
         let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if n + cells > width { break; }
+        if n + cells > width {
+            break;
+        }
         n += cells;
         out.push(ch);
     }
@@ -311,17 +402,25 @@ mod tests {
     fn real_pty_is_interactive_and_popup_repaints_only_changed_rows() {
         let cwd = std::env::temp_dir();
         let rect = popup_rect(100, 35).unwrap();
-        let mut session = Session::spawn("/bin/sh", &cwd,
-            "dme :: integration terminal".into(), rect).unwrap();
+        let mut session =
+            Session::spawn("/bin/sh", &cwd, "dme :: integration terminal".into(), rect).unwrap();
 
         // Run a command inside a genuine PTY, rather than just mocking VT
         // output. This catches broken pipe setup and reader-thread wiring.
-        session.writer.write_all(b"printf PTY_IS_WORKING\r").unwrap();
+        session
+            .writer
+            .write_all(b"printf PTY_IS_WORKING\r")
+            .unwrap();
         session.writer.flush().unwrap();
         let mut found = false;
         for _ in 0..120 {
             session.poll().unwrap();
-            if session.parser.screen().contents().contains("PTY_IS_WORKING") {
+            if session
+                .parser
+                .screen()
+                .contents()
+                .contains("PTY_IS_WORKING")
+            {
                 found = true;
                 break;
             }
@@ -341,21 +440,30 @@ mod tests {
         popup.paint(&mut idle, rect, &session).unwrap();
         assert!(idle.is_empty(), "unchanged PTY rows must not be repainted");
 
-        popup.invalidate_underpaint(rect.x as usize, rect.y as usize + 1,
-            rect.width as usize);
+        popup.invalidate_underpaint(rect.x as usize, rect.y as usize + 1, rect.width as usize);
         let mut repaired = Vec::new();
         popup.paint(&mut repaired, rect, &session).unwrap();
-        assert!(!repaired.is_empty(), "overdrawn terminal line must be restored");
+        assert!(
+            !repaired.is_empty(),
+            "overdrawn terminal line must be restored"
+        );
         assert_eq!(popup.set_rect(None), Some(rect));
     }
 
     #[test]
     fn vt100_handles_lazygit_style_sgr_and_cursor_control() {
         let mut parser = vt100::Parser::new(
-            NonZeroU16::new(12).unwrap(), NonZeroU16::new(80).unwrap(), 32
+            NonZeroU16::new(12).unwrap(),
+            NonZeroU16::new(80).unwrap(),
+            32,
         );
         parser.process(b"\x1b[H\x1b[31mStage changes\x1b[0m\r\n");
         assert!(parser.screen().contents().contains("Stage changes"));
-        assert!(parser.screen().rows_formatted(0, 80).next().unwrap().contains("Stage changes"));
+        assert!(parser
+            .screen()
+            .rows_formatted(0, 80)
+            .next()
+            .unwrap()
+            .contains("Stage changes"));
     }
 }
