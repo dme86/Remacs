@@ -1,6 +1,8 @@
 //! A small, Unicode-aware editable document. No upstream MicroEmacs code is used.
 use std::{fs, io, path::PathBuf};
 
+use crate::function_select::TextRange;
+
 pub struct Document {
     pub lines: Vec<Vec<char>>,
     pub path: Option<PathBuf>,
@@ -232,6 +234,39 @@ impl Document {
             }
             col = 0;
         }
+    }
+
+    pub fn text_in_range(&self, range: TextRange) -> String {
+        if range.start >= range.end || range.end.row >= self.lines.len() {
+            return String::new();
+        }
+        let mut output = String::new();
+        for row in range.start.row..=range.end.row {
+            if row > range.start.row { output.push('\n'); }
+            let line = &self.lines[row];
+            let from = if row == range.start.row { range.start.col } else { 0 };
+            let to = if row == range.end.row { range.end.col } else { line.len() };
+            if from <= to && to <= line.len() {
+                output.extend(line[from..to].iter());
+            }
+        }
+        output
+    }
+
+    pub fn delete_text_range(&mut self, range: TextRange) {
+        if range.start >= range.end || range.end.row >= self.lines.len()
+            || range.start.col > self.lines[range.start.row].len()
+            || range.end.col > self.lines[range.end.row].len()
+        {
+            return;
+        }
+        let mut joined = self.lines[range.start.row][..range.start.col].to_vec();
+        joined.extend_from_slice(&self.lines[range.end.row][range.end.col..]);
+        self.lines.splice(range.start.row..=range.end.row, std::iter::once(joined));
+        self.row = range.start.row;
+        self.col = range.start.col;
+        self.dirty = true;
+        self.invalidate_syntax_from(range.start.row);
     }
 
     pub fn insert_text(&mut self, text: &str) {

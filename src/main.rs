@@ -1,5 +1,6 @@
 //! Remacs: a minimal terminal editor with Vim-style modes and Doom-inspired leader keys.
 mod document;
+mod function_select;
 mod plugins;
 mod syntax;
 
@@ -17,6 +18,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use document::Document;
+use function_select::{around_function, Position, TextRange};
 use plugins::{TreeAction, TreePlugin, TreeView};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -28,11 +30,13 @@ const CURRENT_LINE_BG: Color = Color::Rgb { r: 49, g: 50, b: 57 };
 const GUTTER_BG: Color = Color::Rgb { r: 35, g: 36, b: 42 };
 const GUTTER_FG: Color = Color::Rgb { r: 116, g: 119, b: 132 };
 const CURRENT_NUMBER_FG: Color = Color::Rgb { r: 223, g: 211, b: 255 };
+const VISUAL_SELECTION_BG: Color = Color::Rgb { r: 83, g: 69, b: 111 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Normal,
     Insert,
+    Visual,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +46,8 @@ enum Sequence {
     Leader,
     File,
     Panel,
+    Visual,
+    TextObjectAround,
     Quit,
     Delete,
     Yank,
@@ -109,6 +115,7 @@ struct PaintedLine {
     content: Option<Vec<char>>,
     gutter: String,
     active: bool,
+    selected: Option<(usize, usize)>,
 }
 
 struct Editor {
@@ -119,6 +126,8 @@ struct Editor {
     scroll_row: usize,
     scroll_col: usize,
     mode: Mode,
+    selection: Option<TextRange>,
+    visual_anchor: Option<Position>,
     sequence: Sequence,
     control_x: bool,
     count: Option<usize>,
@@ -142,6 +151,8 @@ impl Editor {
             scroll_row: 0,
             scroll_col: 0,
             mode: Mode::Normal,
+            selection: None,
+            visual_anchor: None,
             sequence: Sequence::None,
             control_x: false,
             count: None,
@@ -270,6 +281,103 @@ impl Editor {
         }
     }
 
+    fn leave_visual(&mut self) {
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.visual_anchor = None;
+        self.sequence = Sequence::None;
+    }
+
+    fn enter_visual(&mut self) {
+        self.mode = Mode::Visual;
+        self.visual_anchor = Some(Position { row: self.doc.row, col: self.doc.col });
+        self.update_visual_selection();
+        self.message = "VISUAL: a f Function | y Yank | d Delete | Esc Cancel".into();
+    }
+
+    fn update_visual_selection(&mut self) {
+        let Some(anchor) = self.visual_anchor else { return };
+        let here = Position { row: self.doc.row, col: self.doc.col };
+        let inclusive_end = |position: Position, doc: &Document| Position {
+            row: position.row,
+            col: (position.col + 1).min(doc.lines[position.row].len()),
+        };
+        self.selection = Some(if anchor <= here {
+            TextRange { start: anchor, end: inclusive_end(here, &self.doc) }
+        } else {
+            TextRange { start: here, end: inclusive_end(anchor, &self.doc) }
+        });
+    }
+
+    fn select_function(&mut self) {
+        self.sequence = Sequence::None;
+        match around_function(&self.doc) {
+            Ok(Some(range)) => {
+                self.mode = Mode::Visual;
+                self.visual_anchor = Some(range.start);
+                self.selection = Some(range);
+                self.doc.row = range.end.row;
+                self.doc.col = range.end.col.saturating_sub(1);
+                self.message = "VISUAL FUNCTION: y Yank | d Delete | Esc Cancel".into();
+            }
+            Ok(None) => self.message = "No surrounding function at the cursor".into(),
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn visual_key(&mut self, key: KeyEvent) {
+        if self.sequence == Sequence::TextObjectAround {
+            self.sequence = Sequence::None;
+            if key.code == KeyCode::Char('f') {
+                self.select_function();
+            } else {
+                self.message = "Unknown Visual text object (use a f)".into();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('a') => {
+                self.sequence = Sequence::TextObjectAround;
+                return;
+            }
+            KeyCode::Char('v') => {
+                self.leave_visual();
+                return;
+            }
+            KeyCode::Char('y') => {
+                if let Some(range) = self.selection {
+                    let text = self.doc.text_in_range(range);
+                    self.register = Some(Register::Text(text));
+                    self.message = "Selection yanked into Remacs register".into();
+                }
+                self.leave_visual();
+                return;
+            }
+            KeyCode::Char('d') => {
+                if let Some(range) = self.selection {
+                    if range.start < range.end {
+                        self.remember();
+                        self.register = Some(Register::Text(self.doc.text_in_range(range)));
+                        self.doc.delete_text_range(range);
+                        self.message = "Selection deleted (u to undo)".into();
+                    }
+                }
+                self.leave_visual();
+                return;
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.doc.left(),
+            KeyCode::Char('j') | KeyCode::Down => self.doc.down(),
+            KeyCode::Char('k') | KeyCode::Up => self.doc.up(),
+            KeyCode::Char('l') | KeyCode::Right => self.doc.right(),
+            KeyCode::Char('0') | KeyCode::Home => self.doc.home(),
+            KeyCode::Char('$') | KeyCode::End => self.doc.end(),
+            KeyCode::Char('w') => self.doc.word_forward(),
+            KeyCode::Char('b') => self.doc.word_backward(),
+            _ => return,
+        }
+        self.update_visual_selection();
+    }
+
     fn save(&mut self) {
         if self.doc.path.is_none() {
             self.prompt = Some(Prompt::SaveAs(String::new()));
@@ -294,6 +402,8 @@ impl Editor {
                 self.scroll_col = 0;
                 self.count = None;
                 self.mode = Mode::Normal;
+                self.selection = None;
+                self.visual_anchor = None;
                 self.undo.clear();
                 self.redo.clear();
                 self.message = format!("Opened {name}");
@@ -433,9 +543,8 @@ impl Editor {
             }
         }
         if key.code == KeyCode::Esc {
-            if self.mode == Mode::Insert {
-                self.leave_insert();
-            }
+            if self.mode == Mode::Insert { self.leave_insert(); }
+            else if self.mode == Mode::Visual { self.leave_visual(); }
             self.sequence = Sequence::None;
             self.control_x = false;
             self.count = None;
@@ -490,6 +599,10 @@ impl Editor {
             }
             return;
         }
+        if self.mode == Mode::Visual {
+            self.visual_key(key);
+            return;
+        }
         self.normal_key(key, page_height);
     }
 
@@ -500,6 +613,8 @@ impl Editor {
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
                 (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
+                (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
+                (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
                 (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
@@ -538,6 +653,7 @@ impl Editor {
         let count = explicit_count.unwrap_or(1);
         match key.code {
             KeyCode::Char(' ') => self.sequence = Sequence::Leader,
+            KeyCode::Char('v') => self.enter_visual(),
             KeyCode::Char('i') => self.begin_insert(),
             KeyCode::Char('a') => {
                 if self.doc.col < self.doc.line().len() { self.doc.col += 1; }
@@ -745,10 +861,12 @@ impl Editor {
                 painted.index != index || painted.content.as_deref() != content
             });
             let highlight_changed = old.is_none_or(|painted| painted.active != active);
+            let selected = self.selection.and_then(|range| range.columns(index, line.map_or(0, Vec::len)));
+            let selection_changed = old.is_none_or(|painted| painted.selected != selected);
             let gutter_changed = old.is_none_or(|painted| painted.gutter != number);
             let syntax_stale = self.syntax.enabled()
                 && syntax_invalid.is_some_and(|first| index >= first);
-            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale;
+            let paint_text = repaint_all || text_stale || highlight_changed || syntax_stale || selection_changed;
 
             if !paint_text && !gutter_changed {
                 continue;
@@ -770,7 +888,16 @@ impl Editor {
 
                 let mut visible_width = 0;
                 if let Some(line) = line {
-                    if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
+                    if let Some(columns) = selected {
+                        let spans = self.syntax.spans(&self.doc, index);
+                        for (foreground, background, text) in render_selected_line(
+                            line, spans.unwrap_or(&[]), self.scroll_col, text_width, columns, active
+                        ) {
+                            visible_width += UnicodeWidthStr::width(text.as_str());
+                            queue!(output, SetForegroundColor(foreground), SetBackgroundColor(background), Print(text))?;
+                        }
+                        queue!(output, ResetColor)?;
+                    } else if let Some(spans) = self.syntax.spans(&self.doc, index).filter(|s| !s.is_empty()) {
                         for (color, text) in render_color_line(line, spans, self.scroll_col, text_width) {
                             visible_width += UnicodeWidthStr::width(text.as_str());
                             queue!(output, SetForegroundColor(color), Print(text))?;
@@ -785,6 +912,7 @@ impl Editor {
                     // Fill to the right edge without clearing the terminal.
                     // This also highlights empty lines and trailing whitespace.
                     queue!(output,
+                        SetBackgroundColor(CURRENT_LINE_BG),
                         SetForegroundColor(Color::Reset),
                         Print(" ".repeat(text_width.saturating_sub(visible_width))),
                         ResetColor
@@ -799,6 +927,7 @@ impl Editor {
                 content: line.cloned(),
                 gutter: number,
                 active,
+                selected,
             });
         }
 
@@ -807,7 +936,7 @@ impl Editor {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".into());
             let mark = if self.doc.dirty { "**" } else { "--" };
-            let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT" };
+            let mode = match self.mode { Mode::Normal => "NORMAL", Mode::Insert => "INSERT", Mode::Visual => "VISUAL" };
             let language = if self.syntax.enabled() { self.syntax.name() } else { "Highlight off" };
             let pane = if self.tree.as_ref().is_some_and(|tree| tree.visible) { " | TREE" } else { "" };
             let status = format!(" {mark} Remacs [{mode}] | {filename} | {language}{pane} | Ln {}, Col {} ", self.doc.row + 1, self.doc.col + 1);
@@ -831,9 +960,11 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → f Files | o Panels | q Quit".into(),
+                    Sequence::Leader => "SPC → f Files | o Panels | v Visual | q Quit".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
+                    Sequence::Visual => "SPC v → f Select function".into(),
+                    Sequence::TextObjectAround => "VISUAL a → f Function".into(),
                     Sequence::Quit => "SPC q → q Quit".into(),
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
@@ -966,6 +1097,64 @@ fn render_color_line(line: &[char], spans: &[Span], start: usize, width: usize) 
             }
             column += size;
         }
+    }
+    runs
+}
+
+fn render_selected_line(
+    line: &[char], spans: &[Span], scroll: usize, width: usize,
+    selection: (usize, usize), active: bool,
+) -> Vec<(Color, Color, String)> {
+    let mut runs: Vec<(Color, Color, String)> = Vec::new();
+    let mut visual_col = 0;
+    let mut syntax_index = 0;
+    let end = scroll.saturating_add(width);
+    for (index, &ch) in line.iter().enumerate() {
+        if visual_col >= end { break; }
+        while syntax_index < spans.len() && index >= spans[syntax_index].end {
+            syntax_index += 1;
+        }
+        let foreground = spans.get(syntax_index)
+            .filter(|span| index >= span.start && index < span.end)
+            .map_or(Color::Reset, |span| span.foreground);
+        let background = if (selection.0..selection.1).contains(&index) {
+            VISUAL_SELECTION_BG
+        } else if active {
+            CURRENT_LINE_BG
+        } else {
+            Color::Reset
+        };
+        let size = char_width(ch, visual_col);
+        let mut visible = String::new();
+        if ch == '\t' || ch.is_control() {
+            for offset in 0..size.max(usize::from(ch.is_control())) {
+                if visual_col + offset >= scroll && visual_col + offset < end {
+                    visible.push(' ');
+                }
+            }
+        } else if size == 0 {
+            if visual_col > scroll && visual_col <= end { visible.push(ch); }
+        } else if visual_col >= scroll && visual_col + size <= end {
+            visible.push(ch);
+        } else {
+            for offset in 0..size {
+                if visual_col + offset >= scroll && visual_col + offset < end {
+                    visible.push(' ');
+                }
+            }
+        }
+        if !visible.is_empty() {
+            if let Some((fg, bg, text)) = runs.last_mut() {
+                if *fg == foreground && *bg == background {
+                    text.push_str(&visible);
+                } else {
+                    runs.push((foreground, background, visible));
+                }
+            } else {
+                runs.push((foreground, background, visible));
+            }
+        }
+        visual_col += size;
     }
     runs
 }
@@ -1211,6 +1400,61 @@ mod tests {
         editor.toggle_tree();
         assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible));
         assert_eq!(editor.doc.line().iter().collect::<String>(), "UNCHANGED-EDITOR-CONTENT");
+    }
+
+    #[test]
+    fn visual_function_selection_and_yank() {
+        let mut doc = Document::from_text("pub fn from_text(text: &str) -> Self {\n  let v = { 42 };\n  Self { v }\n}\n");
+        doc.path = Some(PathBuf::from("src/document.rs"));
+        doc.row = 1;
+        doc.col = 5;
+        let mut editor = Editor::new(doc);
+        for key in ['v', 'a', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.mode, Mode::Visual);
+        let selected = editor.selection.unwrap();
+        assert_eq!(selected.start, Position { row: 0, col: 0 });
+        assert_eq!(selected.end, Position { row: 3, col: 1 });
+        let output = paint(&mut editor);
+        assert!(output.contains("\x1b[48;2;83;69;111m"));
+        press(&mut editor, KeyCode::Char('y'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.selection.is_none());
+        match editor.register.as_ref().unwrap() {
+            Register::Text(text) => assert!(text.starts_with("pub fn from_text")),
+            _ => panic!("expected selected function in register"),
+        }
+        assert_eq!(editor.doc.lines.len(), 5);
+    }
+
+    #[test]
+    fn doom_function_shortcut_delete_is_undoable() {
+        let mut doc = Document::from_text("fn f() {\n  println!(\"hi\");\n}\nfn g() {}\n");
+        doc.path = Some(PathBuf::from("src/lib.rs"));
+        doc.row = 1;
+        let mut editor = Editor::new(doc);
+        for key in [' ', 'v', 'f'] { press(&mut editor, KeyCode::Char(key)); }
+        assert_eq!(editor.mode, Mode::Visual);
+        press(&mut editor, KeyCode::Char('d'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.doc.lines[0].is_empty());
+        assert!(editor.doc.lines[1].iter().collect::<String>().contains("fn g"));
+        press(&mut editor, KeyCode::Char('u'));
+        assert!(editor.doc.lines[0].iter().collect::<String>().starts_with("fn f"));
+    }
+
+    #[test]
+    fn visual_manual_motions_and_escape() {
+        let mut editor = Editor::new(Document::from_text("abcd\nsecond\nthird"));
+        press(&mut editor, KeyCode::Char('v'));
+        press(&mut editor, KeyCode::Char('l'));
+        let range = editor.selection.unwrap();
+        assert_eq!(range.columns(0, 4), Some((0, 2)));
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.mode, Mode::Normal);
+        let output = paint(&mut editor);
+        assert!(output.contains("abcd"));
+        assert!(!output.contains("\x1b[2J"));
     }
 
     #[test]
