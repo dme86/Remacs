@@ -21,7 +21,7 @@ use crossterm::{
 use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache};
 use function_select::{around_function, Position, TextRange};
-use plugins::{TreeAction, TreePlugin, TreeView};
+use plugins::{TreeAction, TreePlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -861,6 +861,10 @@ impl Editor {
                         ResetColor
                     )?;
                     self.screen.sidebar_lines[y] = Some(cell);
+                    // This row may lie behind the centered finder. If the
+                    // sidebar just repainted it, the popup must redraw that
+                    // portion even when its own text is unchanged.
+                    self.screen.finder.invalidate_underpaint(0, y, sidebar_width);
                 }
             }
         }
@@ -895,6 +899,7 @@ impl Editor {
                     Print(&number),
                     ResetColor
                 )?;
+                self.screen.finder.invalidate_underpaint(sidebar_width, y, gutter_width);
             }
             if paint_text {
                 queue!(output, MoveTo((sidebar_width + gutter_width) as u16, y as u16), ResetColor)?;
@@ -937,6 +942,9 @@ impl Editor {
                     // Remove any tail left by a previously longer line.
                     queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
                 }
+                self.screen.finder.invalidate_underpaint(
+                    sidebar_width + gutter_width, y, text_width
+                );
             }
             self.screen.lines[y] = Some(PaintedLine {
                 index,
@@ -1442,6 +1450,49 @@ mod tests {
         assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
         assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_none());
         assert_eq!(editor.doc.line().iter().collect::<String>(), "editor text");
+    }
+
+    #[test]
+    fn overlay_is_repainted_after_sidebar_redraw_during_fuzzy_search() {
+        let mut editor = Editor::new(Document::from_text(
+            &vec!["SOME-EDITOR-CONTENT"; 60].join("\n")
+        ));
+        let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
+        tree.toggle().unwrap();
+        editor.tree = Some(tree);
+
+        // Use a 120-column terminal where the centered dialog intersects
+        // both the sidebar and the editor (the reported macOS layout).
+        let draw = |editor: &mut Editor| {
+            let mut output = Vec::new();
+            editor.draw_at(&mut output, 120, 40).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        draw(&mut editor);
+        press(&mut editor, KeyCode::Char('/'));
+        assert!(draw(&mut editor).contains("FIND FILES"));
+
+        let popup = finder_rect_for(120, 38).unwrap();
+        let overlap_y = popup.y as usize;
+        assert!((popup.x as usize) < tree_sidebar_width(120, true));
+
+        // Simulate the tree re-rendering a row on the popup's title.
+        // Previously this overwrote the left edge of the title, while
+        // the popup cache incorrectly skipped repainting that row.
+        editor.screen.sidebar_lines[overlap_y] = None;
+        press(&mut editor, KeyCode::Char('p'));
+        let frame = draw(&mut editor);
+        assert!(frame.contains("FIND FILES"),
+            "unchanged popup header must be repainted after tree overlap");
+        assert!(frame.contains("  > p"),
+            "search input must remain intact when the tree repaints");
+
+        // Simulate an underlying editor repaint on the popup header too.
+        editor.screen.lines[overlap_y] = None;
+        let frame = draw(&mut editor);
+        assert!(frame.contains("FIND FILES"),
+            "popup border must survive redraws from the editor pane");
+        assert!(!frame.contains("\x1b[2J"), "no fullscreen clear needed");
     }
 
     #[test]
