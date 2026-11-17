@@ -1889,6 +1889,95 @@ mod tests {
     }
 
     #[test]
+    fn alt_j_and_alt_k_cycle_buffers_without_leader() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.doc.insert('!');
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        assert_eq!(editor.active_slot, 1);
+        editor.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), 12);
+        assert_eq!(editor.active_slot, 0);
+        assert!(editor.doc.dirty, "modified buffer must survive direct switching");
+        assert_eq!(editor.doc.line().first(), Some(&'!'));
+
+        editor.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), 12);
+        assert_eq!(editor.active_slot, 1);
+        editor.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 0);
+        editor.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.active_slot, 1);
+        assert_eq!(editor.slots.len(), 2);
+        assert_eq!(editor.dirty_buffers(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_p_opens_existing_fuzzy_buffer_picker_and_switches_to_last_file() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        editor.key(ctrl_p, 12);
+        assert!(editor.buffer_picker.is_some());
+        assert!(paint(&mut editor).contains("SWITCH BUFFER"));
+        // Default selection prefers the previous file for rapid back-and-forth.
+        assert_eq!(editor.buffer_picker.as_ref().unwrap().selected, 0);
+        editor.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 12);
+        assert_eq!(editor.active_slot, 0);
+        assert!(editor.buffer_picker.is_none());
+
+        editor.key(ctrl_p, 12);
+        assert_eq!(editor.buffer_picker.as_ref().unwrap().selected, 1);
+        editor.key(ctrl_p, 12);
+        assert!(editor.buffer_picker.is_none(), "Ctrl+P toggles the dialog");
+
+        editor.key(ctrl_p, 12);
+        for c in "two".chars() {
+            editor.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), 12);
+        }
+        assert_eq!(editor.buffer_picker_view().unwrap().total_matches, 1);
+        editor.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 12);
+        assert_eq!(editor.active_slot, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_p_works_with_tree_focused_and_does_not_close_it() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        editor.toggle_tree();
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
+
+        editor.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), 12);
+        assert!(editor.buffer_picker.is_some());
+        assert!(paint(&mut editor).contains("SWITCH BUFFER"));
+        editor.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 12);
+        assert!(editor.buffer_picker.is_none());
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        editor.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT), 12);
+        assert_eq!(editor.active_slot, 0);
+        // Opening the chooser must not re-read or discard files.
+        assert_eq!(editor.slots.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn alt_keys_do_not_switch_buffers_while_inserting_text() {
+        let root = temporary_buffer_project();
+        let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
+        editor.open(root.join("two.md").to_string_lossy().into_owned());
+        press(&mut editor, KeyCode::Char('i'));
+        editor.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), 12);
+        editor.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL), 12);
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.active_slot, 1);
+        press(&mut editor, KeyCode::Esc);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn doom_buffer_navigation_and_last_buffer_are_stable() {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
