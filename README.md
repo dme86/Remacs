@@ -51,8 +51,8 @@ shows incomplete sequences.
 | Yank line / paste | **`yy` / `p`** |
 | Undo / redo | **`u` / `Ctrl+R`** |
 | Open file in a buffer | **`SPC f f`** (or select in tree) |
-| Switch buffers (searchable picker) | **`SPC b b`** |
-| Next / previous buffer | **`SPC b n`** / **`SPC b p`** |
+| Switch buffers (searchable picker) | **`Ctrl+P`** or **`SPC b b`** |
+| Next / previous buffer | **`Alt+j`** / **`Alt+k`**, or **`Ctrl+PageDown`** / **`Ctrl+PageUp`**; `SPC b n/p` still work |
 | Toggle last buffer | **`SPC b l`** |
 | Close current buffer (only if saved) | **`SPC b d`** |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
@@ -89,10 +89,18 @@ from the tree, the fuzzy finder, `SPC f f`, or `:e FILE` leaves the old
 buffer intact. Opening a file already in the buffer list switches back to
 that same buffer rather than rereading the file and losing edits.
 
-**`SPC b b`** opens a searchable popup listing all buffers. Start typing
+**`Ctrl+P`** opens the same centered, fuzzy-searchable buffer popup as **`SPC b b`**.
+The previously used buffer is preselected, so **`Ctrl+P`, `Enter`** quickly
+switches back without typing. Press `Ctrl+P` again or `Esc` to dismiss it.
+Start typing
 to filter by name/path, use Up/Down (or Tab/Shift+Tab), and Enter to switch.
 A `●` denotes unsaved edits and `▶` marks the active buffer.
-**`SPC b n`** and **`SPC b p`** cycle through buffers;
+**`Alt+j`** and **`Alt+k`** cycle through buffers directly in Normal mode;
+**`Ctrl+PageDown`** and **`Ctrl+PageUp`** provide an alternative if your
+terminal does not transmit Alt/Meta combinations. The original
+**`SPC b n`** and **`SPC b p`** also work. These direct shortcuts work even
+with the tree focused, returning focus to the editor after switching.
+On macOS, your terminal may need **Option as Meta** enabled for `Alt+j/k`.
 **`SPC b l`** toggles between the two most recently active buffers.
 The footer shows a compact **`B 2/4  ●2  SPC b s`** when you're in
 buffer 2 of 4 and two buffers have unsaved edits. The `●` count includes
