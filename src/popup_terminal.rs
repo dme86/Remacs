@@ -16,7 +16,7 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, PtySystem};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 const BG: Color = Color::Rgb { r: 33, g: 34, b: 41 };
 const BORDER: Color = Color::Rgb { r: 215, g: 153, b: 33 };
@@ -222,6 +222,10 @@ impl PopupCache {
     pub fn paint(&mut self, out: &mut impl Write, rect: Rect, session: &Session) -> io::Result<()> {
         self.rows.resize_with(rect.height as usize, || None);
         let interior = (rect.width - 2) as usize;
+        // Query rows just once. VT100 may output SGR formatting; never emit
+        // the child stream's raw cursor-addressing sequences into Remacs.
+        let content: Vec<String> = session.parser.screen()
+            .rows_formatted(0, rect.width - 2).collect();
         let title = format!("─ {} ", session.title);
         for i in 0..rect.height as usize {
             let line = if i == 0 {
@@ -230,36 +234,30 @@ impl PopupCache {
             } else if i == rect.height as usize - 1 {
                 format!("╰{}╯", "─".repeat(interior))
             } else {
-                // vt100 provides per-row content with ANSI SGR colors.
-                let screen_row = (i - 1) as usize;
-                let text = session.parser.screen().rows_formatted(0, rect.width - 2)
-                    .nth(screen_row).unwrap_or_default();
-                // Keep each cell inside the popup. Rows are exactly the PTY
-                // width; redraw the background before emitting colored cells.
-                format!("│\x1b[0m{BG_SGR}{text}\x1b[0m{BG_SGR}│")
+                content.get(i - 1).cloned().unwrap_or_default()
             };
             if self.rows[i].as_ref() == Some(&line) { continue; }
-            let (fg, bg) = if i == 0 || i == rect.height as usize - 1 {
-                (BORDER, BG)
+            let y = rect.y + i as u16;
+            if i == 0 || i == rect.height as usize - 1 {
+                queue!(out, MoveTo(rect.x, y),
+                    SetBackgroundColor(BG), SetForegroundColor(BORDER),
+                    Print(&line), ResetColor)?;
             } else {
-                (Color::Reset, BG)
-            };
-            queue!(out,
-                MoveTo(rect.x, rect.y + i as u16),
-                SetBackgroundColor(bg),
-                SetForegroundColor(fg),
-                Print(&line),
-                ResetColor
-            )?;
+                // Paint the complete row before adding the colored PTY text.
+                // This removes remnants from the file tree or old TUI frames.
+                queue!(out, MoveTo(rect.x, y),
+                    SetBackgroundColor(BG), SetForegroundColor(BORDER), Print("│"),
+                    SetForegroundColor(Color::Reset), Print(" ".repeat(interior)),
+                    SetForegroundColor(BORDER), Print("│"),
+                    ResetColor, MoveTo(rect.x + 1, y),
+                    SetBackgroundColor(BG), SetForegroundColor(Color::Reset),
+                    Print(&line), ResetColor)?;
+            }
             self.rows[i] = Some(line);
         }
         Ok(())
     }
 }
-
-// ANSI SGR background to match the floating-terminal surface after a
-// child row resets its attributes; no cursor-addressing escapes are accepted.
-const BG_SGR: &str = "\x1b[48;2;33;34;41m";
 
 fn fit(text: &str, width: usize) -> String {
     let mut out = String::new();
