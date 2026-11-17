@@ -339,7 +339,14 @@ impl Editor {
     }
 
     fn open_buffer_picker(&mut self) {
-        self.buffer_picker = Some(BufferPicker::default());
+        // Make the most recently visited buffer the initial selection.
+        // Ctrl+P then Enter quickly jumps back without typing a filename.
+        let selected = self.last_slot.unwrap_or(self.active_slot)
+            .min(self.slots.len().saturating_sub(1));
+        self.buffer_picker = Some(BufferPicker {
+            query: String::new(),
+            selected,
+        });
         self.sequence = Sequence::None;
         self.message = "Buffers: type to filter, ↑↓ select, Enter switch, Esc cancel".into();
     }
@@ -895,10 +902,43 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
+        // Ctrl+P opens/closes the existing centered buffer search popup.
+        // Check it before the buffer picker and focused Lua tree so the
+        // shortcut works without a leader and from either pane.
+        if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
+            if self.buffer_picker.is_some() {
+                self.buffer_picker = None;
+            } else {
+                self.open_buffer_picker();
+            }
+            return;
+        }
         if self.buffer_picker.is_some() {
             self.buffer_picker_key(key);
             return;
         }
+
+        // Direct buffer navigation. Alt+j/k follows Vim's movement keys;
+        // Ctrl+PageDown/Up is a fallback for terminals that don't send Meta.
+        // These only operate in Normal mode so accented Option-key input
+        // remains available while inserting text on macOS.
+        if self.mode == Mode::Normal {
+            if key.modifiers == KeyModifiers::ALT {
+                match key.code {
+                    KeyCode::Char('j') => { self.cycle_buffer(true); return; }
+                    KeyCode::Char('k') => { self.cycle_buffer(false); return; }
+                    _ => {}
+                }
+            }
+            if key.modifiers == KeyModifiers::CONTROL {
+                match key.code {
+                    KeyCode::PageDown => { self.cycle_buffer(true); return; }
+                    KeyCode::PageUp => { self.cycle_buffer(false); return; }
+                    _ => {}
+                }
+            }
+        }
+
         // Ctrl+N is a global tree toggle, even when the tree or its fuzzy
         // finder has focus. Handle it before forwarding keys to Lua.
         if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
