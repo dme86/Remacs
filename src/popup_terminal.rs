@@ -301,6 +301,49 @@ mod tests {
         assert_eq!(key(KeyCode::Tab, KeyModifiers::SHIFT), b"\x1b[Z");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_pty_is_interactive_and_popup_repaints_only_changed_rows() {
+        let cwd = std::env::temp_dir();
+        let rect = popup_rect(100, 35).unwrap();
+        let mut session = Session::spawn("/bin/sh", &cwd,
+            "dme :: integration terminal".into(), rect).unwrap();
+
+        // Run a command inside a genuine PTY, rather than just mocking VT
+        // output. This catches broken pipe setup and reader-thread wiring.
+        session.writer.write_all(b"printf PTY_IS_WORKING\r").unwrap();
+        session.writer.flush().unwrap();
+        let mut found = false;
+        for _ in 0..120 {
+            session.poll().unwrap();
+            if session.parser.screen().contents().contains("PTY_IS_WORKING") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(found, "shell output must reach the terminal emulator");
+
+        let mut popup = PopupCache::default();
+        popup.set_rect(Some(rect));
+        let mut initial = Vec::new();
+        popup.paint(&mut initial, rect, &session).unwrap();
+        let rendered = String::from_utf8(initial).unwrap();
+        assert!(rendered.contains("dme :: integration terminal"));
+        assert!(rendered.contains("PTY_IS_WORKING"));
+
+        let mut idle = Vec::new();
+        popup.paint(&mut idle, rect, &session).unwrap();
+        assert!(idle.is_empty(), "unchanged PTY rows must not be repainted");
+
+        popup.invalidate_underpaint(rect.x as usize, rect.y as usize + 1,
+            rect.width as usize);
+        let mut repaired = Vec::new();
+        popup.paint(&mut repaired, rect, &session).unwrap();
+        assert!(!repaired.is_empty(), "overdrawn terminal line must be restored");
+        assert_eq!(popup.set_rect(None), Some(rect));
+    }
+
     #[test]
     fn vt100_handles_lazygit_style_sgr_and_cursor_control() {
         let mut parser = vt100::Parser::new(
