@@ -19,6 +19,15 @@ pub struct LspPlugin {
 impl LspPlugin {
     pub fn new() -> mlua::Result<Self> {
         let lua = Lua::new();
+        // Load Mason's declarative Lua catalog once per LSP Lua VM. Both
+        // plugins use identical embedded source; no duplicated server lists.
+        let package: Table = lua.globals().get("package")?;
+        let preload: Table = package.get("preload")?;
+        let loader = lua.create_function(|lua, _: ()| {
+            lua.load(include_str!("../plugins/mason.lua"))
+                .set_name("plugins/mason.lua").eval::<Table>()
+        })?;
+        preload.set("remacs.mason", loader)?;
         let plugin: Table = lua.load(include_str!("../plugins/lsp.lua"))
             .set_name("plugins/lsp.lua").eval()?;
         let plugin = lua.create_registry_value(plugin)?;
@@ -37,11 +46,14 @@ impl LspPlugin {
         let Some(ext) = path.extension().and_then(|s| s.to_str()) else { return Ok(None) };
         let Some(server): Option<Table> = self.table()?
             .get::<Function>("server_for")?.call(ext)? else { return Ok(None) };
-        let command: Vec<String> = server.get::<Table>("cmd")?
+        let mut command: Vec<String> = server.get::<Table>("cmd")?
             .sequence_values::<String>().collect::<mlua::Result<_>>()?;
         if command.is_empty() || command[0].is_empty() {
             return Err(mlua::Error::external("LSP command cannot be empty"));
         }
+        // Prefer a private, Remacs-managed LSP binary when installed;
+        // otherwise use the user's own PATH (rustup, brew, system packages).
+        command[0] = crate::mason::resolve_command(&command[0]);
         let roots = server.get::<Table>("roots")?
             .sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?;
         Ok(Some(ServerConfig {
@@ -84,6 +96,25 @@ mod tests {
         assert_eq!(spec.command, ["rust-analyzer"]);
         assert!(spec.root.is_dir());
         assert!(config.server_for(Path::new("README.md"), &root).unwrap().is_none());
+    }
+
+    #[test]
+    fn lsp_reads_same_enabled_servers_as_mason_lua_plugin() {
+        let plugin = LspPlugin::new().unwrap();
+        let mason = crate::mason_plugin::MasonPlugin::new().unwrap();
+        let tools = mason.tools().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        for (extension, language) in [
+            ("go", "go"), ("lua", "lua"), ("yaml", "yaml"), ("json", "json"),
+            ("sh", "bash"), ("rs", "rust")
+        ] {
+            assert!(tools.iter().any(|tool| tool.language == language));
+            let file = format!("main.{extension}");
+            let spec = plugin.server_for(Path::new(&file), &cwd).unwrap().unwrap();
+            assert_eq!(spec.language, language);
+        }
+        // Catalog-only, unselected languages must not start or install.
+        assert!(plugin.server_for(Path::new("main.ts"), &cwd).unwrap().is_none());
     }
 
     #[test]

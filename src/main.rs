@@ -5,6 +5,8 @@ mod function_select;
 mod jumps;
 mod lsp;
 mod lsp_plugin;
+mod mason;
+mod mason_plugin;
 mod plugins;
 mod popup_terminal;
 mod syntax;
@@ -31,6 +33,8 @@ use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
 use lsp::{Event as LspEvent, Manager as LspManager, RequestKind};
 use lsp_plugin::LspPlugin;
+use mason::{Event as MasonEvent, Manager as MasonManager};
+use mason_plugin::MasonPlugin;
 use plugins::{FinderView, TreeAction, TreePlugin};
 use popup_terminal::{popup_rect as terminal_rect, PopupCache as TerminalPopupCache, Session as TerminalSession};
 use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
@@ -62,6 +66,7 @@ enum Sequence {
     File,
     Panel,
     Buffer,
+    Language,
     Visual,
     TextObjectAround,
     Quit,
@@ -193,7 +198,10 @@ struct Editor {
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
+    mason_picker: Option<BufferPicker>,
     hover_popup: Option<String>,
+    mason_plugin: MasonPlugin,
+    mason: MasonManager,
     lsp_plugin: LspPlugin,
     lsp: LspManager,
     jumps: JumpManager,
@@ -221,6 +229,13 @@ struct Editor {
 impl Editor {
     fn new(doc: Document) -> Self {
         let syntax = SyntaxEngine::new(&doc);
+        let mason_plugin = MasonPlugin::new().expect("bundled plugins/mason.lua");
+        let mut mason = MasonManager::new(&mason_plugin)
+            .expect("valid Mason Lua catalog");
+        if !cfg!(test) {
+            // No network activity unless expressly enabled in mason.lua.
+            let _ = mason.auto_queue(&mason_plugin);
+        }
         Self {
             doc,
             syntax,
@@ -228,7 +243,10 @@ impl Editor {
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
+            mason_picker: None,
             hover_popup: None,
+            mason_plugin,
+            mason,
             lsp_plugin: LspPlugin::new().expect("bundled plugins/lsp.lua"),
             lsp: LspManager::default(),
             // Unit tests must not write to the real user's persistent state
@@ -462,6 +480,90 @@ impl Editor {
             scanned: matches.len(),
             matches,
         })
+    }
+
+    fn open_mason_picker(&mut self) {
+        self.mason_picker = Some(BufferPicker::default());
+        self.buffer_picker = None;
+        self.hover_popup = None;
+        self.sequence = Sequence::None;
+        self.message = "Mason: Enter install · Ctrl+U update · Ctrl+S sync · Ctrl+R update all".into();
+    }
+
+    fn mason_view(&self) -> Option<FinderView> {
+        let picker = self.mason_picker.as_ref()?;
+        let entries = self.mason.entries(&picker.query);
+        let total = entries.len();
+        Some(FinderView {
+            query: picker.query.clone(),
+            matches: entries.into_iter().map(|(_, display)| display).collect(),
+            selected: if total == 0 { 0 }
+                else { picker.selected.min(total.saturating_sub(1)) + 1 },
+            total_matches: total,
+            scanned: self.mason.tools().len(),
+        })
+    }
+
+    fn mason_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.mason_picker.as_ref() else { return; };
+        let entries = self.mason.entries(&picker.query);
+        let selected = entries.get(picker.selected).map(|(id, _)| id.clone());
+        let count = entries.len();
+        match key.code {
+            KeyCode::Esc => self.mason_picker = None,
+            KeyCode::Enter => if let Some(id) = selected {
+                self.message = self.mason.queue(&id, false).unwrap_or_else(|error| error);
+            },
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if let Some(id) = selected {
+                    self.message = self.mason.queue(&id, true).unwrap_or_else(|error| error);
+                },
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let n = self.mason.queue_all(false);
+                self.message = format!("Mason queued {n} missing servers");
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let n = self.mason.queue_all(true);
+                self.message = format!("Mason queued {n} server updates");
+            }
+            KeyCode::Down | KeyCode::Tab => if let Some(picker) = &mut self.mason_picker {
+                picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
+            },
+            KeyCode::Up | KeyCode::BackTab => if let Some(picker) = &mut self.mason_picker {
+                picker.selected = picker.selected.saturating_sub(1);
+            },
+            KeyCode::Backspace => if let Some(picker) = &mut self.mason_picker {
+                picker.query.pop();
+                picker.selected = 0;
+            },
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                if let Some(picker) = &mut self.mason_picker {
+                    picker.query.clear();
+                    picker.selected = 0;
+                },
+            KeyCode::Char(c) if !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ) => if let Some(picker) = &mut self.mason_picker {
+                if picker.query.len() < 128 {
+                    picker.query.push(c);
+                    picker.selected = 0;
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn poll_mason(&mut self) {
+        for event in self.mason.poll() {
+            match event {
+                MasonEvent::Done { id, language, updated } => {
+                    self.lsp.reset_language(&language);
+                    self.message = format!("Mason {} {id}; LSP ready to restart",
+                        if updated { "updated" } else { "installed" });
+                }
+                MasonEvent::Message(message) => self.message = message,
+            }
+        }
     }
 
     fn active_name(&self) -> String {
@@ -1219,6 +1321,26 @@ impl Editor {
             "tree" | "tree toggle" => self.toggle_tree(),
             "lazygit" => self.terminal_binding("space g"),
             "terminal" => self.terminal_binding("space t"),
+            "mason" => self.open_mason_picker(),
+            "mason sync" | "mason install" => {
+                let count = self.mason.queue_all(false);
+                self.message = format!("Mason queued {count} missing servers");
+            }
+            "mason update" => {
+                let count = self.mason.queue_all(true);
+                self.message = format!("Mason queued {count} server updates");
+            }
+            "mason log" => {
+                self.message = format!("Mason installation log: {}", self.mason.log_path().display());
+            }
+            value if value.starts_with("mason install ") => {
+                let id = value.trim_start_matches("mason install ").trim();
+                self.message = self.mason.queue(id, false).unwrap_or_else(|error| error);
+            }
+            value if value.starts_with("mason update ") => {
+                let id = value.trim_start_matches("mason update ").trim();
+                self.message = self.mason.queue(id, true).unwrap_or_else(|error| error);
+            }
             "buffers" | "ls" => self.open_buffer_picker(),
             "bn" | "bnext" => self.cycle_buffer(true),
             "bp" | "bprev" => self.cycle_buffer(false),
@@ -1356,6 +1478,10 @@ impl Editor {
             } else {
                 self.open_buffer_picker();
             }
+            return;
+        }
+        if self.mason_picker.is_some() {
+            self.mason_picker_key(key);
             return;
         }
         if self.buffer_picker.is_some() {
@@ -1511,6 +1637,8 @@ impl Editor {
             }
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
+                (Sequence::Leader, KeyCode::Char('l')) => self.sequence = Sequence::Language,
+                (Sequence::Language, KeyCode::Char('m')) => self.open_mason_picker(),
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
                 (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
                 (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
@@ -1727,8 +1855,10 @@ impl Editor {
             None => None,
         };
         let buffer_view = self.buffer_picker_view();
+        let mason_view = self.mason_view();
         let hover_view = self.hover_view();
-        let finder_rect = if buffer_view.is_some() || hover_view.is_some()
+        let finder_rect = if buffer_view.is_some() || mason_view.is_some()
+            || hover_view.is_some()
             || tree_view.as_ref().and_then(|view| view.finder.as_ref()).is_some()
         {
             finder_rect_for(cols, height)
@@ -1936,12 +2066,15 @@ impl Editor {
                     "Discard unsaved changes in {} buffer(s) and quit? (y/n)", self.dirty_buffers()
                 ),
                 None if self.control_x => "C-x".into(),
+                None if self.mason_picker.is_some() =>
+                    "MASON  ↑↓ Select · Enter Install · Ctrl+U Update · Ctrl+S Sync · Ctrl+R Update All".into(),
                 None if self.buffer_picker.is_some() =>
                     "BUFFERS  Type to filter · ↑↓ Choose · Enter Switch · Esc Cancel".into(),
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → b Buffers | f Files | g LazyGit | t Terminal | o Panels | v Visual | q Quit".into(),
+                    Sequence::Leader => "SPC → b Buffers | f Files | l Languages | g LazyGit | t Terminal | o Panels | v Visual | q Quit".into(),
+                    Sequence::Language => "SPC l → m Mason (LSP manager)".into(),
                     Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | s Save All | d Close".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
@@ -1966,7 +2099,9 @@ impl Editor {
         // Overlay the fully visible fzf-style picker after the normal editor
         // and sidebar have painted; only changed popup rows are output.
         if let Some(rect) = finder_rect {
-            if let Some(finder) = hover_view.as_ref() {
+            if let Some(finder) = mason_view.as_ref() {
+                self.screen.finder.paint(output, rect, finder, PickerKind::Mason)?;
+            } else if let Some(finder) = hover_view.as_ref() {
                 self.screen.finder.paint(output, rect, finder, PickerKind::Hover)?;
             } else if let Some(finder) = buffer_view.as_ref() {
                 self.screen.finder.paint(output, rect, finder, PickerKind::Buffers)?;
@@ -1999,7 +2134,7 @@ impl Editor {
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if finder_rect.is_some() => {
                 let rect = finder_rect.unwrap();
-                let query = buffer_view.as_ref().or_else(|| {
+                let query = mason_view.as_ref().or_else(|| buffer_view.as_ref()).or_else(|| {
                     tree_view.as_ref().and_then(|view| view.finder.as_ref())
                 }).map_or("", |finder| finder.query.as_str());
                 let (x, y) = finder_cursor(rect, query);
@@ -2289,6 +2424,7 @@ fn main() -> io::Result<()> {
         // A PTY can produce output without key presses. Event polling
         // ensures interactive TUI refreshes while keeping idle CPU low.
         editor.poll_terminals();
+        editor.poll_mason();
         editor.poll_lsp();
         editor.draw(&mut stdout)?;
         let delay = if !editor.terminals.is_empty() {
@@ -2383,6 +2519,45 @@ mod tests {
         }
         assert_eq!(project_root_for(None, &root), expected);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mason_opens_same_fuzzy_popup_and_filters_language_catalog() {
+        let mut editor = Editor::new(Document::from_text("example"));
+        editor.command("mason");
+        assert!(editor.mason_picker.is_some());
+        let out = paint(&mut editor);
+        assert!(out.contains("MASON"));
+        assert!(out.contains("rust_analyzer"));
+        assert!(out.contains("Ctrl+S sync"));
+        for key in ['g', 'o', 'p', 'l', 's'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        let entries = editor.mason_view().unwrap();
+        assert_eq!(entries.total_matches, 1);
+        assert!(entries.matches[0].contains("gopls"));
+        editor.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10);
+        assert!(editor.mason_picker.is_none());
+        assert!(!paint(&mut editor).contains("MASON"));
+    }
+
+    #[test]
+    fn mason_leader_binding_and_commands_queue_tools_without_starting_downloads() {
+        let mut editor = Editor::new(Document::from_text("example"));
+        for key in [' ', 'l', 'm'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        assert!(editor.mason_picker.is_some());
+        editor.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10);
+        assert!(editor.mason_picker.is_some(), "installer UI stays visible");
+        // An explicit update is allowed even if a system server exists.
+        editor.command("mason update gopls");
+        assert!(editor.message.contains("gopls"));
+        editor.command("mason install nonexistent");
+        assert!(editor.message.contains("Unknown language server"));
+        editor.command("mason log");
+        assert!(editor.message.contains("install.log"));
+        // Test does not tick the installer. Nothing runs without poll_mason.
     }
 
     #[test]
