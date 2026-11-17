@@ -50,6 +50,7 @@ shows incomplete sequences.
 | Jump to mark | **'a** (line) / **`a** (exact column), uppercase for cross-file |
 | Select function (Tree-sitter) | **`vaf`** or **`SPC v f`** |
 | LSP definition and hover (rust-analyzer) | **`gd`** and **`K`** |
+| Language-server manager | **`:mason`** or **`SPC l m`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
 | Yank / delete selection | **`y` / `d`** in VISUAL mode |
 | Delete character / line | **`x` / `dd`** |
@@ -88,10 +89,73 @@ Opening another file does **not** require saving the current one: unsaved change
 stay in their own buffer. Start an empty document with `remacs` and save it
 via `SPC f s`.
 
+## Mason-like language-server manager (Lua plugin)
+
+Remacs includes its own **`plugins/mason.lua`** for declaring the languages and
+language servers you want available. It is inspired by the Mason ecosystem
+in Neovim, but **is not Mason.nvim or its full package registry**. The same
+Lua catalog is consumed by `plugins/lsp.lua`: enabling a language makes
+the LSP client recognize it, and the manager knows how to install it.
+
+The initial desired list is **Rust, Lua, Go, Bash, JSON and YAML**. Python,
+TypeScript/JavaScript and TOML recipes are included but commented out. Edit
+`ensure_installed` in `plugins/mason.lua` and rebuild Remacs to change it.
+New languages can be added with an executable command, file extensions, root
+markers and a typed installation recipe.
+
+| Action | Command / keys |
+| --- | --- |
+| Open searchable server manager | **`:mason`** or **`SPC l m`** |
+| Install highlighted server | **Enter** in the manager |
+| Update highlighted server | **Ctrl+U** in the manager |
+| Install all missing desired servers | **`:mason sync`** or **Ctrl+S** |
+| Update all desired servers | **`:mason update`** or **Ctrl+R** |
+| Install one server | **`:mason install gopls`** |
+| Update one server | **`:mason update gopls`** |
+| View installer log location | **`:mason log`** |
+
+The popup is the same fuzzy UI used for files and buffers. Server entries
+show whether they're installed locally, found on the system PATH, missing,
+queued, installing or failed. Install/update jobs run **asynchronously and
+one at a time**, so editing remains responsive. After installing a server,
+Remacs retries a previously unavailable LSP without requiring a restart.
+
+**No surprise downloads:** `auto_install = false` and
+`auto_update_days = 0` are the defaults. The single explicit
+`:mason sync` command installs missing enabled tools. Optionally set
+`auto_install = true` or a positive `auto_update_days = 7` in the Lua file,
+then rebuild, to enable startup installation or periodic refresh (based on
+successful managed installs/updates). Automatic updates only cover entries
+with a recorded successful installation/update; nothing checks network
+versions in the background otherwise. Updates may fetch latest package
+versions and execute package-manager install scripts.
+
+**Storage:** Go, npm and Cargo servers install into Remacs' private directory
+(`~/Library/Application Support/Remacs/mason` on macOS or
+`${XDG_DATA_HOME:-~/.local/share}/remacs/mason` on Linux). The LSP client
+uses managed executables in preference to the system PATH.
+
+Rust uses **`rustup component add rust-analyzer rust-src`** rather than
+bundling a second compiler. LuaLS uses **Homebrew** (`brew install
+lua-language-server`), which changes the regular Homebrew environment
+rather than the private Remacs directory; on Linux, install LuaLS via your
+system package manager if `brew` is unavailable. Running
+`:mason update` on Rust ensures its components are present in the current
+toolchain; **`rustup update` remains a separate, explicit operation**.
+Other recipes use local `go install`, `npm install --global --prefix`, or
+`cargo install --root`. The required package-manager binary must already be
+available on PATH. No arbitrary shell command strings are evaluated.
+
+This first version manages **LSP servers**, not DAP adapters, linters or
+formatters, and does not implement Mason.nvim's online registry or version
+pinning. Installation logs are kept at `mason/install.log`. The manager's
+local package list is intentionally small and auditable.
+
 ## Language server support (Lua plugin)
 
-Remacs ships **`plugins/lsp.lua`** for language-server configuration and
-shortcuts. The Rust host **`src/lsp.rs`** handles asynchronous LSP 3.17 JSON-RPC
+Remacs ships **`plugins/lsp.lua`** for LSP navigation shortcuts; the
+desired servers and install recipes are configured in **`plugins/mason.lua`**.
+The Rust host **`src/lsp.rs`** handles asynchronous LSP 3.17 JSON-RPC
 over stdio; it starts **one server per language and workspace only when a
 matching file is opened**, never one server per buffer.
 
@@ -126,7 +190,7 @@ not bundled with Remacs.
 Interactive completion, diagnostics and refactoring actions are follow-up
 milestones, not included in this implementation. Language servers and
 keybindings remain configured in Lua; add more languages to
-`plugins/lsp.lua` and rebuild. GitHub Actions exercises a real rust-analyzer
+`plugins/mason.lua` and rebuild. GitHub Actions exercises a real rust-analyzer
 server on both Linux and macOS in addition to protocol unit tests.
 
 ## Floating terminal & LazyGit (Lua plugin)
