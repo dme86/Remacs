@@ -799,6 +799,7 @@ impl Editor {
         self.sequence = Sequence::None;
         match around_function(&self.doc) {
             Ok(Some(range)) => {
+                self.record_current_jump();
                 self.mode = Mode::Visual;
                 self.visual_anchor = Some(range.start);
                 self.selection = Some(range);
@@ -985,6 +986,12 @@ impl Editor {
             "b#" => self.last_buffer(),
             "bd" => self.close_buffer(false),
             "bd!" => self.close_buffer(true),
+            "jumps" => self.message = format!(
+                "{} jump locations (Ctrl+O older, Alt+Right newer)", self.jumps.entries().len()
+            ),
+            "changes" => self.message = format!(
+                "{} recent edits (g; older, g, newer)", self.jumps.changes().len()
+            ),
             "wq" | "x" => {
                 if self.doc.path.is_some() {
                     self.save();
@@ -1098,6 +1105,8 @@ impl Editor {
                 match key.code {
                     KeyCode::Char('j') => { self.cycle_buffer(true); return; }
                     KeyCode::Char('k') => { self.cycle_buffer(false); return; }
+                    KeyCode::Left => { self.jump_back(); return; }
+                    KeyCode::Right => { self.jump_forward(); return; }
                     _ => {}
                 }
             }
@@ -1153,6 +1162,8 @@ impl Editor {
                 KeyCode::Char('x') => self.control_x = true,
                 KeyCode::Char('g') => { self.sequence = Sequence::None; self.count = None; self.message = "Cancelled".into(); }
                 KeyCode::Char('r') if self.mode == Mode::Normal => self.redo(),
+                KeyCode::Char('o') if self.mode == Mode::Normal => self.jump_back(),
+                KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => self.jump_forward(),
                 KeyCode::Char('v') if self.mode == Mode::Normal => self.page_down(page_height),
                 _ => {},
             }
@@ -1223,9 +1234,15 @@ impl Editor {
                     self.message = "Line yanked".into();
                 }
                 (Sequence::Go, KeyCode::Char('g')) => {
+                    self.record_current_jump();
                     self.doc.row = count.unwrap_or(1).saturating_sub(1).min(self.doc.lines.len() - 1);
                     self.doc.home();
                 }
+                (Sequence::Go, KeyCode::Char(';')) => self.jump_to_change(true),
+                (Sequence::Go, KeyCode::Char(',')) => self.jump_to_change(false),
+                (Sequence::MarkSet, KeyCode::Char(name)) => self.set_mark(name),
+                (Sequence::MarkLine, KeyCode::Char(name)) => self.jump_to_mark(name, true),
+                (Sequence::MarkExact, KeyCode::Char(name)) => self.jump_to_mark(name, false),
                 _ => self.message = "Unknown key sequence".into(),
             }
             return;
@@ -1295,7 +1312,11 @@ impl Editor {
                 self.count = explicit_count;
                 self.sequence = Sequence::Go;
             },
+            KeyCode::Char('m') => self.sequence = Sequence::MarkSet,
+            KeyCode::Char('\'') => self.sequence = Sequence::MarkLine,
+            KeyCode::Char('`') => self.sequence = Sequence::MarkExact,
             KeyCode::Char('G') => {
+                self.record_current_jump();
                 self.doc.row = explicit_count.map_or(
                     self.doc.lines.len() - 1,
                     |line| line.saturating_sub(1).min(self.doc.lines.len() - 1),
@@ -1333,9 +1354,11 @@ impl Editor {
     }
 
     fn page_down(&mut self, height: usize) {
+        self.record_current_jump();
         for _ in 0..height.max(1) { self.doc.down(); }
     }
     fn page_up(&mut self, height: usize) {
+        self.record_current_jump();
         for _ in 0..height.max(1) { self.doc.up(); }
     }
 
