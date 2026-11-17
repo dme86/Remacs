@@ -2,6 +2,7 @@
 mod document;
 mod finder_ui;
 mod function_select;
+mod jumps;
 mod plugins;
 mod syntax;
 
@@ -21,6 +22,7 @@ use crossterm::{
 use document::Document;
 use finder_ui::{rect_for as finder_rect_for, search_cursor as finder_cursor, Cache as FinderCache, PickerKind};
 use function_select::{around_function, Position, TextRange};
+use jumps::{JumpManager, Location};
 use plugins::{FinderView, TreeAction, TreePlugin};
 use syntax::{Span, SyntaxEngine};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -56,6 +58,9 @@ enum Sequence {
     Delete,
     Yank,
     Go,
+    MarkSet,
+    MarkLine,
+    MarkExact,
 }
 
 enum Prompt {
@@ -177,6 +182,7 @@ struct Editor {
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
+    jumps: JumpManager,
     tree: Option<TreePlugin>,
     screen: ScreenCache,
     scroll_row: usize,
@@ -206,6 +212,7 @@ impl Editor {
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
+            jumps: JumpManager::load_default(),
             tree: None,
             screen: ScreenCache::default(),
             scroll_row: 0,
@@ -235,6 +242,147 @@ impl Editor {
     fn buffer_name(doc: &Document) -> String {
         doc.path.as_ref().map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "[No Name]".into())
+    }
+
+
+    fn current_location(&self) -> Option<Location> {
+        self.doc.path.as_ref().map(|path| Location {
+            path: path_identity(path),
+            row: self.doc.row,
+            col: self.doc.col,
+        })
+    }
+
+    fn record_current_jump(&mut self) {
+        if let Some(location) = self.current_location() {
+            if let Err(error) = self.jumps.remember(location) {
+                self.message = format!("Jump history could not be saved: {error}");
+            }
+        }
+    }
+
+    fn record_current_change(&mut self) {
+        if let Some(location) = self.current_location() {
+            if let Err(error) = self.jumps.record_change(location) {
+                self.message = format!("Change history could not be saved: {error}");
+            }
+        }
+    }
+
+    fn visit_location(&mut self, target: Location, linewise: bool) -> bool {
+        if !target.path.is_file() {
+            self.message = format!("Jump target missing: {}", target.path.display());
+            return false;
+        }
+        let Some(slot) = self.named_slot(&target.path) else {
+            // Open through the standard buffer API but without adding
+            // the origin as another jump to this already-traversed history.
+            let next = match Document::open(target.path.clone()) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    self.message = format!("Jump target unreadable: {error}");
+                    return false;
+                }
+            };
+            let previous = self.active_slot;
+            let current = self.take_current();
+            self.slots[previous] = Some(current);
+            let index = self.slots.len();
+            self.slots.push(None);
+            self.last_slot = Some(previous);
+            self.activate(StoredBuffer {
+                doc: next, undo: Vec::new(), redo: Vec::new(),
+                scroll_row: 0, scroll_col: 0,
+            }, index);
+            self.move_to_location(target, linewise);
+            return true;
+        };
+        if slot != self.active_slot {
+            self.switch_buffer_internal(slot, false);
+        }
+        self.move_to_location(target, linewise);
+        true
+    }
+
+    fn move_to_location(&mut self, target: Location, linewise: bool) {
+        self.doc.row = target.row.min(self.doc.lines.len().saturating_sub(1));
+        let line = &self.doc.lines[self.doc.row];
+        let col = if linewise {
+            line.iter().position(|c| !c.is_whitespace()).unwrap_or(0)
+        } else {
+            target.col
+        };
+        self.doc.col = col.min(line.len());
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.visual_anchor = None;
+        self.sequence = Sequence::None;
+        self.return_to_editor_after_switch();
+        self.message = format!("Jump: {}:{}:{}",
+            self.doc.path.as_ref().map_or(String::new(), |p| p.display().to_string()),
+            self.doc.row + 1, self.doc.col + 1);
+    }
+
+    fn jump_back(&mut self) {
+        let current = self.current_location();
+        match self.jumps.back(current) {
+            Ok(Some(place)) => { self.visit_location(place, false); }
+            Ok(None) => self.message = "At oldest jump".into(),
+            Err(error) => self.message = format!("Jump history error: {error}"),
+        }
+    }
+
+    fn jump_forward(&mut self) {
+        match self.jumps.forward() {
+            Ok(Some(place)) => { self.visit_location(place, false); }
+            Ok(None) => self.message = "At newest jump".into(),
+            Err(error) => self.message = format!("Jump history error: {error}"),
+        }
+    }
+
+    fn jump_to_change(&mut self, older: bool) {
+        let result = if older {
+            self.jumps.older_change()
+        } else {
+            self.jumps.newer_change()
+        };
+        match result {
+            Ok(Some(place)) => {
+                self.record_current_jump();
+                self.visit_location(place, false);
+            }
+            Ok(None) => self.message = if older {
+                "No older edit location".into()
+            } else {
+                "No newer edit location".into()
+            },
+            Err(error) => self.message = format!("Change history error: {error}"),
+        }
+    }
+
+    fn set_mark(&mut self, name: char) {
+        let Some(location) = self.current_location() else {
+            self.message = "Name this file before setting a persistent mark".into();
+            return;
+        };
+        match self.jumps.set_mark(name, location) {
+            Ok(true) => self.message = format!("Mark {name} saved"),
+            Ok(false) => self.message = "Marks must be letters a-z or A-Z".into(),
+            Err(error) => self.message = format!("Could not save mark: {error}"),
+        }
+    }
+
+    fn jump_to_mark(&mut self, name: char, linewise: bool) {
+        let Some(current) = self.current_location() else {
+            self.message = "Name this file before jumping to a mark".into();
+            return;
+        };
+        if let Some(place) = self.jumps.mark(name, &current.path) {
+            self.record_current_jump();
+            self.visit_location(place, linewise);
+        } else {
+            self.message = format!("Mark {name} not set");
+        }
     }
 
     fn dirty_buffers(&self) -> usize {
@@ -305,9 +453,15 @@ impl Editor {
     }
 
     fn switch_buffer(&mut self, index: usize) {
+        self.switch_buffer_internal(index, true);
+    }
+
+    fn switch_buffer_internal(&mut self, index: usize, record_jump: bool) {
         if index == self.active_slot || index >= self.slots.len() {
             return;
         }
+        if self.slots[index].is_none() { return; }
+        if record_jump { self.record_current_jump(); }
         let Some(next) = self.slots[index].take() else { return; };
         let previous = self.active_slot;
         let current = self.take_current();
@@ -494,6 +648,7 @@ impl Editor {
     }
 
     fn remember(&mut self) {
+        self.record_current_change();
         let snapshot = Snapshot::capture(&self.doc);
         let next_bytes = snapshot.approx_bytes();
         let mut used = self.undo.iter().map(Snapshot::approx_bytes).sum::<usize>();
@@ -785,6 +940,7 @@ impl Editor {
         }
         match Document::open(path) {
             Ok(doc) => {
+                self.record_current_jump();
                 let previous = self.active_slot;
                 let current = self.take_current();
                 self.slots[previous] = Some(current);
