@@ -1331,6 +1331,10 @@ impl Editor {
             }
             return;
         }
+        if self.hover_popup.is_some() {
+            self.hover_popup = None;
+            if key.code == KeyCode::Esc { return; }
+        }
         if self.prompt.is_some() {
             self.prompt_key(key);
             return;
@@ -1494,6 +1498,15 @@ impl Editor {
                     }
                 }
             }
+            if sequence == Sequence::Go {
+                if let KeyCode::Char(c) = key.code {
+                    let binding = format!("g{c}");
+                    if let Ok(Some(action)) = self.lsp_plugin.binding(&binding) {
+                        self.lsp_action(&action);
+                        return;
+                    }
+                }
+            }
             match (sequence, key.code) {
                 (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
@@ -1598,6 +1611,11 @@ impl Editor {
             KeyCode::Char('g') => {
                 self.count = explicit_count;
                 self.sequence = Sequence::Go;
+            },
+            KeyCode::Char('K') => {
+                if let Ok(Some(action)) = self.lsp_plugin.binding("K") {
+                    self.lsp_action(&action);
+                }
             },
             KeyCode::Char('m') => self.sequence = Sequence::MarkSet,
             KeyCode::Char('\'') => self.sequence = Sequence::MarkLine,
@@ -1707,7 +1725,8 @@ impl Editor {
             None => None,
         };
         let buffer_view = self.buffer_picker_view();
-        let finder_rect = if buffer_view.is_some()
+        let hover_view = self.hover_view();
+        let finder_rect = if buffer_view.is_some() || hover_view.is_some()
             || tree_view.as_ref().and_then(|view| view.finder.as_ref()).is_some()
         {
             finder_rect_for(cols, height)
@@ -1945,7 +1964,9 @@ impl Editor {
         // Overlay the fully visible fzf-style picker after the normal editor
         // and sidebar have painted; only changed popup rows are output.
         if let Some(rect) = finder_rect {
-            if let Some(finder) = buffer_view.as_ref() {
+            if let Some(finder) = hover_view.as_ref() {
+                self.screen.finder.paint(output, rect, finder, PickerKind::Hover)?;
+            } else if let Some(finder) = buffer_view.as_ref() {
                 self.screen.finder.paint(output, rect, finder, PickerKind::Buffers)?;
             } else if let Some(finder) = tree_view.as_ref().and_then(|view| view.finder.as_ref()) {
                 self.screen.finder.paint(output, rect, finder, PickerKind::Files)?;
@@ -2266,11 +2287,12 @@ fn main() -> io::Result<()> {
         // A PTY can produce output without key presses. Event polling
         // ensures interactive TUI refreshes while keeping idle CPU low.
         editor.poll_terminals();
+        editor.poll_lsp();
         editor.draw(&mut stdout)?;
-        let delay = if editor.terminals.is_empty() {
-            Duration::from_millis(250)
-        } else {
+        let delay = if !editor.terminals.is_empty() {
             Duration::from_millis(24)
+        } else {
+            Duration::from_millis(90)
         };
         if event::poll(delay)? {
             if let Event::Key(key) = event::read()? {
