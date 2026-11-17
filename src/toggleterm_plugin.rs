@@ -37,6 +37,10 @@ impl ToggleTermPlugin {
         self.table()?.get::<Function>("binding")?.call(key)
     }
 
+    pub fn dismiss(&self, key: &str) -> mlua::Result<bool> {
+        self.table()?.get::<Function>("dismiss")?.call(key)
+    }
+
     pub fn toggle(&self, kind: &str, cwd: &Path) -> mlua::Result<Action> {
         let result: Table = self.table()?.get::<Function>("toggle")?
             .call((kind, cwd.to_string_lossy().into_owned()))?;
@@ -75,6 +79,8 @@ mod tests {
         assert_eq!(plugin.binding("ctrl-t").unwrap().as_deref(), Some("shell"));
         assert_eq!(plugin.binding("space t").unwrap().as_deref(), Some("shell"));
         assert_eq!(plugin.binding("not-a-binding").unwrap(), None);
+        assert!(plugin.dismiss("ctrl-t").unwrap());
+        assert!(!plugin.dismiss("ctrl-n").unwrap());
         let cwd = std::env::temp_dir();
         match plugin.toggle("lazygit", &cwd).unwrap() {
             Action::Open { command, kind, .. } => {
