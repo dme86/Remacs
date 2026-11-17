@@ -1710,14 +1710,16 @@ mod tests {
 
         let status = paint(&mut editor);
         assert!(status.contains("B 2/2  ●2  SPC b s"));
+        // Drawing may normalize scroll offsets for short files. Save-all
+        // must preserve the viewport state as it stands at invocation time.
+        let before_scroll = (editor.scroll_row, editor.scroll_col);
         for key in [' ', 'b', 's'] {
             press(&mut editor, KeyCode::Char(key));
         }
 
         assert_eq!(editor.dirty_buffers(), 0);
         assert_eq!(editor.active_slot, 1);
-        assert_eq!(editor.scroll_row, 2);
-        assert_eq!(editor.scroll_col, 4);
+        assert_eq!((editor.scroll_row, editor.scroll_col), before_scroll);
         assert_eq!(editor.undo.len(), before_undo, "save-all must not wipe undo");
         assert!(std::fs::read_to_string(root.join("one.rs")).unwrap().starts_with('X'));
         assert!(std::fs::read_to_string(root.join("two.md")).unwrap().starts_with('Y'));
