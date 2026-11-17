@@ -217,8 +217,7 @@ pub fn around_function(doc: &Document) -> Result<Option<TextRange>, String> {
         // If the grammar starts at "fn" but the declaration begins with
         // "pub", "async" etc., include those modifiers in the selection.
         if start_byte < function.start_byte() {
-            let line_start = source[..start_byte].rfind('
-').map_or(0, |i| i + 1);
+            let line_start = source[..start_byte].rfind('\n').map_or(0, |i| i + 1);
             from = source_position(doc, start.row, start_byte - line_start);
         }
     }
