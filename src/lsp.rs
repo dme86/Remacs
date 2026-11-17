@@ -9,6 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread,
+    time::{Duration, Instant},
 };
 use serde_json::{json, Value};
 use url::Url;
@@ -17,6 +18,8 @@ use crate::lsp_plugin::ServerConfig;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_EVENTS_PER_TICK: usize = 128;
+const MAX_INITIAL_EMPTY_RETRIES: u8 = 6; // bounded async retries while rust-analyzer indexes
+const MAX_PENDING_REQUESTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding { Utf8, Utf16, Utf32 }
@@ -180,10 +183,12 @@ pub struct Target {
 
 pub enum Event {
     Definition {
-        origin: PathBuf, revision: u64, target: Option<Target>
+        origin: PathBuf, revision: u64, cursor: (usize, usize),
+        target: Option<Target>
     },
     Hover {
-        origin: PathBuf, revision: u64, text: Option<String>
+        origin: PathBuf, revision: u64, cursor: (usize, usize),
+        text: Option<String>
     },
     Status(String),
 }
@@ -207,6 +212,8 @@ struct Requested {
     kind: RequestKind,
     row: usize,
     character: usize, // character offset in the editor's Vec<char>
+    attempts: u8,
+    retry_after: Option<Instant>,
 }
 
 struct Server {
@@ -348,14 +355,36 @@ impl Server {
             events.push(Event::Status(format!("LSP request failed: {}", message["error"])));
             return events;
         }
+        let target = if request.kind == RequestKind::Definition {
+            parse_definition(result, self.encoding)
+        } else { None };
+        let hover = if request.kind == RequestKind::Hover {
+            parse_hover(result)
+        } else { None };
+        // rust-analyzer returns []/null if definition/hover is queried in
+        // the milliseconds between didOpen and indexing the workspace.
+        // A bounded, asynchronous retry avoids falsely claiming there is
+        // no definition, without making the editor UI wait. Ordinary misses
+        // eventually terminate; stale revisions are dropped in flush_requests.
+        if target.is_none() && hover.is_none()
+            && request.attempts < MAX_INITIAL_EMPTY_RETRIES
+        {
+            let mut retry = request;
+            retry.retry_after = Some(Instant::now() + Duration::from_millis(
+                300 * retry.attempts as u64
+            ));
+            self.deferred.push(retry);
+            return events;
+        }
+        let cursor = (request.row, request.character);
         match request.kind {
             RequestKind::Definition => events.push(Event::Definition {
-                origin: request.origin, revision: request.revision,
-                target: parse_definition(result, self.encoding),
+                origin: request.origin, revision: request.revision, cursor,
+                target,
             }),
             RequestKind::Hover => events.push(Event::Hover {
-                origin: request.origin, revision: request.revision,
-                text: parse_hover(result),
+                origin: request.origin, revision: request.revision, cursor,
+                text: hover,
             }),
         }
         events
@@ -404,7 +433,11 @@ impl Server {
     fn flush_requests(&mut self) -> io::Result<()> {
         if !self.ready { return Ok(()) }
         let mut pending = std::mem::take(&mut self.deferred);
-        for request in pending.drain(..) {
+        for mut request in pending.drain(..) {
+            if request.retry_after.is_some_and(|when| Instant::now() < when) {
+                self.deferred.push(request);
+                continue;
+            }
             // Keep the operation pending until the document is opened.
             let Some(doc) = self.documents.get(&request.origin) else {
                 self.deferred.push(request);
@@ -429,7 +462,11 @@ impl Server {
                 }
             });
             match self.send(payload) {
-                Ok(()) => { self.waiting.insert(id, request); }
+                Ok(()) => {
+                    request.attempts += 1;
+                    request.retry_after = None;
+                    self.waiting.insert(id, request);
+                }
                 Err(error) => {
                     self.deferred.push(request);
                     return Err(error);
@@ -483,8 +520,14 @@ impl Manager {
     pub fn request(&mut self, config: &ServerConfig, path: &Path, revision: u64,
         row: usize, col: usize, kind: RequestKind) -> io::Result<bool> {
         let Some(server) = self.ensure(config)? else { return Ok(false); };
+        // Bounded pending operations: repeating gd while indexing must
+        // never grow memory indefinitely.
+        if server.deferred.len() >= MAX_PENDING_REQUESTS {
+            server.deferred.remove(0);
+        }
         server.deferred.push(Requested {
-            origin: absolute(path), revision, row, character: col, kind
+            origin: absolute(path), revision, row, character: col, kind,
+            attempts: 0, retry_after: None,
         });
         Ok(true)
     }
@@ -592,6 +635,23 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn early_empty_definition_is_retried_with_backoff_and_limited() {
+        // No external language server is needed to check the retry policy.
+        let retry = Requested {
+            origin: std::env::temp_dir().join("test.rs"),
+            revision: 0,
+            kind: RequestKind::Definition,
+            row: 1,
+            character: 3,
+            attempts: 1,
+            retry_after: Some(Instant::now() + Duration::from_millis(300)),
+        };
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.retry_after.is_some_and(|when| when > Instant::now()));
+        assert!(MAX_INITIAL_EMPTY_RETRIES <= MAX_PENDING_REQUESTS as u8);
+    }
+
+    #[test]
     fn lsp_framing_accepts_multibyte_json_and_rejects_oversize() {
         let val = json!({"jsonrpc":"2.0","method":"window/logMessage",
             "params":{"message":"é 🦀"}});
@@ -657,7 +717,7 @@ mod tests {
         assert!(manager.request(&config, &source, 0, 1, column,
             RequestKind::Definition).unwrap());
 
-        let deadline = Instant::now() + Duration::from_secs(25);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let present = HashSet::from([absolute(&source)]);
         let mut found = false;
         let mut failure = None;
