@@ -619,6 +619,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run in CI with rustup component add rust-analyzer rust-src"]
+    fn actual_rust_analyzer_resolves_definition() {
+        use std::time::{Duration, Instant};
+        let root = std::env::temp_dir().join(format!(
+            "remacs-ra-integration-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"),
+            "[package]\nname = \"remacs-lsp-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let text = "pub fn target() -> u32 { 42 }\npub fn caller() -> u32 { target() }\n";
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, text).unwrap();
+        let config = ServerConfig {
+            language: "rust".into(),
+            command: vec!["rust-analyzer".into()],
+            root: root.canonicalize().unwrap(),
+        };
+        let reference = text.lines().nth(1).unwrap();
+        let column = reference.find("target()").unwrap();
+        let mut manager = Manager::default();
+        assert!(manager.request(&config, &source, 0, 1, column,
+            RequestKind::Definition).unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(75);
+        let present = HashSet::from([absolute(&source)]);
+        let mut found = false;
+        let mut failure = None;
+        while Instant::now() < deadline {
+            for event in manager.poll() {
+                match event {
+                    Event::Definition { target: Some(target), .. } => {
+                        assert_eq!(absolute(&target.path), absolute(&source));
+                        assert_eq!(target.row, 0);
+                        found = true;
+                    }
+                    Event::Status(status) if status.contains("error")
+                        || status.contains("exited") || status.contains("failed") =>
+                        failure = Some(status),
+                    _ => {}
+                }
+            }
+            if found || failure.is_some() { break; }
+            manager.sync(&config, &source, 0, || text.into()).unwrap();
+            manager.flush(&present);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        drop(manager);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(failure.is_none(), "rust-analyzer failed: {failure:?}");
+        assert!(found, "rust-analyzer did not resolve a real definition before timeout");
+    }
+
+    #[test]
     fn hover_parses_markdown_and_plaintext() {
         assert_eq!(parse_hover(&json!({
             "contents":{"kind":"markdown","value":"**struct** Example"}
