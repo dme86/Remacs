@@ -213,7 +213,7 @@ function tree.on_key(key)
         cancel_search()
         return { action = "open", path = node.path }
       end
-    elseif key == "down" or key == "tab" or key == "ctrl-n" then
+    elseif key == "down" or key == "tab" then
       tree.search_selected = math.min(#tree.results, tree.search_selected + 1)
       tree.search_selected = math.max(1, tree.search_selected)
     elseif key == "up" or key == "backtab" or key == "ctrl-p" then
