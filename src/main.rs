@@ -1634,7 +1634,10 @@ impl Editor {
                     Sequence::Quit => "SPC q → q Quit".into(),
                     Sequence::Delete => "d → d Delete line".into(),
                     Sequence::Yank => "y → y Yank line".into(),
-                    Sequence::Go => "g → g First line".into(),
+                    Sequence::Go => "g → g First line | ; Previous edit | , Next edit".into(),
+                    Sequence::MarkSet => "m → a-z File mark | A-Z Global mark".into(),
+                    Sequence::MarkLine => "' → mark (first nonblank on line)".into(),
+                    Sequence::MarkExact => "` → mark (exact position)".into(),
                     Sequence::None => self.count.map_or_else(|| self.message.clone(), |n| n.to_string()),
                 },
             };
