@@ -1590,6 +1590,19 @@ impl Editor {
             }
         }
 
+        let active_terminal = self.toggleterm.active().ok().flatten();
+        let popup_rect = active_terminal.as_ref()
+            .filter(|kind| self.terminals.contains_key(kind.as_str()))
+            .and_then(|_| terminal_rect(cols, height));
+        if let Some(old) = self.screen.terminal.set_rect(popup_rect) {
+            // Repaint only the previously covered region when hiding.
+            for y in old.y as usize..old.y as usize + old.height as usize {
+                if let Some(line) = self.screen.lines.get_mut(y) { *line = None; }
+                if let Some(line) = self.screen.sidebar_lines.get_mut(y) { *line = None; }
+                self.screen.finder.invalidate_underpaint(old.x as usize, y, old.width as usize);
+            }
+        }
+
         let mut selected_tree_row = 0;
         let mut search_cursor: Option<usize> = None;
         if sidebar_width > 0 {
@@ -1636,6 +1649,7 @@ impl Editor {
                     // sidebar just repainted it, the popup must redraw that
                     // portion even when its own text is unchanged.
                     self.screen.finder.invalidate_underpaint(0, y, sidebar_width);
+                    self.screen.terminal.invalidate_underpaint(0, y, sidebar_width);
                 }
             }
         }
@@ -1671,6 +1685,7 @@ impl Editor {
                     ResetColor
                 )?;
                 self.screen.finder.invalidate_underpaint(sidebar_width, y, gutter_width);
+                self.screen.terminal.invalidate_underpaint(sidebar_width, y, gutter_width);
             }
             if paint_text {
                 queue!(output, MoveTo((sidebar_width + gutter_width) as u16, y as u16), ResetColor)?;
@@ -1714,6 +1729,9 @@ impl Editor {
                     queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
                 }
                 self.screen.finder.invalidate_underpaint(
+                    sidebar_width + gutter_width, y, text_width
+                );
+                self.screen.terminal.invalidate_underpaint(
                     sidebar_width + gutter_width, y, text_width
                 );
             }
@@ -1799,7 +1817,24 @@ impl Editor {
             }
         }
 
+        // The terminal is composed above both editor and fuzzy popups, and
+        // never forwards child cursor-control codes to the outer terminal.
+        if let (Some(rect), Some(kind)) = (popup_rect, active_terminal.as_ref()) {
+            if let Some(session) = self.terminals.get_mut(kind) {
+                if let Err(error) = session.resize(rect) {
+                    self.message = format!("PTY resize: {error}");
+                }
+                self.screen.terminal.paint(output, rect, session)?;
+            }
+        }
+
         let (x, y) = match &self.prompt {
+            _ if popup_rect.is_some() => {
+                let rect = popup_rect.unwrap();
+                let kind = active_terminal.as_ref().unwrap();
+                let (x, y) = self.terminals.get(kind).unwrap().cursor(rect);
+                (x as usize, y)
+            },
             Some(Prompt::SaveAs(name)) => ("Save file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Open(name)) => ("Find file: ".len() + name.chars().count(), rows.saturating_sub(1)),
             Some(Prompt::Command(command)) => (1 + command.chars().count(), rows.saturating_sub(1)),
@@ -2042,11 +2077,21 @@ fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
     let mut editor = Editor::new(doc);
     while editor.running {
+        // A PTY can produce output without key presses. Event polling
+        // ensures interactive TUI refreshes while keeping idle CPU low.
+        editor.poll_terminals();
         editor.draw(&mut stdout)?;
-        if let Event::Key(key) = event::read()? {
-            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                let height = terminal::size()?.1.saturating_sub(2) as usize;
-                editor.key(key, height);
+        let delay = if editor.terminals.is_empty() {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(24)
+        };
+        if event::poll(delay)? {
+            if let Event::Key(key) = event::read()? {
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    let height = terminal::size()?.1.saturating_sub(2) as usize;
+                    editor.key(key, height);
+                }
             }
         }
     }
