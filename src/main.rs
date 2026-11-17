@@ -812,6 +812,10 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
+        if self.buffer_picker.is_some() {
+            self.buffer_picker_key(key);
+            return;
+        }
         // Ctrl+N is a global tree toggle, even when the tree or its fuzzy
         // finder has focus. Handle it before forwarding keys to Lua.
         if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -899,11 +903,17 @@ impl Editor {
             let sequence = std::mem::take(&mut self.sequence);
             let count = self.count.take();
             match (sequence, key.code) {
+                (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
                 (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
                 (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
                 (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
                 (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
                 (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
+                (Sequence::Buffer, KeyCode::Char('b')) => self.open_buffer_picker(),
+                (Sequence::Buffer, KeyCode::Char('n')) => self.cycle_buffer(true),
+                (Sequence::Buffer, KeyCode::Char('p')) => self.cycle_buffer(false),
+                (Sequence::Buffer, KeyCode::Char('l')) => self.last_buffer(),
+                (Sequence::Buffer, KeyCode::Char('d')) => self.close_buffer(false),
                 (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
                 (Sequence::File, KeyCode::Char('f')) => self.prompt = Some(Prompt::Open(String::new())),
@@ -1091,9 +1101,14 @@ impl Editor {
             }
             None => None,
         };
-        let finder_rect = tree_view.as_ref()
-            .and_then(|view| view.finder.as_ref())
-            .and_then(|_| finder_rect_for(cols, height));
+        let buffer_view = self.buffer_picker_view();
+        let finder_rect = if buffer_view.is_some()
+            || tree_view.as_ref().and_then(|view| view.finder.as_ref()).is_some()
+        {
+            finder_rect_for(cols, height)
+        } else {
+            None
+        };
 
         // On closing the dialog, invalidate just the rows it covered.
         // That restores the existing tree/editor content without clearing the
@@ -1276,7 +1291,8 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → f Files | o Panels | v Visual | q Quit".into(),
+                    Sequence::Leader => "SPC → b Buffers | f Files | o Panels | v Visual | q Quit".into(),
+                    Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | d Close".into(),
                     Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
                     Sequence::Panel => "SPC o → p Project tree".into(),
                     Sequence::Visual => "SPC v → f Select function".into(),
@@ -1296,11 +1312,12 @@ impl Editor {
         }
         // Overlay the fully visible fzf-style picker after the normal editor
         // and sidebar have painted; only changed popup rows are output.
-        if let (Some(rect), Some(finder)) = (
-            finder_rect,
-            tree_view.as_ref().and_then(|view| view.finder.as_ref()),
-        ) {
-            self.screen.finder.paint(output, rect, finder)?;
+        if let Some(rect) = finder_rect {
+            if let Some(finder) = buffer_view.as_ref() {
+                self.screen.finder.paint(output, rect, finder, PickerKind::Buffers)?;
+            } else if let Some(finder) = tree_view.as_ref().and_then(|view| view.finder.as_ref()) {
+                self.screen.finder.paint(output, rect, finder, PickerKind::Files)?;
+            }
         }
 
         let (x, y) = match &self.prompt {
@@ -1310,9 +1327,9 @@ impl Editor {
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if finder_rect.is_some() => {
                 let rect = finder_rect.unwrap();
-                let query = tree_view.as_ref()
-                    .and_then(|view| view.finder.as_ref())
-                    .map_or("", |finder| finder.query.as_str());
+                let query = buffer_view.as_ref().or_else(|| {
+                    tree_view.as_ref().and_then(|view| view.finder.as_ref())
+                }).map_or("", |finder| finder.query.as_str());
                 let (x, y) = finder_cursor(rect, query);
                 (x as usize, y)
             }
