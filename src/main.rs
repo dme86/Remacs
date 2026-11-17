@@ -252,23 +252,7 @@ impl Editor {
 
     fn project_root(&self) -> PathBuf {
         let current = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let start = self.doc.path.as_ref()
-            .and_then(|path| path.parent())
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(current.as_path());
-        // Vim-like project discovery: prefer the enclosing Git repository.
-        // Cargo/npm/Go markers are fallbacks for a non-Git project.
-        let fallback = start.to_path_buf();
-        for dir in start.ancestors() {
-            if dir.join(".git").exists() { return dir.to_path_buf(); }
-        }
-        for dir in start.ancestors() {
-            if ["Cargo.toml", "go.mod", "package.json"]
-                .iter().any(|file| dir.join(file).exists()) {
-                return dir.to_path_buf();
-            }
-        }
-        fallback
+        project_root_for(self.doc.path.as_deref(), &current)
     }
 
     fn terminal_binding(&mut self, binding: &str) {
@@ -303,7 +287,10 @@ impl Editor {
                     }
                     Err(error) => {
                         let _ = self.toggleterm.exited(&kind);
-                        self.message = format!("Cannot launch {command}: {error}. Install it first.");
+                        self.message = format!(
+                            "Cannot launch {command} in {}: {error}",
+                            Path::new(&cwd).display()
+                        );
                     }
                 }
             }
@@ -1883,6 +1870,43 @@ impl Editor {
 
 // Convert terminal key events into Lua plugin binding names. This is a
 // generic dispatcher, not a hardcoded terminal-plugin shortcut table.
+/// Resolve the opened file relative to the editor's actual working
+/// directory *before* traversing ancestors. For e.g. "src/main.rs",
+/// Path::ancestors() eventually yields an empty path; returning that as the
+/// Git root causes portable-pty to reject its working directory.
+fn project_root_for(file: Option<&Path>, cwd: &Path) -> PathBuf {
+    let current = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let start = file
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| {
+            if parent.is_absolute() {
+                parent.to_path_buf()
+            } else {
+                current.join(parent)
+            }
+        })
+        // The parent of an as-yet-unsaved file may not exist; use the
+        // current directory instead of passing an invalid cwd to the PTY.
+        .and_then(|parent| parent.canonicalize().ok().filter(|path| path.is_dir()))
+        .unwrap_or_else(|| current.clone());
+
+    // Git worktrees may have a .git *file*, not a directory.
+    for dir in start.ancestors() {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+    }
+    for dir in start.ancestors() {
+        if ["Cargo.toml", "go.mod", "package.json"]
+            .iter().any(|marker| dir.join(marker).exists()) {
+            return dir.to_path_buf();
+        }
+    }
+    // Always return a real absolute directory; never the empty path.
+    start
+}
+
 fn popup_shortcut(key: KeyEvent) -> Option<String> {
     let KeyCode::Char(c) = key.code else { return None };
     let modifiers = key.modifiers;
@@ -2150,6 +2174,55 @@ mod tests {
         std::fs::write(root.join("one.rs"), "one\nsecond\nthird\n").unwrap();
         std::fs::write(root.join("two.md"), "# two\n").unwrap();
         root
+    }
+
+    #[test]
+    fn popup_root_resolves_relative_files_inside_git_repository() {
+        let project = temporary_buffer_project();
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("src/deep")).unwrap();
+        let root = std::fs::canonicalize(&project).unwrap();
+
+        // Regression: traversing ancestors of a relative path reached ""
+        // and returned that empty path when .git was in the process cwd.
+        for file in ["src/main.rs", "src/deep/module.rs", "one.rs"] {
+            let found = project_root_for(Some(Path::new(file)), &project);
+            assert_eq!(found, root, "wrong git root for {file}");
+            assert!(found.is_absolute() && found.is_dir());
+        }
+        assert_eq!(project_root_for(None, &project), root);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn popup_root_resolves_absolute_paths_and_git_worktree_files() {
+        let cwd = temporary_buffer_project();
+        let other = temporary_buffer_project();
+        std::fs::create_dir_all(other.join("src/deep")).unwrap();
+        // Git linked worktrees use a .git text file with a gitdir: pointer.
+        std::fs::write(other.join(".git"), "gitdir: /tmp/fake-worktree\n").unwrap();
+
+        let file = other.join("src/deep/file.rs");
+        let root = project_root_for(Some(&file), &cwd);
+        assert_eq!(root, std::fs::canonicalize(&other).unwrap());
+        assert!(root.is_dir() && root.is_absolute());
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn popup_root_uses_existing_directory_for_new_or_unnamed_file() {
+        let root = temporary_buffer_project();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='test'\n").unwrap();
+        let expected = std::fs::canonicalize(&root).unwrap();
+
+        for name in ["not-yet-created/main.rs", "src/file.rs"] {
+            let found = project_root_for(Some(Path::new(name)), &root);
+            assert_eq!(found, expected);
+            assert!(found.is_dir() && found.is_absolute());
+        }
+        assert_eq!(project_root_for(None, &root), expected);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
