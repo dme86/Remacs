@@ -27,6 +27,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TAB_WIDTH: usize = 4;
 const MAX_UNDO: usize = 100;
+const MAX_UNDO_BYTES: usize = 32 * 1024 * 1024; // per-buffer snapshot budget
 // Subtle current-line tint. The normal terminal background is unchanged.
 const CURRENT_LINE_BG: Color = Color::Rgb { r: 49, g: 50, b: 57 };
 const GUTTER_BG: Color = Color::Rgb { r: 35, g: 36, b: 42 };
@@ -79,6 +80,13 @@ impl Snapshot {
             col: doc.col,
         }
     }
+    fn approx_bytes(&self) -> usize {
+        self.lines.iter().map(|line| {
+            std::mem::size_of::<Vec<char>>()
+                + line.capacity() * std::mem::size_of::<char>()
+        }).sum()
+    }
+
     fn restore(self, doc: &mut Document) {
         doc.lines = self.lines;
         doc.row = self.row;
@@ -464,10 +472,18 @@ impl Editor {
     }
 
     fn remember(&mut self) {
-        if self.undo.len() == MAX_UNDO {
-            self.undo.remove(0);
+        let snapshot = Snapshot::capture(&self.doc);
+        let next_bytes = snapshot.approx_bytes();
+        let mut used = self.undo.iter().map(Snapshot::approx_bytes).sum::<usize>();
+        while !self.undo.is_empty()
+            && (self.undo.len() >= MAX_UNDO
+                || used.saturating_add(next_bytes) > MAX_UNDO_BYTES)
+        {
+            used = used.saturating_sub(self.undo.remove(0).approx_bytes());
         }
-        self.undo.push(Snapshot::capture(&self.doc));
+        // Keep at least the most recent snapshot even if the document
+        // exceeds the budget, so undo remains possible for large files.
+        self.undo.push(snapshot);
         self.redo.clear();
     }
 
