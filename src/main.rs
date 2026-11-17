@@ -242,7 +242,6 @@ impl Editor {
             KeyCode::Tab => "tab".into(),
             KeyCode::BackTab => "backtab".into(),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-u".into(),
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-n".into(),
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => "ctrl-p".into(),
             KeyCode::Backspace => "backspace".into(),
             KeyCode::Left => "left".into(),
@@ -524,14 +523,14 @@ impl Editor {
             self.prompt_key(key);
             return;
         }
-        // The explorer owns its keys when focused, including Ctrl+N for
-        // moving through fuzzy results. Outside it, Ctrl+N toggles the pane.
-        if self.tree.as_ref().is_some_and(|tree| tree.focused) {
-            self.tree_key(key);
-            return;
-        }
+        // Ctrl+N is a global tree toggle, even when the tree or its fuzzy
+        // finder has focus. Handle it before forwarding keys to Lua.
         if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.toggle_tree();
+            return;
+        }
+        if self.tree.as_ref().is_some_and(|tree| tree.focused) {
+            self.tree_key(key);
             return;
         }
         if self.mode == Mode::Normal && key.code == KeyCode::Tab {
@@ -1378,6 +1377,37 @@ mod tests {
         assert!(!output.contains("abcdef"));
         assert!(!output.contains("second"));
         assert!(!output.contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn ctrl_n_toggles_tree_regardless_of_focus() {
+        let mut editor = Editor::new(Document::from_text("editor text"));
+        let press_ctrl_n = |editor: &mut Editor| {
+            editor.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), 10);
+        };
+
+        // From the editor: open the tree and focus it.
+        press_ctrl_n(&mut editor);
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+
+        // From the focused tree: Ctrl+N must close it (regression).
+        press_ctrl_n(&mut editor);
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible && !tree.focused));
+
+        // Re-open the tree and enter the fuzzy finder.
+        press_ctrl_n(&mut editor);
+        editor.tree_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_some());
+
+        // Ctrl+N remains the global toggle even while searching.
+        press_ctrl_n(&mut editor);
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible && !tree.focused));
+
+        // Reopening returns to the tree, not to the stale search prompt.
+        press_ctrl_n(&mut editor);
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.visible && tree.focused));
+        assert!(editor.tree.as_ref().unwrap().view(10).unwrap().search_cursor.is_none());
+        assert_eq!(editor.doc.line().iter().collect::<String>(), "editor text");
     }
 
     #[test]

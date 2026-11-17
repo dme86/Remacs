@@ -93,9 +93,13 @@ impl TreePlugin {
     }
 
     pub fn toggle(&mut self) -> mlua::Result<()> {
-        if !self.visible {
+        if self.visible {
+            // Cancel an active fuzzy search before hiding the pane; otherwise
+            // reopening it would unexpectedly return to the old query.
+            let _ = self.key_action("esc")?;
+        } else {
             // Pick up newly created/deleted files when reopening.
-            let _: TreeAction = self.key_action("r")?;
+            let _ = self.key_action("r")?;
         }
         self.visible = !self.visible;
         self.focused = self.visible;
