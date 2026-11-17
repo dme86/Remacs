@@ -100,6 +100,25 @@ impl Cache {
         previous
     }
 
+    /// A lower layer repainted part of the popup. Invalidate only the
+    /// intersecting popup row so the overlay is composited on top again.
+    /// Without this, the file tree can overwrite the left edge of cached
+    /// popup rows while typing (notably where the panes overlap).
+    pub fn invalidate_underpaint(&mut self, x: usize, y: usize, width: usize) {
+        if width == 0 { return; }
+        let Some(rect) = self.rect else { return; };
+        let left = rect.x as usize;
+        let right = left + rect.width;
+        if x >= right || x.saturating_add(width) <= left {
+            return;
+        }
+        if let Some(relative_y) = y.checked_sub(rect.y as usize) {
+            if let Some(row) = self.painted.get_mut(relative_y) {
+                *row = None;
+            }
+        }
+    }
+
     pub fn paint(
         &mut self,
         output: &mut impl Write,
@@ -118,7 +137,8 @@ impl Cache {
         for row in 0..rect.height {
             let (line, style) = if row == 0 {
                 let title = "─ FIND FILES ";
-                let filler = rect.width.saturating_sub(2 + title.len());
+                // Terminal geometry is measured in cells, not UTF-8 bytes.
+                let filler = rect.width.saturating_sub(2 + UnicodeWidthStr::width(title));
                 (format!("╭{title}{}╮", "─".repeat(filler)), Style::Border)
             } else if row == 1 {
                 let query = trailing_query(&finder.query, rect.width.saturating_sub(7));
@@ -209,6 +229,50 @@ mod tests {
         cache.paint(&mut subsequent, rect, &finder).unwrap();
         assert!(subsequent.is_empty(), "unchanged search should not repaint");
         assert_eq!(cache.set_rect(None), Some(rect));
+    }
+
+    #[test]
+    fn popup_repairs_rows_overwritten_by_the_underlying_tree() {
+        let finder = FinderView {
+            query: "p".into(),
+            matches: vec!["src/plugins.rs".into(), "plugins/tree.lua".into()],
+            selected: 1,
+            total_matches: 2,
+            scanned: 14,
+        };
+        // For a wide terminal the centered popup overlaps the tree gutter.
+        let rect = rect_for(120, 38).unwrap();
+        assert!(rect.x < 34);
+        let mut cache = Cache::default();
+        cache.set_rect(Some(rect));
+        cache.paint(&mut Vec::new(), rect, &finder).unwrap();
+
+        // Ordinary repeated draws still avoid redundant popup output.
+        let mut no_update = Vec::new();
+        cache.paint(&mut no_update, rect, &finder).unwrap();
+        assert!(no_update.is_empty());
+
+        // Simulate an underlying tree repaint crossing the popup's left edge.
+        cache.invalidate_underpaint(0, rect.y as usize, 34);
+        let mut repaired = Vec::new();
+        cache.paint(&mut repaired, rect, &finder).unwrap();
+        let text = String::from_utf8(repaired).unwrap();
+        assert!(text.contains("FIND FILES"), "popup title must be restored");
+        assert!(!text.contains("src/plugins.rs"), "other popup rows stay cached");
+
+        // A repaint at the search prompt must restore that row as well.
+        cache.invalidate_underpaint(0, rect.y as usize + 1, 34);
+        let mut repaired = Vec::new();
+        cache.paint(&mut repaired, rect, &finder).unwrap();
+        let text = String::from_utf8(repaired).unwrap();
+        assert!(text.contains("  > p"), "search input must not be clipped");
+
+        // Unrelated terminal regions must not invalidate the dialog.
+        cache.invalidate_underpaint(0, rect.y as usize + 1, rect.x as usize);
+        cache.invalidate_underpaint(0, 0, 34);
+        let mut unchanged = Vec::new();
+        cache.paint(&mut unchanged, rect, &finder).unwrap();
+        assert!(unchanged.is_empty());
     }
 
     #[test]
