@@ -2011,6 +2011,13 @@ impl Editor {
 
     fn command(&mut self, command: &str) {
         match command.trim() {
+            value if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                let line = value.bytes().fold(0usize, |line, digit| {
+                    line.saturating_mul(10)
+                        .saturating_add((digit - b'0') as usize)
+                });
+                self.go_to_line(line);
+            }
             "w" => self.save(),
             "wa" | "wall" => self.save_all(),
             "q" => self.quit(),
@@ -2087,6 +2094,36 @@ impl Editor {
             "" => {}
             other => self.message = format!("Unknown command: {other}"),
         }
+    }
+
+    fn go_to_line(&mut self, line: usize) {
+        let row = line.saturating_sub(1).min(self.doc.lines.len() - 1);
+        let col = self.doc.lines[row]
+            .iter()
+            .position(|ch| !ch.is_whitespace())
+            .unwrap_or(0);
+        if (self.doc.row, self.doc.col) != (row, col) {
+            self.record_current_jump();
+        }
+        self.dismiss_completion();
+        self.doc.row = row;
+        self.doc.col = col;
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.visual_anchor = None;
+        self.sequence = Sequence::None;
+        self.count = None;
+        self.control_x = false;
+        self.return_to_editor_after_switch();
+        if let Some((_, rows)) = self.screen.size {
+            let height = (rows.saturating_sub(2) as usize).max(1);
+            if row < self.scroll_row || row >= self.scroll_row.saturating_add(height) {
+                self.scroll_row = row
+                    .saturating_sub(height / 2)
+                    .min(self.doc.lines.len().saturating_sub(height));
+            }
+        }
+        self.message = format!("Line {} of {}", row + 1, self.doc.lines.len());
     }
 
     fn prompt_key(&mut self, key: KeyEvent) {
@@ -2405,15 +2442,43 @@ impl Editor {
                 KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => {
                     self.jump_forward()
                 }
-                KeyCode::Char('v') if self.mode == Mode::Normal => self.page_down(page_height),
+                KeyCode::Char(direction @ ('d' | 'u' | 'f' | 'b' | 'v'))
+                    if matches!(self.mode, Mode::Normal | Mode::Visual) =>
+                {
+                    let count = self.count.take();
+                    let height = page_height.max(1);
+                    let amount = if matches!(direction, 'd' | 'u') {
+                        count.unwrap_or((height / 2).max(1))
+                    } else {
+                        height
+                            .saturating_sub(2)
+                            .max(1)
+                            .saturating_mul(count.unwrap_or(1))
+                    };
+                    self.scroll_lines(matches!(direction, 'd' | 'f' | 'v'), amount, height);
+                }
                 _ => {}
             }
             return;
         }
         if key.modifiers.contains(KeyModifiers::ALT) {
-            if key.code == KeyCode::Char('v') && self.mode == Mode::Normal {
-                self.page_up(page_height);
+            if key.code == KeyCode::Char('v') && matches!(self.mode, Mode::Normal | Mode::Visual) {
+                let count = self.count.take().unwrap_or(1);
+                self.scroll_lines(
+                    false,
+                    page_height.saturating_sub(2).max(1).saturating_mul(count),
+                    page_height,
+                );
             }
+            return;
+        }
+        if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp) {
+            let count = self.count.take().unwrap_or(1);
+            self.scroll_lines(
+                key.code == KeyCode::PageDown,
+                page_height.saturating_sub(2).max(1).saturating_mul(count),
+                page_height,
+            );
             return;
         }
         if self.mode == Mode::Insert {
@@ -2454,10 +2519,10 @@ impl Editor {
             self.visual_key(key);
             return;
         }
-        self.normal_key(key, page_height);
+        self.normal_key(key);
     }
 
-    fn normal_key(&mut self, key: KeyEvent, page_height: usize) {
+    fn normal_key(&mut self, key: KeyEvent) {
         if self.sequence != Sequence::None {
             let sequence = std::mem::take(&mut self.sequence);
             let count = self.count.take();
@@ -2644,22 +2709,42 @@ impl Editor {
             KeyCode::Char('p') => self.paste_clipboard(),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char(':') => self.prompt = Some(Prompt::Command(String::new())),
-            KeyCode::PageDown => self.page_down(page_height),
-            KeyCode::PageUp => self.page_up(page_height),
             _ => {}
         }
     }
 
-    fn page_down(&mut self, height: usize) {
-        self.record_current_jump();
-        for _ in 0..height.max(1) {
-            self.doc.down();
+    fn scroll_lines(&mut self, down: bool, amount: usize, height: usize) {
+        self.dismiss_completion();
+        let height = height.max(1);
+        let last_row = self.doc.lines.len() - 1;
+        let max_top = self.doc.lines.len().saturating_sub(height);
+        // Normalize a viewport that has not been painted since a jump/resize.
+        let top = self
+            .scroll_row
+            .min(self.doc.row)
+            .min(max_top)
+            .max(self.doc.row.saturating_sub(height - 1));
+        let row = if down {
+            self.doc.row.saturating_add(amount).min(last_row)
+        } else {
+            self.doc.row.saturating_sub(amount)
+        };
+        let top = if down {
+            top.saturating_add(amount).min(max_top)
+        } else {
+            top.saturating_sub(amount)
+        };
+        if row != self.doc.row {
+            self.record_current_jump();
         }
-    }
-    fn page_up(&mut self, height: usize) {
-        self.record_current_jump();
-        for _ in 0..height.max(1) {
-            self.doc.up();
+        self.doc.row = row;
+        // Intermediate short lines must not erase the destination column.
+        self.doc.col = self.doc.col.min(self.doc.line().len());
+        self.scroll_row = top.min(row).max(row.saturating_sub(height - 1));
+        self.sequence = Sequence::None;
+        self.count = None;
+        if self.mode == Mode::Visual {
+            self.update_visual_selection();
         }
     }
 
@@ -4471,6 +4556,217 @@ mod tests {
         assert!(!next.contains("gamma"));
         assert!(!next.contains("\x1b[2J"));
         assert!(next.contains(" 2  "));
+    }
+
+    fn scrolling_editor() -> Editor {
+        let text = (0..100)
+            .map(|row| format!("  line {row:03} with enough columns"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut doc = Document::from_text(&text);
+        doc.path = Some(PathBuf::from("navigation-fixture.txt"));
+        doc.row = 23;
+        doc.col = 6;
+        let mut editor = Editor::new(doc);
+        editor.scroll_row = 20;
+        editor
+    }
+
+    #[test]
+    fn numeric_command_jumps_through_prompt_and_preserves_jump_origin() {
+        let mut editor = scrolling_editor();
+        paint(&mut editor);
+        press(&mut editor, KeyCode::Char(':'));
+        for ch in "52".chars() {
+            press(&mut editor, KeyCode::Char(ch));
+        }
+        press(&mut editor, KeyCode::Enter);
+        assert!(editor.prompt.is_none());
+        assert_eq!((editor.doc.row, editor.doc.col), (51, 2));
+        assert!(editor.doc.row >= editor.scroll_row && editor.doc.row < editor.scroll_row + 16);
+        editor.jump_back();
+        assert_eq!((editor.doc.row, editor.doc.col), (23, 6));
+        editor.jump_forward();
+        assert_eq!((editor.doc.row, editor.doc.col), (51, 2));
+        assert!(!editor.doc.dirty);
+        assert_eq!(editor.doc.revision, 0);
+        assert!(editor.undo.is_empty() && editor.redo.is_empty());
+    }
+
+    #[test]
+    fn numeric_commands_clamp_bounds_and_work_without_a_filename() {
+        let mut editor = Editor::new(Document::from_text("  first\n\tsecond\n  last"));
+        editor.command("  0002  ");
+        assert_eq!((editor.doc.row, editor.doc.col), (1, 1));
+        editor.command("0");
+        assert_eq!((editor.doc.row, editor.doc.col), (0, 2));
+        editor.command(&"9".repeat(400));
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 2));
+        for command in ["12x", "-1", "", "12 34"] {
+            editor.command(command);
+            assert_eq!((editor.doc.row, editor.doc.col), (2, 2));
+        }
+        assert!(!editor.doc.dirty);
+        let mut empty = Editor::new(Document::empty());
+        empty.command("9999999999999999999999999999999999");
+        assert_eq!((empty.doc.row, empty.doc.col), (0, 0));
+    }
+
+    #[test]
+    fn fast_scroll_keys_move_viewport_and_cursor_together() {
+        for (code, modifiers, down, amount) in [
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, true, 5),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL, false, 5),
+            (KeyCode::Char('f'), KeyModifiers::CONTROL, true, 8),
+            (KeyCode::Char('b'), KeyModifiers::CONTROL, false, 8),
+            (KeyCode::PageDown, KeyModifiers::NONE, true, 8),
+            (KeyCode::PageUp, KeyModifiers::NONE, false, 8),
+            (KeyCode::Char('v'), KeyModifiers::CONTROL, true, 8),
+            (KeyCode::Char('v'), KeyModifiers::ALT, false, 8),
+        ] {
+            let mut editor = scrolling_editor();
+            editor.key(KeyEvent::new(code, modifiers), 10);
+            let expected_row = if down { 23 + amount } else { 23 - amount };
+            let expected_top = if down { 20 + amount } else { 20 - amount };
+            assert_eq!(
+                (editor.doc.row, editor.scroll_row, editor.doc.col),
+                (expected_row, expected_top, 6)
+            );
+            editor.jump_back();
+            assert_eq!((editor.doc.row, editor.doc.col), (23, 6));
+            assert_eq!(editor.doc.revision, 0);
+            assert!(!editor.doc.dirty);
+            assert!(editor.undo.is_empty());
+        }
+    }
+
+    #[test]
+    fn scroll_counts_are_consumed_and_full_pages_saturate_safely() {
+        let mut editor = scrolling_editor();
+        press(&mut editor, KeyCode::Char('3'));
+        editor.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 10);
+        assert_eq!((editor.doc.row, editor.scroll_row), (47, 44));
+        assert!(editor.count.is_none());
+        press(&mut editor, KeyCode::Char('j'));
+        assert_eq!(editor.doc.row, 48);
+        press(&mut editor, KeyCode::Char('3'));
+        editor.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 10);
+        assert_eq!(editor.doc.row, 51);
+        editor.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 10);
+        assert_eq!(editor.doc.row, 56, "half-page count applies to one command");
+        for _ in 0..40 {
+            press(&mut editor, KeyCode::Char('9'));
+        }
+        editor.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 10);
+        assert_eq!((editor.doc.row, editor.scroll_row), (99, 90));
+        assert!(editor.count.is_none());
+        let history = editor.jumps.entries().len();
+        editor.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 10);
+        assert_eq!(
+            editor.jumps.entries().len(),
+            history,
+            "no jump for a no-op at EOF"
+        );
+    }
+
+    #[test]
+    fn paging_clamps_column_only_at_destination_and_keeps_selection() {
+        let mut editor = scrolling_editor();
+        for line in &mut editor.doc.lines[24..31] {
+            line.clear();
+        }
+        editor.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 10);
+        assert_eq!((editor.doc.row, editor.doc.col), (31, 6));
+        editor.doc.lines[39] = "hi".chars().collect();
+        editor.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 10);
+        assert_eq!((editor.doc.row, editor.doc.col), (39, 2));
+        editor.enter_visual();
+        let anchor = editor.visual_anchor;
+        editor.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 10);
+        assert_eq!(editor.mode, Mode::Visual);
+        assert_eq!(editor.visual_anchor, anchor);
+        let selected = editor.selection.unwrap();
+        assert_eq!(selected.start.row, 39);
+        assert_eq!(selected.end.row, 44);
+        assert!(!editor.doc.dirty);
+    }
+
+    #[test]
+    fn paging_handles_tiny_viewports_and_single_line_documents() {
+        for height in [0, 1, 2, 10, 200] {
+            let mut editor = scrolling_editor();
+            editor.count = Some(usize::MAX);
+            editor.key(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                height,
+            );
+            assert_eq!(editor.doc.row, 99);
+            assert!(editor.scroll_row <= editor.doc.lines.len().saturating_sub(height.max(1)));
+            editor.count = Some(usize::MAX);
+            editor.key(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                height,
+            );
+            assert_eq!((editor.doc.row, editor.scroll_row), (0, 0));
+            let history = editor.jumps.entries().len();
+            editor.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), height);
+            assert_eq!(editor.jumps.entries().len(), history);
+            let mut empty = Editor::new(Document::empty());
+            empty.key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                height,
+            );
+            empty.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), height);
+            assert_eq!((empty.doc.row, empty.doc.col, empty.scroll_row), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn scrolling_respects_prompt_picker_tree_and_insert_mode() {
+        let mut editor = scrolling_editor();
+        editor.prompt = Some(Prompt::Command("52".into()));
+        editor.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 10);
+        assert!(matches!(&editor.prompt, Some(Prompt::Command(value)) if value == "52"));
+        assert_eq!(editor.doc.row, 23);
+        editor.prompt = None;
+        editor.open_buffer_picker();
+        editor.pasted("query");
+        editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), 10);
+        assert!(editor.buffer_picker.as_ref().unwrap().query.is_empty());
+        assert_eq!(editor.doc.row, 23);
+        editor.buffer_picker = None;
+        let root = temporary_buffer_project();
+        let mut tree = TreePlugin::new(&root).unwrap();
+        tree.toggle().unwrap();
+        tree.on_key("/").unwrap();
+        tree.paste_query("query").unwrap();
+        editor.tree = Some(tree);
+        editor.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), 10);
+        assert!(editor
+            .tree
+            .as_ref()
+            .unwrap()
+            .view(10)
+            .unwrap()
+            .finder
+            .unwrap()
+            .query
+            .is_empty());
+        assert_eq!(editor.doc.row, 23);
+        editor.tree = None;
+        editor.begin_insert();
+        editor.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 10);
+        assert_eq!(
+            editor.doc.row, 23,
+            "insert controls must not become normal-mode motions"
+        );
+        editor.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 10);
+        assert_eq!(
+            (editor.mode, editor.doc.row, editor.scroll_row),
+            (Mode::Insert, 31, 28)
+        );
+        assert!(!editor.doc.dirty);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

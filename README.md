@@ -45,6 +45,9 @@ shows incomplete sequences.
 | Move | **`h` / `j` / `k` / `l`**, arrows, **`w` / `b`**, optional count (e.g. **`5j`**, **`12k`**) |
 | Beginning / end of line | **`0` / `$`** |
 | First / last line | **gg / G**, absolute jump via **42G** or **42gg** |
+| Go to line number | **`:42`**, then **Enter** (first nonblank on line 42) |
+| Scroll down / up half a page | **Ctrl+D / Ctrl+U** (Normal or Visual) |
+| Scroll forward / back a page | **Ctrl+F / Ctrl+B** (Normal or Visual), **PageDown / PageUp** (Normal, Insert or Visual) |
 | Jump backwards / forwards | **Ctrl+O / Ctrl+I** or **Alt+Left / Alt+Right** |
 | Previous / next edit (global) | **g; / g,** |
 | Set local / global mark | **ma / mA** |
@@ -69,12 +72,24 @@ shows incomplete sequences.
 | Save current buffer | **`SPC f s`** |
 | Save all modified named buffers | **`SPC b s`** or **`:wa`** / **`:wall`** |
 | Quit (prompts if modified) | **`SPC q q`** |
-| Command minibuffer | **`:`** then `w`, `q`, `q!`, `wq`, `e FILE`, `w FILE`, `buffers`, `bn`, `bp`, `b#`, `bd`, `bd!`, `wa` or `wall` |
+| Command minibuffer | **`:`** then a line number, `w`, `q`, `q!`, `wq`, `e FILE`, `w FILE`, `buffers`, `bn`, `bp`, `b#`, `bd`, `bd!`, `wa` or `wall` |
 | Legacy Emacs-style file shortcuts | **`Ctrl+X Ctrl+F`**, **`Ctrl+X Ctrl+S`**, **`Ctrl+X Ctrl+C`** |
 
 The editor supports multiple independent file buffers, a status line, a minibuffer,
 UTF-8 text editing, basic horizontal/vertical scrolling, and CRLF/LF preservation.
 This is a **small subset** of Vim/Evil, not full compatibility with Doom Emacs.
+
+Line numbers in `:NUM` are one-based: `:0` goes to the first line and a number
+past the end goes to the last. Scrolling moves the viewport and cursor together,
+keeping the cursor's screen row until a file boundary. Half-page scrolling uses
+half the visible text height; in Normal mode, a count such as `3 Ctrl+D` moves
+exactly three lines for that command only. Full pages leave two context lines (where space
+allows); `3 Ctrl+F` moves three pages. Counts are consumed by the scroll and do
+not affect the next motion. `Ctrl+V` / `Alt+V` remain full-page aliases, while
+`Ctrl+PageDown` / `Ctrl+PageUp` still switch buffers in Normal mode. Scrolling
+in Visual mode extends the selection. Return to a line-jump or scroll origin
+with `Ctrl+O` in Normal mode. Prompts, search fields, the file tree and floating
+terminals retain their own key handling.
 
 ## System clipboard
 
