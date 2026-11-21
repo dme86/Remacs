@@ -2,10 +2,11 @@
 -- Lua owns mappings, which session is visible, commands and session lifetime.
 -- The Rust host only supplies PTY I/O and terminal rendering.
 --
--- Edit these mappings/commands to customize your installed Remacs build.
+-- Override this module or use remacs.keymap from init.lua; no rebuild needed.
 local M = {}
-local sessions = {}
-local active = nil
+local state = remacs.state.toggleterm or { sessions = {} }
+remacs.state.toggleterm = state
+local sessions = state.sessions
 
 M.dismiss_key = "ctrl-t"
 
@@ -29,17 +30,17 @@ function M.dismiss(key)
 end
 
 function M.active()
-  return active
+  return state.active
 end
 
 function M.toggle(kind, cwd)
   local program = M.programs[kind]
   if not program then return { action = "error", message = "Unknown popup: " .. tostring(kind) } end
-  if active == kind then
-    active = nil
+  if state.active == kind then
+    state.active = nil
     return { action = "hide", kind = kind }
   end
-  active = kind
+  state.active = kind
   local session = sessions[kind]
   if session then
     return { action = "show", kind = kind, title = session.title }
@@ -56,14 +57,23 @@ function M.toggle(kind, cwd)
 end
 
 function M.hide()
-  local previous = active
-  active = nil
+  local previous = state.active
+  state.active = nil
   return previous
 end
 
 function M.exited(kind)
   sessions[kind] = nil
-  if active == kind then active = nil end
+  if state.active == kind then state.active = nil end
+end
+
+for kind in pairs(M.programs) do
+  remacs.commands.add(kind, function() remacs.core("terminal", { kind = kind }) end)
+end
+remacs.commands.add("terminal", function() remacs.core("terminal", { kind = "shell" }) end)
+for key, kind in pairs(M.keys) do
+  local mode = key:match("^ctrl%-") and "global" or "normal"
+  remacs.keymap.set(mode, key, kind)
 end
 
 return M

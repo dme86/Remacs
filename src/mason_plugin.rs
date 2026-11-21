@@ -1,6 +1,8 @@
 //! Read declarative desired language servers and install recipes from Lua.
 //! The plugin owns package selection; Rust only executes typed recipes.
-use mlua::{Function, Lua, RegistryKey, Table};
+use mlua::{Function, Table};
+
+use crate::lua_runtime::LuaRuntime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recipe {
@@ -21,23 +23,17 @@ pub struct Tool {
 }
 
 pub struct MasonPlugin {
-    lua: Lua,
-    plugin: RegistryKey,
+    runtime: LuaRuntime,
 }
 
 impl MasonPlugin {
-    pub fn new() -> mlua::Result<Self> {
-        let lua = Lua::new();
-        let table: Table = lua
-            .load(include_str!("../plugins/mason.lua"))
-            .set_name("plugins/mason.lua")
-            .eval()?;
-        let plugin = lua.create_registry_value(table)?;
-        Ok(Self { lua, plugin })
+    pub fn new(runtime: LuaRuntime) -> mlua::Result<Self> {
+        runtime.table("mason")?;
+        Ok(Self { runtime })
     }
 
     fn table(&self) -> mlua::Result<Table> {
-        self.lua.registry_value(&self.plugin)
+        self.runtime.table("mason")
     }
 
     pub fn auto_install(&self) -> mlua::Result<bool> {
@@ -48,8 +44,21 @@ impl MasonPlugin {
         self.table()?.get("auto_update_days")
     }
 
+    /// Validate external catalog modules before replacing the working one.
+    pub fn validate_table(table: &Table) -> mlua::Result<()> {
+        table.get::<bool>("auto_install")?;
+        table.get::<u64>("auto_update_days")?;
+        table.get::<Function>("server_for")?;
+        Self::tools_from_table(table)?;
+        Ok(())
+    }
+
     pub fn tools(&self) -> mlua::Result<Vec<Tool>> {
-        let list: Table = self.table()?.get::<Function>("list")?.call(())?;
+        Self::tools_from_table(&self.table()?)
+    }
+
+    fn tools_from_table(table: &Table) -> mlua::Result<Vec<Tool>> {
+        let list: Table = table.get::<Function>("list")?.call(())?;
         let mut result = Vec::new();
         for entry in list.sequence_values::<Table>() {
             let entry = entry?;
@@ -60,6 +69,15 @@ impl MasonPlugin {
                     .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'_')
             {
                 return Err(mlua::Error::external(format!("Invalid LSP id: {id}")));
+            }
+            for key in ["files", "roots"] {
+                let values = entry
+                    .get::<Table>(key)?
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                if values.iter().any(String::is_empty) {
+                    return Err(mlua::Error::external(format!("Empty {key} value for {id}")));
+                }
             }
             let command = entry
                 .get::<Table>("cmd")?
@@ -125,7 +143,8 @@ mod tests {
 
     #[test]
     fn single_lua_catalog_defines_installer_policy() {
-        let lua = MasonPlugin::new().unwrap();
+        let lua =
+            MasonPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap()).unwrap();
         let tools = lua.tools().unwrap();
         let ids = tools
             .iter()

@@ -1,13 +1,12 @@
-//! Small Lua plugin host. The first bundled plugin is a file tree.
+//! File-tree view adapter for the shared editor Lua runtime.
 //!
 //! Plugins communicate through a narrow API: read-only filesystem metadata,
 //! a render result, and action messages. Rust owns editor buffers and TUI I/O.
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use mlua::{Function, Lua, RegistryKey, Table};
+use mlua::{Function, Table};
+
+use crate::lua_runtime::LuaRuntime;
 
 pub enum TreeAction {
     None,
@@ -36,70 +35,24 @@ pub struct TreeView {
 }
 
 pub struct TreePlugin {
-    lua: Lua,
-    key: RegistryKey,
+    runtime: LuaRuntime,
     pub visible: bool,
     pub focused: bool,
 }
 
 impl TreePlugin {
-    pub fn new(root: &Path) -> mlua::Result<Self> {
-        let lua = Lua::new();
-        let remacs = lua.create_table()?;
-        let filesystem = lua.create_table()?;
-
-        // One deliberately small host API for the plugin. Never expose the
-        // Rust Editor directly or make document writes from Lua callbacks.
-        filesystem.set(
-            "list",
-            lua.create_function(|lua, path: String| {
-                let mut entries = Vec::new();
-                for entry in fs::read_dir(&path).map_err(mlua::Error::external)? {
-                    let entry = entry.map_err(mlua::Error::external)?;
-                    let file_type = entry.file_type().map_err(mlua::Error::external)?;
-                    entries.push((
-                        entry.file_name().to_string_lossy().into_owned(),
-                        entry.path().to_string_lossy().into_owned(),
-                        file_type.is_dir(),
-                    ));
-                }
-                entries.sort_by(|a, b| {
-                    b.2.cmp(&a.2)
-                        .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-                });
-                let table = lua.create_table()?;
-                for (index, (name, path, is_dir)) in entries.into_iter().enumerate() {
-                    let row = lua.create_table()?;
-                    row.set("name", name)?;
-                    row.set("path", path)?;
-                    row.set("is_dir", is_dir)?;
-                    table.set(index + 1, row)?;
-                }
-                Ok(table)
-            })?,
-        )?;
-        remacs.set("fs", filesystem)?;
-        lua.globals().set("remacs", remacs)?;
-
-        // Embedded source keeps this working after cargo install --path .
-        // Lua owns navigation/tree expansion, not terminal drawing.
-        let plugin: Table = lua
-            .load(include_str!("../plugins/tree.lua"))
-            .set_name("plugins/tree.lua")
-            .eval()?;
-        let setup: Function = plugin.get("setup")?;
+    pub fn new(runtime: LuaRuntime, root: &Path) -> mlua::Result<Self> {
+        let setup: Function = runtime.table("tree")?.get("setup")?;
         setup.call::<()>(root.to_string_lossy().into_owned())?;
-        let key = lua.create_registry_value(plugin)?;
         Ok(Self {
-            lua,
-            key,
+            runtime,
             visible: false,
             focused: false,
         })
     }
 
     fn plugin(&self) -> mlua::Result<Table> {
-        self.lua.registry_value(&self.key)
+        self.runtime.table("tree")
     }
 
     pub fn toggle(&mut self) -> mlua::Result<()> {
@@ -205,6 +158,41 @@ impl TreePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn hot_reload_preserves_tree_expansion_dotfiles_and_search() {
+        let temp = std::env::temp_dir().join(format!(
+            "remacs-tree-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp.join("src")).unwrap();
+        fs::write(temp.join("src/answer.rs"), "42").unwrap();
+        fs::write(temp.join(".hidden"), "secret").unwrap();
+        let runtime = LuaRuntime::new(&temp).unwrap();
+        let mut tree = TreePlugin::new(runtime.clone(), &temp).unwrap();
+        tree.toggle().unwrap();
+        tree.on_key("l").unwrap();
+        tree.on_key(".").unwrap();
+        let before = tree.view(10).unwrap().lines;
+        runtime.reload("tree").unwrap();
+        assert_eq!(tree.view(10).unwrap().lines, before);
+        tree.on_key("/").unwrap();
+        tree.paste_query("ans").unwrap();
+        runtime.reload("tree").unwrap();
+        let finder = tree.view(10).unwrap().finder.unwrap();
+        assert_eq!(finder.query, "ans");
+        assert_eq!(finder.matches, ["src/answer.rs"]);
+        match tree.on_key("enter").unwrap() {
+            TreeAction::Open(path) => assert_eq!(path, temp.join("src/answer.rs")),
+            _ => panic!("reloaded finder must still open its selection"),
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn fuzzy_finder_finds_collapsed_nested_files_and_opens_match() {
@@ -224,7 +212,7 @@ mod tests {
         fs::write(temp.join(".secret.md"), "hidden").unwrap();
         fs::write(temp.join("target/generated.rs"), "excluded").unwrap();
 
-        let mut tree = TreePlugin::new(&temp).unwrap();
+        let mut tree = TreePlugin::new(LuaRuntime::new(&temp).unwrap(), &temp).unwrap();
         tree.toggle().unwrap();
         tree.on_key("/").unwrap();
         assert!(tree.view(10).unwrap().title.contains("FIND /"));
@@ -293,7 +281,7 @@ mod tests {
         fs::create_dir_all(&temp).unwrap();
         fs::write(temp.join("café.txt"), "text").unwrap();
         fs::write(temp.join("camel.txt"), "text").unwrap();
-        let tree = TreePlugin::new(&temp).unwrap();
+        let tree = TreePlugin::new(LuaRuntime::new(&temp).unwrap(), &temp).unwrap();
         tree.on_key("/").unwrap();
         for c in "ca".chars() {
             tree.on_key(&c.to_string()).unwrap();
@@ -333,7 +321,7 @@ mod tests {
         fs::create_dir_all(&temp).unwrap();
         fs::write(temp.join("café.txt"), "text").unwrap();
         fs::write(temp.join("qj.txt"), "text").unwrap();
-        let mut tree = TreePlugin::new(&temp).unwrap();
+        let mut tree = TreePlugin::new(LuaRuntime::new(&temp).unwrap(), &temp).unwrap();
         tree.toggle().unwrap();
         let selected = tree.view(10).unwrap().selected;
         tree.paste_query("qj/f").unwrap();
@@ -378,7 +366,7 @@ mod tests {
         fs::write(temp.join("README.md"), "# Remacs").unwrap();
         fs::write(temp.join("src").join("main.rs"), "fn main() {}").unwrap();
         fs::write(temp.join(".hidden"), "secret").unwrap();
-        let mut tree = TreePlugin::new(&temp).unwrap();
+        let mut tree = TreePlugin::new(LuaRuntime::new(&temp).unwrap(), &temp).unwrap();
         assert!(!tree.visible);
         tree.toggle().unwrap();
         assert!(tree.visible && tree.focused);

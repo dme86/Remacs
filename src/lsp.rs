@@ -259,6 +259,19 @@ pub enum Event {
 struct ServerKey {
     root: PathBuf,
     language: String,
+    // A reload can replace a language's executable without changing its
+    // workspace. Process and failure identity must include the full argv.
+    command: Vec<String>,
+}
+
+impl ServerKey {
+    fn for_config(config: &ServerConfig) -> Self {
+        Self {
+            root: absolute(&config.root),
+            language: config.language.clone(),
+            command: config.command.clone(),
+        }
+    }
 }
 
 struct Synced {
@@ -443,6 +456,22 @@ impl Server {
                 "jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":id}
             }));
         }
+    }
+
+    fn close_document(&mut self, path: &Path) -> io::Result<()> {
+        self.cancel_requests(|request| request.origin == path);
+        if !self.documents.contains_key(path) {
+            return Ok(());
+        }
+        if self.ready {
+            self.send(json!({
+                "jsonrpc":"2.0", "method":"textDocument/didClose",
+                "params":{"textDocument":{"uri":uri(path)?}}
+            }))?;
+        }
+        // Keep the document if notification backpressure requires a retry.
+        self.documents.remove(path);
+        Ok(())
     }
 
     fn queue_request(&mut self, request: Requested) {
@@ -796,11 +825,16 @@ impl Manager {
         self.servers.retain(|key, _| key.language != language);
     }
 
+    /// Reconcile a live Lua configuration without restarting unaffected
+    /// workspaces. Dropping an obsolete server also cancels its pending work.
+    pub fn reconfigure(&mut self, configs: &[ServerConfig]) {
+        let retained: HashSet<_> = configs.iter().map(ServerKey::for_config).collect();
+        self.servers.retain(|key, _| retained.contains(key));
+        self.failed.retain(|key| retained.contains(key));
+    }
+
     fn ensure(&mut self, config: &ServerConfig) -> io::Result<Option<&mut Server>> {
-        let key = ServerKey {
-            root: absolute(&config.root),
-            language: config.language.clone(),
-        };
+        let key = ServerKey::for_config(config);
         if self.failed.contains(&key) {
             return Ok(None);
         }
@@ -831,8 +865,18 @@ impl Manager {
         revision: u64,
         text: impl FnOnce() -> String,
     ) -> io::Result<()> {
+        let key = ServerKey::for_config(config);
+        let path = absolute(path);
+        // A live configuration can move a path to another language/workspace
+        // while its previous server still serves other buffers. Close only the
+        // reassigned document and cancel its stale responses there.
+        for (previous, server) in &mut self.servers {
+            if previous != &key {
+                server.close_document(&path)?;
+            }
+        }
         if let Some(server) = self.ensure(config)? {
-            server.sync_document(path, revision, text, &config.language)?;
+            server.sync_document(&path, revision, text, &config.language)?;
         }
         Ok(())
     }
@@ -929,17 +973,7 @@ impl Manager {
                     .cloned()
                     .collect();
                 for path in missing {
-                    if let Ok(uri) = uri(&path) {
-                        if server
-                            .send(json!({
-                                "jsonrpc":"2.0","method":"textDocument/didClose",
-                                "params":{"textDocument":{"uri":uri}}
-                            }))
-                            .is_ok()
-                        {
-                            server.documents.remove(&path);
-                        }
-                    }
+                    let _ = server.close_document(&path);
                 }
                 let _ = server.flush_requests();
             }
@@ -1063,6 +1097,7 @@ mod tests {
             ServerKey {
                 root: config.root.clone(),
                 language: config.language.clone(),
+                command: config.command.clone(),
             },
             server,
         );
@@ -1434,15 +1469,153 @@ mod tests {
     }
 
     #[test]
+    fn reassigned_document_closes_on_previous_server_and_cancels_stale_requests() {
+        let (mut previous, outgoing) = test_server(16);
+        let request = requested(1);
+        let path = request.origin.clone();
+        open_request_document(&mut previous, &request);
+        previous.waiting.insert(7, request);
+        let unrelated = requested(2);
+        open_request_document(&mut previous, &unrelated);
+        previous.deferred.push(unrelated);
+        let (mut manager, old_config) = manager_with_server(previous);
+        let (replacement, replacement_outgoing) = test_server(16);
+        let config = ServerConfig {
+            language: "lua".into(),
+            command: vec!["different-test-server".into()],
+            root: old_config.root.clone(),
+        };
+        manager
+            .servers
+            .insert(ServerKey::for_config(&config), replacement);
+        manager
+            .sync(&config, &path, 2, || "new text".into())
+            .unwrap();
+        let previous = &manager.servers[&ServerKey::for_config(&old_config)];
+        assert!(!previous.documents.contains_key(&path));
+        assert!(previous.waiting.is_empty());
+        assert_eq!(previous.documents.len(), 1);
+        assert_eq!(
+            previous.deferred.len(),
+            1,
+            "unrelated requests stay pending"
+        );
+        let messages: Vec<_> = outgoing.try_iter().collect();
+        assert!(messages
+            .iter()
+            .any(|message| message["method"] == "$/cancelRequest"));
+        assert!(messages
+            .iter()
+            .any(|message| message["method"] == "textDocument/didClose"));
+        assert_eq!(
+            replacement_outgoing.try_recv().unwrap()["method"],
+            "textDocument/didOpen"
+        );
+    }
+
+    #[test]
+    fn document_reassignment_retries_after_notification_backpressure() {
+        let (mut previous, outgoing) = test_server(1);
+        let request = requested(3);
+        let path = request.origin.clone();
+        open_request_document(&mut previous, &request);
+        previous.send(json!({"method":"test/blocker"})).unwrap();
+        let (mut manager, old_config) = manager_with_server(previous);
+        let (replacement, replacement_outgoing) = test_server(16);
+        let config = ServerConfig {
+            language: "lua".into(),
+            command: vec!["different-test-server".into()],
+            root: old_config.root.clone(),
+        };
+        manager
+            .servers
+            .insert(ServerKey::for_config(&config), replacement);
+        assert!(manager
+            .sync(&config, &path, 2, || "new text".into())
+            .is_err());
+        assert!(manager.servers[&ServerKey::for_config(&old_config)]
+            .documents
+            .contains_key(&path));
+        assert!(replacement_outgoing.try_recv().is_err());
+        outgoing.try_recv().unwrap();
+        manager
+            .sync(&config, &path, 2, || "new text".into())
+            .unwrap();
+        assert_eq!(
+            outgoing.try_recv().unwrap()["method"],
+            "textDocument/didClose"
+        );
+        assert_eq!(
+            replacement_outgoing.try_recv().unwrap()["method"],
+            "textDocument/didOpen"
+        );
+    }
+
+    #[test]
+    fn configuration_reload_keeps_unchanged_process_and_pending_requests() {
+        let (mut server, _outgoing) = test_server(16);
+        let request = requested(1);
+        open_request_document(&mut server, &request);
+        server.deferred.push(request);
+        let pid = server.child.id();
+        let (mut manager, config) = manager_with_server(server);
+        manager.reconfigure(std::slice::from_ref(&config));
+        let retained = manager
+            .servers
+            .get(&ServerKey::for_config(&config))
+            .unwrap();
+        assert_eq!(retained.child.id(), pid);
+        assert_eq!(retained.deferred.len(), 1);
+    }
+
+    #[test]
+    fn configuration_reload_removes_changed_and_disabled_processes() {
+        let (server, _outgoing) = test_server(16);
+        let (mut manager, config) = manager_with_server(server);
+        let mut changed = config.clone();
+        changed.command = vec!["replacement-server".into(), "--stdio".into()];
+        manager.failed.insert(ServerKey::for_config(&config));
+        manager.reconfigure(std::slice::from_ref(&changed));
+        assert!(manager.servers.is_empty());
+        assert!(
+            manager.failed.is_empty(),
+            "old command failure must not block new executable"
+        );
+
+        let (server, _outgoing) = test_server(16);
+        let (mut manager, _) = manager_with_server(server);
+        manager.reconfigure(&[]);
+        assert!(
+            manager.servers.is_empty(),
+            "disabled language server must stop"
+        );
+    }
+
+    #[test]
+    fn changed_command_does_not_reuse_old_negative_startup_cache() {
+        let (server, _outgoing) = test_server(16);
+        let (mut manager, mut config) = manager_with_server(server);
+        manager.failed.insert(ServerKey::for_config(&config));
+        config.command = vec!["/remacs-test-no-such-executable".into()];
+        assert!(
+            manager.ensure(&config).is_err(),
+            "new argv must attempt startup, not reuse old failure"
+        );
+        assert!(manager.failed.contains(&ServerKey::for_config(&config)));
+    }
+
+    #[test]
     fn successful_mason_install_releases_failed_server_state() {
         let mut manager = Manager::default();
         let rust = ServerKey {
             root: PathBuf::from("/tmp"),
             language: "rust".into(),
+            command: vec!["rust-analyzer".into()],
         };
         let lua = ServerKey {
             root: PathBuf::from("/tmp"),
             language: "lua".into(),
+            command: vec!["lua-language-server".into()],
         };
         manager.failed.insert(rust.clone());
         manager.failed.insert(lua.clone());

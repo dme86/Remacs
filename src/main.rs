@@ -3,11 +3,13 @@ mod clipboard;
 mod completion;
 mod completion_ui;
 mod document;
+mod editor_lua;
 mod finder_ui;
 mod function_select;
 mod jumps;
 mod lsp;
 mod lsp_plugin;
+mod lua_runtime;
 mod mason;
 mod mason_plugin;
 mod plugins;
@@ -42,6 +44,7 @@ use function_select::{around_function, Position, TextRange};
 use jumps::{JumpManager, Location};
 use lsp::{Event as LspEvent, Manager as LspManager, RequestKind};
 use lsp_plugin::LspPlugin;
+use lua_runtime::LuaRuntime;
 use mason::{Event as MasonEvent, Manager as MasonManager};
 use mason_plugin::MasonPlugin;
 use plugins::{FinderView, TreeAction, TreePlugin};
@@ -95,17 +98,6 @@ enum Mode {
 enum Sequence {
     #[default]
     None,
-    Leader,
-    File,
-    Panel,
-    Buffer,
-    Language,
-    Visual,
-    TextObjectAround,
-    Quit,
-    Delete,
-    Yank,
-    Go,
     MarkSet,
     MarkLine,
     MarkExact,
@@ -279,6 +271,8 @@ struct Editor {
     doc: Document,
     syntax: SyntaxEngine,
     slots: Vec<Option<StoredBuffer>>,
+    buffer_ids: Vec<u64>,
+    next_buffer_id: u64,
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
@@ -288,6 +282,12 @@ struct Editor {
     completion_pending: Option<PendingCompletion>,
     completion_due: Option<Instant>,
     mason: MasonManager,
+    lua: LuaRuntime,
+    lua_generation: u64,
+    lua_observed: HashMap<u64, editor_lua::BufferObservation>,
+    lua_current: Option<u64>,
+    lua_mode: Option<Mode>,
+    lua_saved: Vec<u64>,
     lsp_plugin: LspPlugin,
     lsp: LspManager,
     lsp_document_versions: Option<Vec<(PathBuf, u64)>>,
@@ -303,7 +303,6 @@ struct Editor {
     selection: Option<TextRange>,
     visual_anchor: Option<Position>,
     sequence: Sequence,
-    control_x: bool,
     count: Option<usize>,
     prompt: Option<Prompt>,
     message: String,
@@ -318,16 +317,16 @@ struct Editor {
 impl Editor {
     fn new(doc: Document) -> Self {
         let syntax = SyntaxEngine::new(&doc);
-        let mason_plugin = MasonPlugin::new().expect("bundled plugins/mason.lua");
-        let mut mason = MasonManager::new(&mason_plugin).expect("valid Mason Lua catalog");
-        if !cfg!(test) {
-            // No network activity unless expressly enabled in mason.lua.
-            let _ = mason.auto_queue(&mason_plugin);
-        }
+        let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let lua = LuaRuntime::new(&root).expect("bundled Lua runtime");
+        let mason_plugin = MasonPlugin::new(lua.clone()).expect("bundled plugins/mason.lua");
+        let mason = MasonManager::new(&mason_plugin).expect("valid Mason Lua catalog");
         Self {
             doc,
             syntax,
             slots: vec![None],
+            buffer_ids: vec![1],
+            next_buffer_id: 2,
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
@@ -337,7 +336,12 @@ impl Editor {
             completion_pending: None,
             completion_due: None,
             mason,
-            lsp_plugin: LspPlugin::new().expect("bundled plugins/lsp.lua"),
+            lua_generation: lua.generation(),
+            lua_observed: HashMap::new(),
+            lua_current: None,
+            lua_mode: None,
+            lua_saved: Vec::new(),
+            lsp_plugin: LspPlugin::new(lua.clone()).expect("bundled plugins/lsp.lua"),
             lsp: LspManager::default(),
             lsp_document_versions: None,
             lsp_present: HashSet::new(),
@@ -348,7 +352,8 @@ impl Editor {
             } else {
                 JumpManager::load_default()
             },
-            toggleterm: ToggleTermPlugin::new().expect("bundled toggleterm.lua plugin"),
+            toggleterm: ToggleTermPlugin::new(lua.clone()).expect("bundled toggleterm.lua plugin"),
+            lua,
             terminals: HashMap::new(),
             tree: None,
             screen: ScreenCache::default(),
@@ -358,7 +363,6 @@ impl Editor {
             selection: None,
             visual_anchor: None,
             sequence: Sequence::None,
-            control_x: false,
             count: None,
             prompt: None,
             message: "NORMAL | i Insert | Space f f Open | Space f s Save | Space q q Quit".into(),
@@ -376,17 +380,9 @@ impl Editor {
         project_root_for(self.doc.path.as_deref(), &current)
     }
 
-    fn terminal_binding(&mut self, binding: &str) {
-        let kind = match self.toggleterm.binding(binding) {
-            Ok(Some(kind)) => kind,
-            Ok(None) => return,
-            Err(error) => {
-                self.message = format!("toggleterm plugin: {error}");
-                return;
-            }
-        };
+    fn toggle_terminal(&mut self, kind: &str) {
         let root = self.project_root();
-        let action = match self.toggleterm.toggle(&kind, &root) {
+        let action = match self.with_lua(10, |_| self.toggleterm.toggle(kind, &root)) {
             Ok(action) => action,
             Err(error) => {
                 self.message = format!("toggleterm: {error}");
@@ -402,7 +398,7 @@ impl Editor {
             } => {
                 let (cols, rows) = terminal::size().unwrap_or((100, 35));
                 let Some(rect) = terminal_rect(cols, rows.saturating_sub(2) as usize) else {
-                    let _ = self.toggleterm.exited(&kind);
+                    let _ = self.with_lua(10, |_| self.toggleterm.exited(&kind));
                     self.message = "Terminal is too small for the floating popup".into();
                     return;
                 };
@@ -412,7 +408,7 @@ impl Editor {
                         self.buffer_picker = None;
                     }
                     Err(error) => {
-                        let _ = self.toggleterm.exited(&kind);
+                        let _ = self.with_lua(10, |_| self.toggleterm.exited(&kind));
                         self.message = format!(
                             "Cannot launch {command} in {}: {error}",
                             Path::new(&cwd).display()
@@ -422,7 +418,7 @@ impl Editor {
             }
             TerminalAction::Show { kind } => {
                 if !self.terminals.contains_key(&kind) {
-                    let _ = self.toggleterm.exited(&kind);
+                    let _ = self.with_lua(10, |_| self.toggleterm.exited(&kind));
                     self.message = "Terminal session exited; reopen to start a new one".into();
                 } else {
                     self.buffer_picker = None;
@@ -447,7 +443,7 @@ impl Editor {
         }
         for kind in ended {
             self.terminals.remove(&kind);
-            let _ = self.toggleterm.exited(&kind);
+            let _ = self.with_lua(10, |_| self.toggleterm.exited(&kind));
             self.message = format!("{kind} terminal exited");
         }
     }
@@ -458,7 +454,7 @@ impl Editor {
             return;
         };
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config = match self.lsp_plugin.server_for(path, &cwd) {
+        let config = match self.with_lua(10, |_| self.lsp_plugin.server_for(path, &cwd)) {
             Ok(Some(config)) => config,
             Ok(None) => {
                 self.message = "No language server configured for this file".into();
@@ -501,7 +497,11 @@ impl Editor {
             && self.mason_picker.is_none()
             && self.hover_popup.is_none()
             && !self.tree.as_ref().is_some_and(|tree| tree.focused)
-            && self.toggleterm.active().ok().flatten().is_none()
+            && self
+                .with_lua(10, |_| self.toggleterm.active())
+                .ok()
+                .flatten()
+                .is_none()
     }
 
     fn completion_prefix(&self) -> String {
@@ -545,7 +545,7 @@ impl Editor {
         }
         let path = self.doc.path.as_ref().unwrap().clone();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config = match self.lsp_plugin.server_for(&path, &cwd) {
+        let config = match self.with_lua(10, |_| self.lsp_plugin.server_for(&path, &cwd)) {
             Ok(Some(config)) => config,
             Ok(None) => {
                 if manual {
@@ -715,8 +715,7 @@ impl Editor {
             let Some(path) = doc.path.as_ref() else {
                 continue;
             };
-            present.insert(lsp::absolute(path));
-            let config = match self.lsp_plugin.server_for(path, &cwd) {
+            let config = match self.with_lua(10, |_| self.lsp_plugin.server_for(path, &cwd)) {
                 Ok(Some(config)) => config,
                 Ok(None) => continue,
                 Err(error) => {
@@ -725,6 +724,7 @@ impl Editor {
                     continue;
                 }
             };
+            present.insert(lsp::absolute(path));
             if let Err(error) = self
                 .lsp
                 .sync(&config, path, doc.revision, || doc.lsp_text())
@@ -1049,6 +1049,8 @@ impl Editor {
             self.slots[previous] = Some(current);
             let index = self.slots.len();
             self.slots.push(None);
+            self.buffer_ids.push(self.next_buffer_id);
+            self.next_buffer_id += 1;
             self.last_slot = Some(previous);
             self.activate(
                 StoredBuffer {
@@ -1234,7 +1236,10 @@ impl Editor {
         }
         let before = self.doc.path.replace(path);
         match self.doc.save() {
-            Ok(()) => self.message = "File saved".into(),
+            Ok(()) => {
+                self.lua_saved.push(self.buffer_ids[self.active_slot]);
+                self.message = "File saved".into();
+            }
             Err(error) => {
                 // A failed write must not silently rename an unnamed buffer.
                 self.doc.path = before;
@@ -1262,6 +1267,7 @@ impl Editor {
         self.scroll_row = next.scroll_row;
         self.scroll_col = next.scroll_col;
         self.active_slot = index;
+        let _ = self.lua.cancel_keys();
         let enabled = self.syntax.enabled();
         self.syntax = SyntaxEngine::new(&self.doc);
         self.syntax.set_enabled(enabled);
@@ -1270,7 +1276,6 @@ impl Editor {
         self.visual_anchor = None;
         self.sequence = Sequence::None;
         self.count = None;
-        self.control_x = false;
         self.insert_changed = false;
         // Only visible text rows are invalidated; tree and terminal geometry
         // are unchanged, so there is no destructive whole-screen clear.
@@ -1312,13 +1317,14 @@ impl Editor {
     }
 
     fn return_to_editor_after_switch(&mut self) {
-        if let Some(tree) = &mut self.tree {
+        if let Some(mut tree) = self.tree.take() {
             if tree.focused {
                 // A direct buffer switch should land in the editor, not leave
                 // keyboard focus (or a fuzzy-file popup) in the old tree.
-                let _ = tree.on_key("esc");
+                let _ = self.with_lua(10, |_| tree.on_key("esc"));
                 tree.leave();
             }
+            self.tree = Some(tree);
         }
     }
 
@@ -1495,6 +1501,8 @@ impl Editor {
         if self.slots.len() == 1 {
             let enabled = self.syntax.enabled();
             self.doc = Document::empty();
+            self.buffer_ids[0] = self.next_buffer_id;
+            self.next_buffer_id += 1;
             self.syntax = SyntaxEngine::new(&self.doc);
             self.syntax.set_enabled(enabled);
             self.undo.clear();
@@ -1516,6 +1524,7 @@ impl Editor {
         let next = (closed + 1) % self.slots.len();
         let replacement = self.slots[next].take().expect("inactive buffer in slot");
         self.slots.remove(closed);
+        self.buffer_ids.remove(closed);
         // Adjust target index because removing an earlier slot shifts it.
         let adjusted_next = if next > closed { next - 1 } else { next };
         self.last_slot = None;
@@ -1584,7 +1593,7 @@ impl Editor {
     fn toggle_tree(&mut self) {
         if self.tree.is_none() {
             let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match TreePlugin::new(&root) {
+            match self.with_lua(10, |_| TreePlugin::new(self.lua.clone(), &root)) {
                 Ok(tree) => self.tree = Some(tree),
                 Err(error) => {
                     self.message = format!("Cannot load Lua tree plugin: {error}");
@@ -1592,13 +1601,14 @@ impl Editor {
                 }
             }
         }
-        if let Some(tree) = &mut self.tree {
-            if let Err(error) = tree.toggle() {
+        if let Some(mut tree) = self.tree.take() {
+            if let Err(error) = self.with_lua(10, |_| tree.toggle()) {
                 self.message = format!("Tree plugin error: {error}");
             } else if tree.visible {
                 self.message =
                     "Tree: / or f fuzzy find  j/k move  Enter open  Tab/Esc editor".into();
             }
+            self.tree = Some(tree);
         }
         self.sequence = Sequence::None;
     }
@@ -1625,7 +1635,11 @@ impl Editor {
             KeyCode::Down => "down".into(),
             _ => return,
         };
-        let action = match self.tree.as_ref().map(|tree| tree.on_key(&name)) {
+        let action = match self
+            .tree
+            .as_ref()
+            .map(|tree| self.with_lua(10, |_| tree.on_key(&name)))
+        {
             Some(Ok(action)) => action,
             Some(Err(error)) => {
                 self.message = format!("Lua file tree error: {error}");
@@ -1714,11 +1728,17 @@ impl Editor {
     /// Bracketed paste arrives as one event instead of a stream of hotkeys.
     /// In Insert mode this is one undoable edit, even with multiline Unicode.
     fn pasted(&mut self, text: &str) {
+        let _ = self.lua.cancel_keys();
+        self.pasted_inner(text);
+        self.sync_lua_events();
+    }
+
+    fn pasted_inner(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         self.dismiss_completion();
-        if let Ok(Some(active)) = self.toggleterm.active() {
+        if let Ok(Some(active)) = self.with_lua(10, |_| self.toggleterm.active()) {
             if let Some(session) = self.terminals.get_mut(&active) {
                 if let Err(error) = session.paste(text) {
                     self.message = format!("PTY paste: {error}");
@@ -1762,7 +1782,7 @@ impl Editor {
                 .take_while(|ch| *ch != '\r' && *ch != '\n')
                 .filter(|ch| !ch.is_control())
                 .collect();
-            if let Err(error) = tree.paste_query(&query) {
+            if let Err(error) = self.with_lua(10, |_| tree.paste_query(&query)) {
                 self.message = format!("Tree paste: {error}");
             }
             return;
@@ -1770,7 +1790,6 @@ impl Editor {
         self.hover_popup = None;
         self.sequence = Sequence::None;
         self.count = None;
-        self.control_x = false;
         let text = normalize_pasted_text(text);
         match self.mode {
             Mode::Insert => {
@@ -1851,65 +1870,16 @@ impl Editor {
         }
     }
 
-    fn visual_key(&mut self, key: KeyEvent) {
-        if self.sequence == Sequence::TextObjectAround {
-            self.sequence = Sequence::None;
-            if key.code == KeyCode::Char('f') {
-                self.select_function();
-            } else {
-                self.message = "Unknown Visual text object (use a f)".into();
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::Char('a') => {
-                self.sequence = Sequence::TextObjectAround;
-                return;
-            }
-            KeyCode::Char('v') => {
-                self.leave_visual();
-                return;
-            }
-            KeyCode::Char('y') => {
-                if let Some(range) = self.selection {
-                    let text = self.doc.text_in_range(range);
-                    self.store_register(Register::Text(text), "Selection copied");
-                }
-                self.leave_visual();
-                return;
-            }
-            KeyCode::Char('d') => {
-                if let Some(range) = self.selection {
-                    if range.start < range.end {
-                        self.remember();
-                        let text = self.doc.text_in_range(range);
-                        self.doc.delete_text_range(range);
-                        self.store_register(Register::Text(text), "Selection deleted (u to undo)");
-                    }
-                }
-                self.leave_visual();
-                return;
-            }
-            KeyCode::Char('h') | KeyCode::Left => self.doc.left(),
-            KeyCode::Char('j') | KeyCode::Down => self.doc.down(),
-            KeyCode::Char('k') | KeyCode::Up => self.doc.up(),
-            KeyCode::Char('l') | KeyCode::Right => self.doc.right(),
-            KeyCode::Char('0') | KeyCode::Home => self.doc.home(),
-            KeyCode::Char('$') | KeyCode::End => self.doc.end(),
-            KeyCode::Char('w') => self.doc.word_forward(),
-            KeyCode::Char('b') => self.doc.word_backward(),
-            _ => return,
-        }
-        self.update_visual_selection();
-    }
-
     fn save(&mut self) {
         if self.doc.path.is_none() {
             self.prompt = Some(Prompt::SaveAs(String::new()));
             return;
         }
         match self.doc.save() {
-            Ok(()) => self.message = "File saved".into(),
+            Ok(()) => {
+                self.lua_saved.push(self.buffer_ids[self.active_slot]);
+                self.message = "File saved".into();
+            }
             Err(error) => self.message = format!("Save error: {error}"),
         }
     }
@@ -1923,7 +1893,8 @@ impl Editor {
         let mut failed = 0usize;
         let mut first_error: Option<String> = None;
 
-        let mut save_if_dirty = |doc: &mut Document| {
+        let mut saved_ids = Vec::new();
+        let mut save_if_dirty = |doc: &mut Document, id: u64| {
             if !doc.dirty {
                 return;
             }
@@ -1933,7 +1904,10 @@ impl Editor {
             };
             let name = path.display().to_string();
             match doc.save() {
-                Ok(()) => saved += 1,
+                Ok(()) => {
+                    saved += 1;
+                    saved_ids.push(id);
+                }
                 Err(error) => {
                     failed += 1;
                     if first_error.is_none() {
@@ -1943,10 +1917,13 @@ impl Editor {
             }
         };
 
-        save_if_dirty(&mut self.doc);
-        for slot in self.slots.iter_mut().flatten() {
-            save_if_dirty(&mut slot.doc);
+        save_if_dirty(&mut self.doc, self.buffer_ids[self.active_slot]);
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(slot) = slot {
+                save_if_dirty(&mut slot.doc, self.buffer_ids[index]);
+            }
         }
+        self.lua_saved.extend(saved_ids);
 
         self.message = if saved == 0 && unnamed == 0 && failed == 0 {
             "All buffers already saved".into()
@@ -1985,6 +1962,8 @@ impl Editor {
                 self.slots[previous] = Some(current);
                 let index = self.slots.len();
                 self.slots.push(None);
+                self.buffer_ids.push(self.next_buffer_id);
+                self.next_buffer_id += 1;
                 self.last_slot = Some(previous);
                 self.activate(
                     StoredBuffer {
@@ -2010,90 +1989,17 @@ impl Editor {
     }
 
     fn command(&mut self, command: &str) {
-        match command.trim() {
-            value if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
-                let line = value.bytes().fold(0usize, |line, digit| {
-                    line.saturating_mul(10)
-                        .saturating_add((digit - b'0') as usize)
-                });
-                self.go_to_line(line);
-            }
-            "w" => self.save(),
-            "wa" | "wall" => self.save_all(),
-            "q" => self.quit(),
-            "q!" => self.running = false,
-            "syntax on" => {
-                self.syntax.set_enabled(true);
-                self.message = "Syntax highlighting enabled".into();
-            }
-            "syntax off" => {
-                self.syntax.set_enabled(false);
-                self.message = "Syntax highlighting disabled".into();
-            }
-            "tree" | "tree toggle" => self.toggle_tree(),
-            "lazygit" => self.terminal_binding("space g"),
-            "terminal" => self.terminal_binding("space t"),
-            "mason" => self.open_mason_picker(),
-            "mason sync" | "mason install" => {
-                let count = self.mason.queue_all(false);
-                self.message = format!("Mason queued {count} missing servers");
-            }
-            "mason update" => {
-                let count = self.mason.queue_all(true);
-                self.message = format!("Mason queued {count} server updates");
-            }
-            "mason log" => {
-                self.message = format!(
-                    "Mason installation log: {}",
-                    self.mason.log_path().display()
-                );
-            }
-            value if value.starts_with("mason install ") => {
-                let id = value.trim_start_matches("mason install ").trim();
-                self.message = self.mason.queue(id, false).unwrap_or_else(|error| error);
-            }
-            value if value.starts_with("mason update ") => {
-                let id = value.trim_start_matches("mason update ").trim();
-                self.message = self.mason.queue(id, true).unwrap_or_else(|error| error);
-            }
-            "buffers" | "ls" => self.open_buffer_picker(),
-            "bn" | "bnext" => self.cycle_buffer(true),
-            "bp" | "bprev" => self.cycle_buffer(false),
-            "b#" => self.last_buffer(),
-            "bd" => self.close_buffer(false),
-            "bd!" => self.close_buffer(true),
-            "jumps" => {
-                self.message = format!(
-                    "{} jump locations (Ctrl+O older, Alt+Right newer)",
-                    self.jumps.entries().len()
-                )
-            }
-            "changes" => {
-                self.message = format!(
-                    "{} recent edits (g; older, g, newer)",
-                    self.jumps.changes().len()
-                )
-            }
-            "wq" | "x" => {
-                if self.doc.path.is_some() {
-                    self.save();
-                    if !self.doc.dirty {
-                        self.quit(); // Other unsaved buffers still require confirmation.
-                    }
-                } else {
-                    self.message = "Choose a filename with :w or Space f s first".into();
-                }
-            }
-            value if value.starts_with("e ") => self.open(value[2..].trim().to_owned()),
-            value if value.starts_with("w ") => {
-                let name = value[2..].trim();
-                if !name.is_empty() {
-                    self.set_path_and_save(PathBuf::from(name));
-                }
-            }
-            "" => {}
-            other => self.message = format!("Unknown command: {other}"),
+        let command = command.trim();
+        if !command.is_empty() && command.bytes().all(|byte| byte.is_ascii_digit()) {
+            let line = command.bytes().fold(0usize, |line, digit| {
+                line.saturating_mul(10)
+                    .saturating_add((digit - b'0') as usize)
+            });
+            self.go_to_line(line);
+        } else if !command.is_empty() {
+            self.lua_command(command);
         }
+        self.sync_lua_events();
     }
 
     fn go_to_line(&mut self, line: usize) {
@@ -2113,7 +2019,6 @@ impl Editor {
         self.visual_anchor = None;
         self.sequence = Sequence::None;
         self.count = None;
-        self.control_x = false;
         self.return_to_editor_after_switch();
         if let Some((_, rows)) = self.screen.size {
             let height = (rows.saturating_sub(2) as usize).max(1);
@@ -2221,6 +2126,7 @@ impl Editor {
                     match key.code {
                         KeyCode::Tab => {
                             self.accept_completion();
+                            self.sync_lua_events();
                             return;
                         }
                         KeyCode::Down => {
@@ -2272,19 +2178,18 @@ impl Editor {
                 self.completion_due = Some(Instant::now() + COMPLETION_DELAY);
             }
         }
+        self.sync_lua_events();
     }
 
     fn key_inner(&mut self, key: KeyEvent, page_height: usize) {
-        let shortcut = popup_shortcut(key);
-        // A visible terminal receives every key, including Escape, instead of
-        // leaking editing shortcuts to Remacs. Ctrl+T hides it without killing
-        // the PTY; the session continues while hidden.
-        if let Ok(Some(active)) = self.toggleterm.active() {
-            if shortcut
-                .as_deref()
-                .is_some_and(|name| self.toggleterm.dismiss(name).unwrap_or(false))
-            {
-                let _ = self.toggleterm.hide();
+        // Focused PTYs and prompts own their input. Their keys must never leak
+        // into editor commands, including Lua commands registered at runtime.
+        if let Ok(Some(active)) = self.with_lua(10, |_| self.toggleterm.active()) {
+            if popup_shortcut(key).as_deref().is_some_and(|name| {
+                self.with_lua(10, |_| self.toggleterm.dismiss(name))
+                    .unwrap_or(false)
+            }) {
+                let _ = self.with_lua(10, |_| self.toggleterm.hide());
                 return;
             }
             if let Some(session) = self.terminals.get_mut(&active) {
@@ -2294,31 +2199,19 @@ impl Editor {
             }
             return;
         }
-        if self.hover_popup.is_some() {
-            self.hover_popup = None;
-            if key.code == KeyCode::Esc {
-                return;
-            }
+        if self.hover_popup.take().is_some() && key.code == KeyCode::Esc {
+            return;
         }
         if self.prompt.is_some() {
             self.prompt_key(key);
             return;
         }
-        if let Some(ref name) = shortcut {
-            if self.toggleterm.binding(name).ok().flatten().is_some() {
-                self.terminal_binding(name);
-                return;
-            }
-        }
-        // Ctrl+P opens/closes the existing centered buffer search popup.
-        // Check it before the buffer picker and focused Lua tree so the
-        // shortcut works without a leader and from either pane.
-        if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL {
-            if self.buffer_picker.is_some() {
-                self.buffer_picker = None;
-            } else {
-                self.open_buffer_picker();
-            }
+        // These focus-changing shortcuts retain their availability in pickers
+        // and the tree. Their actions and availability are defined in Lua.
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('t' | 'n' | 'p'))
+            && self.dispatch_lua_key(key, page_height)
+        {
             return;
         }
         if self.mason_picker.is_some() {
@@ -2329,76 +2222,28 @@ impl Editor {
             self.buffer_picker_key(key);
             return;
         }
-
-        // Direct buffer navigation. Alt+j/k follows Vim's movement keys;
-        // Ctrl+PageDown/Up is a fallback for terminals that don't send Meta.
-        // These only operate in Normal mode so accented Option-key input
-        // remains available while inserting text on macOS.
-        if self.mode == Mode::Normal {
-            if key.modifiers == KeyModifiers::ALT {
-                match key.code {
-                    KeyCode::Char('j') => {
-                        self.cycle_buffer(true);
-                        return;
-                    }
-                    KeyCode::Char('k') => {
-                        self.cycle_buffer(false);
-                        return;
-                    }
-                    KeyCode::Left => {
-                        self.jump_back();
-                        return;
-                    }
-                    KeyCode::Right => {
-                        self.jump_forward();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            if key.modifiers == KeyModifiers::CONTROL {
-                match key.code {
-                    KeyCode::PageDown => {
-                        self.cycle_buffer(true);
-                        return;
-                    }
-                    KeyCode::PageUp => {
-                        self.cycle_buffer(false);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Ctrl+N is a global tree toggle, even when the tree or its fuzzy
-        // finder has focus. Handle it before forwarding keys to Lua.
-        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.toggle_tree();
+        if self.mode == Mode::Normal
+            && (key.modifiers == KeyModifiers::ALT
+                || (key.modifiers == KeyModifiers::CONTROL
+                    && matches!(key.code, KeyCode::PageDown | KeyCode::PageUp)))
+            && self.dispatch_lua_key(key, page_height)
+        {
             return;
         }
         if self.tree.as_ref().is_some_and(|tree| tree.focused) {
             self.tree_key(key);
             return;
         }
-        // Legacy terminals (including rst in its standard input mode)
-        // send the *same byte* (0x09) for Ctrl+I and Tab. Crossterm reports
-        // it as an unmodified Tab, so the forward jumplist must take priority
-        // over the editor-to-tree focus shortcut while history exists ahead.
-        // Once the newest jump is reached, ordinary Tab focus returns.
-        // Enhanced terminals can still report an explicit Ctrl+I separately.
+        // Legacy terminals encode Ctrl+I and Tab identically. Preserve the
+        // jumplist-before-tree-focus rule without hiding this ambiguity in Lua.
         if self.mode == Mode::Normal
             && key.code == KeyCode::Tab
             && key.modifiers == KeyModifiers::NONE
-            && self.jumps.can_forward()
         {
-            self.jump_forward();
-            return;
-        }
-        if self.mode == Mode::Normal
-            && key.code == KeyCode::Tab
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+            if self.jumps.can_forward() {
+                self.jump_forward();
+                return;
+            }
             if let Some(tree) = &mut self.tree {
                 if tree.visible {
                     tree.focus();
@@ -2407,93 +2252,74 @@ impl Editor {
             }
         }
         if key.code == KeyCode::Esc {
-            if self.mode == Mode::Insert {
-                self.leave_insert();
-            } else if self.mode == Mode::Visual {
-                self.leave_visual();
-            }
             self.sequence = Sequence::None;
-            self.control_x = false;
+            self.count = None;
+        }
+        if self.sequence != Sequence::None
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.dispatch_lua_key(key, page_height);
+            return;
+        }
+        if self.sequence != Sequence::None {
+            let sequence = std::mem::take(&mut self.sequence);
+            if let KeyCode::Char(name) = key.code {
+                match sequence {
+                    Sequence::MarkSet => self.set_mark(name),
+                    Sequence::MarkLine => self.jump_to_mark(name, true),
+                    Sequence::MarkExact => self.jump_to_mark(name, false),
+                    Sequence::None => {}
+                }
+            }
             self.count = None;
             return;
         }
-        if self.control_x {
-            self.control_x = false;
-            match key.code {
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save(),
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.prompt = Some(Prompt::Open(String::new()));
+        // Counts and arbitrary mark names are modal input syntax; the
+        // operations they drive and all ordinary keymaps live in Lua.
+        if self.mode == Mode::Normal
+            && !self.lua.key_pending()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            if let KeyCode::Char(digit @ '0'..='9') = key.code {
+                if digit != '0' || self.count.is_some() {
+                    self.count = Some(
+                        self.count
+                            .unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add((digit as u8 - b'0') as usize),
+                    );
+                    return;
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit(),
-                _ => self.message = "Unknown C-x sequence (Esc cancels)".into(),
             }
+        }
+        if self.dispatch_lua_key(key, page_height) {
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        self.count = None;
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        if self.mode == Mode::Normal {
+            self.sequence = match key.code {
+                KeyCode::Char('m') => Sequence::MarkSet,
+                KeyCode::Char('\'') => Sequence::MarkLine,
+                KeyCode::Char('`') => Sequence::MarkExact,
+                _ => Sequence::None,
+            };
+        } else if self.mode == Mode::Insert {
+            // Literal input is the native hot path. Lua can override any key
+            // above, while normal typing keeps the existing undo grouping.
             match key.code {
-                KeyCode::Char('x') => self.control_x = true,
-                KeyCode::Char('g') => {
-                    self.sequence = Sequence::None;
-                    self.count = None;
-                    self.message = "Cancelled".into();
-                }
-                KeyCode::Char('r') if self.mode == Mode::Normal => self.redo(),
-                KeyCode::Char('o') if self.mode == Mode::Normal => self.jump_back(),
-                KeyCode::Char('i') | KeyCode::Tab if self.mode == Mode::Normal => {
-                    self.jump_forward()
-                }
-                KeyCode::Char(direction @ ('d' | 'u' | 'f' | 'b' | 'v'))
-                    if matches!(self.mode, Mode::Normal | Mode::Visual) =>
-                {
-                    let count = self.count.take();
-                    let height = page_height.max(1);
-                    let amount = if matches!(direction, 'd' | 'u') {
-                        count.unwrap_or((height / 2).max(1))
-                    } else {
-                        height
-                            .saturating_sub(2)
-                            .max(1)
-                            .saturating_mul(count.unwrap_or(1))
-                    };
-                    self.scroll_lines(matches!(direction, 'd' | 'f' | 'v'), amount, height);
-                }
-                _ => {}
-            }
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            if key.code == KeyCode::Char('v') && matches!(self.mode, Mode::Normal | Mode::Visual) {
-                let count = self.count.take().unwrap_or(1);
-                self.scroll_lines(
-                    false,
-                    page_height.saturating_sub(2).max(1).saturating_mul(count),
-                    page_height,
-                );
-            }
-            return;
-        }
-        if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp) {
-            let count = self.count.take().unwrap_or(1);
-            self.scroll_lines(
-                key.code == KeyCode::PageDown,
-                page_height.saturating_sub(2).max(1).saturating_mul(count),
-                page_height,
-            );
-            return;
-        }
-        if self.mode == Mode::Insert {
-            match key.code {
-                KeyCode::Left => self.doc.left(),
-                KeyCode::Right => self.doc.right(),
-                KeyCode::Up => self.doc.up(),
-                KeyCode::Down => self.doc.down(),
-                KeyCode::Home => self.doc.home(),
-                KeyCode::End => self.doc.end(),
-                KeyCode::Backspace => {
-                    if self.doc.col > 0 || self.doc.row > 0 {
-                        self.insert_change();
-                        self.doc.backspace();
-                    }
+                KeyCode::Backspace if self.doc.col > 0 || self.doc.row > 0 => {
+                    self.insert_change();
+                    self.doc.backspace();
                 }
                 KeyCode::Delete => {
                     self.insert_change();
@@ -2513,203 +2339,6 @@ impl Editor {
                 }
                 _ => {}
             }
-            return;
-        }
-        if self.mode == Mode::Visual {
-            self.visual_key(key);
-            return;
-        }
-        self.normal_key(key);
-    }
-
-    fn normal_key(&mut self, key: KeyEvent) {
-        if self.sequence != Sequence::None {
-            let sequence = std::mem::take(&mut self.sequence);
-            let count = self.count.take();
-            // Lua owns the leader bindings. Any new "space x" mapping in
-            // plugins/toggleterm.lua works without changing this dispatcher.
-            if sequence == Sequence::Leader {
-                if let KeyCode::Char(c) = key.code {
-                    let binding = format!("space {}", c.to_ascii_lowercase());
-                    if self.toggleterm.binding(&binding).ok().flatten().is_some() {
-                        self.terminal_binding(&binding);
-                        return;
-                    }
-                }
-            }
-            if sequence == Sequence::Go {
-                if let KeyCode::Char(c) = key.code {
-                    let binding = format!("g{c}");
-                    if let Ok(Some(action)) = self.lsp_plugin.binding(&binding) {
-                        self.lsp_action(&action);
-                        return;
-                    }
-                }
-            }
-            match (sequence, key.code) {
-                (Sequence::Leader, KeyCode::Char('b')) => self.sequence = Sequence::Buffer,
-                (Sequence::Leader, KeyCode::Char('l')) => self.sequence = Sequence::Language,
-                (Sequence::Language, KeyCode::Char('m')) => self.open_mason_picker(),
-                (Sequence::Leader, KeyCode::Char('f')) => self.sequence = Sequence::File,
-                (Sequence::Leader, KeyCode::Char('o')) => self.sequence = Sequence::Panel,
-                (Sequence::Leader, KeyCode::Char('v')) => self.sequence = Sequence::Visual,
-                (Sequence::Visual, KeyCode::Char('f')) => self.select_function(),
-                (Sequence::Leader, KeyCode::Char('q')) => self.sequence = Sequence::Quit,
-                (Sequence::Buffer, KeyCode::Char('b')) => self.open_buffer_picker(),
-                (Sequence::Buffer, KeyCode::Char('n')) => self.cycle_buffer(true),
-                (Sequence::Buffer, KeyCode::Char('p')) => self.cycle_buffer(false),
-                (Sequence::Buffer, KeyCode::Char('l')) => self.last_buffer(),
-                (Sequence::Buffer, KeyCode::Char('d')) => self.close_buffer(false),
-                (Sequence::Buffer, KeyCode::Char('s')) => self.save_all(),
-                (Sequence::Panel, KeyCode::Char('p')) => self.toggle_tree(),
-                (Sequence::File, KeyCode::Char('t')) => self.toggle_tree(),
-                (Sequence::File, KeyCode::Char('f')) => {
-                    self.prompt = Some(Prompt::Open(String::new()))
-                }
-                (Sequence::File, KeyCode::Char('s')) => self.save(),
-                (Sequence::Quit, KeyCode::Char('q')) => self.quit(),
-                (Sequence::Delete, KeyCode::Char('d')) => {
-                    self.remember();
-                    let line = self.doc.delete_line();
-                    self.store_register(Register::Line(line), "Line deleted");
-                }
-                (Sequence::Yank, KeyCode::Char('y')) => {
-                    self.store_register(Register::Line(self.doc.line().to_vec()), "Line copied");
-                }
-                (Sequence::Go, KeyCode::Char('g')) => {
-                    self.record_current_jump();
-                    self.doc.row = count
-                        .unwrap_or(1)
-                        .saturating_sub(1)
-                        .min(self.doc.lines.len() - 1);
-                    self.doc.home();
-                }
-                (Sequence::Go, KeyCode::Char(';')) => self.jump_to_change(true),
-                (Sequence::Go, KeyCode::Char(',')) => self.jump_to_change(false),
-                (Sequence::MarkSet, KeyCode::Char(name)) => self.set_mark(name),
-                (Sequence::MarkLine, KeyCode::Char(name)) => self.jump_to_mark(name, true),
-                (Sequence::MarkExact, KeyCode::Char(name)) => self.jump_to_mark(name, false),
-                _ => self.message = "Unknown key sequence".into(),
-            }
-            return;
-        }
-        // Vim-style numeric prefixes: 5j, 12k, 120G, 42gg.
-        // Zero alone still means beginning of line.
-        if let KeyCode::Char(digit @ '0'..='9') = key.code {
-            if digit != '0' || self.count.is_some() {
-                self.count = Some(
-                    self.count
-                        .unwrap_or(0)
-                        .saturating_mul(10)
-                        .saturating_add((digit as u8 - b'0') as usize),
-                );
-                return;
-            }
-        }
-        let explicit_count = self.count.take();
-        let count = explicit_count.unwrap_or(1);
-        match key.code {
-            KeyCode::Char(' ') => self.sequence = Sequence::Leader,
-            KeyCode::Char('v') => self.enter_visual(),
-            KeyCode::Char('i') => self.begin_insert(),
-            KeyCode::Char('a') => {
-                if self.doc.col < self.doc.line().len() {
-                    self.doc.col += 1;
-                }
-                self.begin_insert();
-            }
-            KeyCode::Char('I') => {
-                self.doc.home();
-                self.begin_insert();
-            }
-            KeyCode::Char('A') => {
-                self.doc.end();
-                self.begin_insert();
-            }
-            KeyCode::Char('o') => {
-                self.remember();
-                self.doc.insert_line_below(Vec::new());
-                self.begin_insert();
-                self.insert_changed = true;
-            }
-            KeyCode::Char('O') => {
-                self.remember();
-                self.doc.insert_line_above(Vec::new());
-                self.begin_insert();
-                self.insert_changed = true;
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.doc.col = self.doc.col.saturating_sub(count);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                if !self.doc.line().is_empty() {
-                    self.doc.col = self
-                        .doc
-                        .col
-                        .saturating_add(count)
-                        .min(self.doc.line().len() - 1);
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.doc.row = self
-                    .doc
-                    .row
-                    .saturating_add(count)
-                    .min(self.doc.lines.len() - 1);
-                self.doc.col = self.doc.col.min(self.doc.line().len());
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.doc.row = self.doc.row.saturating_sub(count);
-                self.doc.col = self.doc.col.min(self.doc.line().len());
-            }
-            KeyCode::Char('0') | KeyCode::Home => self.doc.home(),
-            KeyCode::Char('$') | KeyCode::End => {
-                self.doc.end();
-                self.doc.col = self.doc.col.saturating_sub(1);
-            }
-            KeyCode::Char('w') => {
-                for _ in 0..count.min(100_000) {
-                    self.doc.word_forward();
-                }
-            }
-            KeyCode::Char('b') => {
-                for _ in 0..count.min(100_000) {
-                    self.doc.word_backward();
-                }
-            }
-            KeyCode::Char('g') => {
-                self.count = explicit_count;
-                self.sequence = Sequence::Go;
-            }
-            KeyCode::Char('K') => {
-                if let Ok(Some(action)) = self.lsp_plugin.binding("K") {
-                    self.lsp_action(&action);
-                }
-            }
-            KeyCode::Char('m') => self.sequence = Sequence::MarkSet,
-            KeyCode::Char('\'') => self.sequence = Sequence::MarkLine,
-            KeyCode::Char('`') => self.sequence = Sequence::MarkExact,
-            KeyCode::Char('G') => {
-                self.record_current_jump();
-                self.doc.row = explicit_count.map_or(self.doc.lines.len() - 1, |line| {
-                    line.saturating_sub(1).min(self.doc.lines.len() - 1)
-                });
-                self.doc.home();
-            }
-            KeyCode::Char('d') => self.sequence = Sequence::Delete,
-            KeyCode::Char('y') => self.sequence = Sequence::Yank,
-            KeyCode::Char('x') => {
-                if self.doc.col < self.doc.line().len() {
-                    self.remember();
-                    let deleted = self.doc.line()[self.doc.col].to_string();
-                    self.doc.delete();
-                    self.store_register(Register::Text(deleted), "Character deleted");
-                }
-            }
-            KeyCode::Char('p') => self.paste_clipboard(),
-            KeyCode::Char('u') => self.undo(),
-            KeyCode::Char(':') => self.prompt = Some(Prompt::Command(String::new())),
-            _ => {}
         }
     }
 
@@ -2811,7 +2440,7 @@ impl Editor {
         let tree_view = match self
             .tree
             .as_ref()
-            .map(|tree| tree.view(height.saturating_sub(1)))
+            .map(|tree| self.with_lua(height, |_| tree.view(height.saturating_sub(1))))
         {
             Some(Ok(view)) => Some(view),
             Some(Err(error)) => {
@@ -2850,7 +2479,10 @@ impl Editor {
             }
         }
 
-        let active_terminal = self.toggleterm.active().ok().flatten();
+        let active_terminal = self
+            .with_lua(10, |_| self.toggleterm.active())
+            .ok()
+            .flatten();
         let popup_rect = active_terminal
             .as_ref()
             .filter(|kind| self.terminals.contains_key(kind.as_str()))
@@ -3175,7 +2807,6 @@ impl Editor {
                 Some(Prompt::Quit) => format!(
                     "Discard unsaved changes in {} buffer(s) and quit? (y/n)", self.dirty_buffers()
                 ),
-                None if self.control_x => "C-x".into(),
                 None if self.mason_picker.is_some() =>
                     "MASON  ↑↓ Select · Enter Install · Ctrl+U Update · Ctrl+S Sync · Ctrl+R Update All".into(),
                 None if self.buffer_picker.is_some() =>
@@ -3189,21 +2820,12 @@ impl Editor {
                 None if self.tree.as_ref().is_some_and(|tree| tree.focused) =>
                     "TREE  / or f Find  j/k Move  l/Enter Open  . Hidden  r Refresh  Tab/Esc Editor  q Close".into(),
                 None => match self.sequence {
-                    Sequence::Leader => "SPC → b Buffers | f Files | l Languages | g LazyGit | t Terminal | o Panels | v Visual | q Quit".into(),
-                    Sequence::Language => "SPC l → m Mason (LSP manager)".into(),
-                    Sequence::Buffer => "SPC b → b Pick | n Next | p Previous | l Last | s Save All | d Close".into(),
-                    Sequence::File => "SPC f → f Find | s Save | t Tree".into(),
-                    Sequence::Panel => "SPC o → p Project tree".into(),
-                    Sequence::Visual => "SPC v → f Select function".into(),
-                    Sequence::TextObjectAround => "VISUAL a → f Function".into(),
-                    Sequence::Quit => "SPC q → q Quit".into(),
-                    Sequence::Delete => "d → d Delete line".into(),
-                    Sequence::Yank => "y → y Yank line".into(),
-                    Sequence::Go => "g → g First line | ; Previous edit | , Next edit".into(),
                     Sequence::MarkSet => "m → a-z File mark | A-Z Global mark".into(),
                     Sequence::MarkLine => "' → mark (first nonblank on line)".into(),
                     Sequence::MarkExact => "` → mark (exact position)".into(),
-                    Sequence::None => self.count.map_or_else(|| self.message.clone(), |n| n.to_string()),
+                    Sequence::None => if self.lua.key_pending() {
+                        format!("{} →", self.lua.pending_keys())
+                    } else { self.count.map_or_else(|| self.message.clone(), |n| n.to_string()) },
                 },
             };
             let message = fit_cells(&message, width);
@@ -3633,12 +3255,14 @@ fn main() -> io::Result<()> {
     let _terminal = TerminalGuard::enter()?;
     let mut stdout = io::stdout();
     let mut editor = Editor::new(doc);
+    editor.load_lua_config();
     while editor.running {
         // A PTY can produce output without key presses. Event polling
         // ensures interactive TUI refreshes while keeping idle CPU low.
         editor.poll_terminals();
         editor.poll_mason();
         editor.poll_lsp();
+        editor.sync_lua_events();
         editor.draw(&mut stdout)?;
         let delay = if !editor.terminals.is_empty()
             || editor.completion_due.is_some()
@@ -3657,10 +3281,19 @@ fn main() -> io::Result<()> {
                     editor.key(key, height);
                 }
                 Event::Paste(text) => editor.pasted(&text),
+                Event::Resize(width, height) => {
+                    editor.emit_lua("resize", |data| {
+                        data.set("width", width)?;
+                        data.set("height", height)
+                    });
+                    editor.drain_lua_actions();
+                }
                 _ => {}
             }
         }
     }
+    editor.emit_lua("editor_exit", |_| Ok(()));
+    editor.drain_lua_actions();
     Ok(())
 }
 
@@ -4175,7 +3808,7 @@ mod tests {
         let root = temporary_buffer_project();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
         editor.doc.insert('!');
-        let mut tree = TreePlugin::new(&root).unwrap();
+        let mut tree = TreePlugin::new(editor.lua.clone(), &root).unwrap();
         tree.toggle().unwrap();
         editor.tree = Some(tree);
         // Sorted root: one.rs, two.md.
@@ -4399,7 +4032,7 @@ mod tests {
             let mut editor = Editor::new(Document::from_text(&text));
             editor.doc.col = 20;
             if sidebar {
-                let mut tree = TreePlugin::new(&root).unwrap();
+                let mut tree = TreePlugin::new(editor.lua.clone(), &root).unwrap();
                 tree.toggle().unwrap();
                 tree.leave();
                 editor.tree = Some(tree);
@@ -4736,7 +4369,7 @@ mod tests {
         assert_eq!(editor.doc.row, 23);
         editor.buffer_picker = None;
         let root = temporary_buffer_project();
-        let mut tree = TreePlugin::new(&root).unwrap();
+        let mut tree = TreePlugin::new(editor.lua.clone(), &root).unwrap();
         tree.toggle().unwrap();
         tree.on_key("/").unwrap();
         tree.paste_query("query").unwrap();
@@ -4884,7 +4517,8 @@ mod tests {
         let mut editor = Editor::new(Document::from_text(
             &vec!["SOME-EDITOR-CONTENT"; 60].join("\n"),
         ));
-        let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
+        let mut tree =
+            TreePlugin::new(editor.lua.clone(), &std::env::current_dir().unwrap()).unwrap();
         tree.toggle().unwrap();
         editor.tree = Some(tree);
 
@@ -4943,7 +4577,7 @@ mod tests {
         std::fs::write(temp.join("README.md"), "# Example").unwrap();
 
         let mut editor = Editor::new(Document::empty());
-        let mut tree = TreePlugin::new(&temp).unwrap();
+        let mut tree = TreePlugin::new(editor.lua.clone(), &temp).unwrap();
         tree.toggle().unwrap();
         editor.tree = Some(tree);
         let initial = paint(&mut editor);
@@ -4984,7 +4618,8 @@ mod tests {
         let mut editor = Editor::new(Document::from_text(
             &vec!["EDITOR_CONTENT_STAYS_VISIBLE"; 30].join("\n"),
         ));
-        let mut tree = TreePlugin::new(&std::env::current_dir().unwrap()).unwrap();
+        let mut tree =
+            TreePlugin::new(editor.lua.clone(), &std::env::current_dir().unwrap()).unwrap();
         tree.toggle().unwrap();
         editor.tree = Some(tree);
         paint(&mut editor);
@@ -5277,7 +4912,7 @@ mod tests {
         editor.pasted("x");
         press(&mut editor, KeyCode::Char('d'));
         assert_eq!(editor.doc.lsp_text(), "oxne");
-        assert_eq!(editor.sequence, Sequence::Delete);
+        assert!(editor.lua.key_pending());
     }
 
     #[test]

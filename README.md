@@ -14,8 +14,8 @@ No GUI, no menus, no daemon, and no configuration required to start editing.
 The default keymap is **Vim-style modal editing** with a **Doom-inspired Space leader**.
 
 This is an independent implementation, **not** a port of MicroEmacs' C code.
-It includes multiple buffers, Lua plugins, persistent jumps, native clipboard
-integration and asynchronous LSP navigation.
+It includes multiple buffers, a shared and reloadable Lua runtime, persistent
+jumps, native clipboard integration and asynchronous LSP navigation.
 
 ## Get started
 
@@ -128,6 +128,30 @@ Opening another file does **not** require saving the current one: unsaved change
 stay in their own buffer. Start an empty document with `remacs` and save it
 via `SPC f s`.
 
+## Lua configuration and plugins
+
+Commands, default keymaps, hooks and plugins run in **one persistent Lua 5.4
+runtime**. Rust provides fast text operations, rendering, I/O, PTY sessions and
+asynchronous LSP services. The tree, toggleterm, LSP and Mason plugins share the
+same public API and module cache.
+
+Try a command immediately with `:lua remacs.message("Hello")`, load a plugin with
+`:luafile /path/to/plugin.lua`, then edit it and use `:reload /path/to/plugin.lua`.
+`:reload tree`, `:reload toggleterm`, `:reload lsp` and `:reload mason` update the
+bundled modules without rebuilding or restarting. `:reload` reloads your user
+configuration. Registered Lua commands are available directly from `:`.
+
+User configuration lives in `~/.config/remacs/init.lua` (or
+`$XDG_CONFIG_HOME/remacs/init.lua`; `$REMACS_CONFIG_DIR` overrides the directory).
+Place modified bundled plugin files in that directory's `plugins/` folder,
+such as `~/.config/remacs/plugins/mason.lua`, then reload the module.
+
+The [Lua API guide](docs/lua-api.md) documents configuration discovery, commands,
+multi-key mappings, buffers, editor events and reload behavior.
+[examples/init.lua](examples/init.lua) is a usable configuration example;
+[lua/defaults.lua](lua/defaults.lua) contains the existing default editor policy.
+Embedded Lua files remain available as installation fallbacks.
+
 ## Mason-like language-server manager (Lua plugin)
 
 Remacs includes its own **`plugins/mason.lua`** for declaring the languages and
@@ -138,7 +162,8 @@ the LSP client recognize it, and the manager knows how to install it.
 
 The initial desired list is **Rust, Lua, Go, Bash, JSON and YAML**. Python,
 TypeScript/JavaScript and TOML recipes are included but commented out. Edit
-`ensure_installed` in `plugins/mason.lua` and rebuild Remacs to change it.
+`ensure_installed` in your runtime copy of `plugins/mason.lua`, then use
+`:reload mason` to change it.
 New languages can be added with an executable command, file extensions, root
 markers and a typed installation recipe.
 
@@ -162,8 +187,8 @@ Remacs retries a previously unavailable LSP without requiring a restart.
 **No surprise downloads:** `auto_install = false` and
 `auto_update_days = 0` are the defaults. The single explicit
 `:mason sync` command installs missing enabled tools. Optionally set
-`auto_install = true` or a positive `auto_update_days = 7` in the Lua file,
-then rebuild, to enable startup installation or periodic refresh (based on
+`auto_install = true` or a positive `auto_update_days = 7` in the Lua file
+to enable startup installation or periodic refresh (based on
 successful managed installs/updates). Automatic updates only cover entries
 with a recorded successful installation/update; nothing checks network
 versions in the background otherwise. Updates may fetch latest package
@@ -257,8 +282,8 @@ repeat filesystem root discovery. Mason updates invalidate the cache.
 
 **Roadmap:** LSP Core covers definition, hover, completion and synchronization.
 Diagnostics and refactoring actions are follow-up milestones. Language servers and
-keybindings remain configured in Lua; add more languages to
-`plugins/mason.lua` and rebuild. GitHub Actions exercises a real rust-analyzer
+keybindings remain configured in Lua; add more languages to your runtime copy of
+`plugins/mason.lua` and use `:reload mason`. GitHub Actions exercises a real rust-analyzer
 server on both Linux and macOS in addition to protocol unit tests.
 
 ## Floating terminal & LazyGit (Lua plugin)
@@ -276,10 +301,9 @@ PTY, an ANSI/VT100 renderer and a curved border.
   are sent directly to the child program. `q` exits LazyGit normally.
 
 The Lua plugin **owns the bindings, command selection, titles and lifecycle**.
-The small Rust host only supplies PTY sessions, keyboard input and drawing,
-as it does for other editor capabilities. The source is embedded at compile
-time so `cargo install --path .` works without shipping loose Lua files.
-Modify `plugins/toggleterm.lua` and rebuild to customize bindings.
+Its adapter uses the shared runtime; Rust supplies PTY sessions, keyboard input
+and drawing. Modify your runtime copy of `plugins/toggleterm.lua`, then use
+`:reload toggleterm` to customize it. Existing session state survives reload.
 
 LazyGit is an **optional external program**, not bundled with Remacs. On macOS,
 for example: `brew install lazygit`. If it is missing, Remacs shows an error
@@ -398,7 +422,7 @@ The current line has a subtle full-width background tint, including empty
 space to the right of the text. Both features are integrated with the
 incremental renderer so moving between lines does not clear the screen.
 
-## File tree — first Lua plugin
+## File tree (Lua plugin)
 
 Open the project explorer using **SPC o p** (Space, o, p), **SPC f t**,
 **Ctrl+N**, or **:tree**. The tree appears in a narrow left sidebar and
@@ -409,12 +433,10 @@ closes the sidebar. Press . to show/hide dotfiles, r to refresh, and g/G
 to jump to the first/last entry. Opening a different file preserves
 unsaved changes in the original buffer.
 
-The tree is implemented in **plugins/tree.lua** and executed by the
-bundled Lua 5.4 runtime (mlua). Rust provides a small host API
-(remacs.fs.list), paints the sidebar, and processes file-open actions.
-The plugin source is embedded in the executable so it works after cargo
-install without copying any plugin files. This is the first plugin host
-prototype, not yet a general-purpose plugin manager or configuration loader.
+The tree is implemented in **plugins/tree.lua** and executed by the shared
+Lua 5.4 runtime (mlua). Rust provides filesystem metadata (`remacs.fs.list`),
+paints the sidebar, and processes file-open actions. `:reload tree` loads changes
+to its runtime file while preserving the project's navigation state.
 
 ### Fuzzy file finding in the tree
 

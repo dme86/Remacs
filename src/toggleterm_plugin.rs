@@ -1,12 +1,13 @@
 //! Lua-driven popup terminal controller. This is deliberately separate from
 //! the Rust PTY renderer: plugins/toggleterm.lua owns bindings, session
 //! visibility and commands; the host only executes actions returned by Lua.
-use mlua::{Function, Lua, RegistryKey, Table};
+use mlua::{Function, Table};
+
+use crate::lua_runtime::LuaRuntime;
 use std::path::Path;
 
 pub struct ToggleTermPlugin {
-    lua: Lua,
-    plugin: RegistryKey,
+    runtime: LuaRuntime,
 }
 
 pub enum Action {
@@ -24,24 +25,20 @@ pub enum Action {
 }
 
 impl ToggleTermPlugin {
-    pub fn new() -> mlua::Result<Self> {
-        let lua = Lua::new();
-        let plugin: Table = lua
-            .load(include_str!("../plugins/toggleterm.lua"))
-            .set_name("plugins/toggleterm.lua")
-            .eval()?;
-        let plugin = lua.create_registry_value(plugin)?;
-        Ok(Self { lua, plugin })
+    pub fn new(runtime: LuaRuntime) -> mlua::Result<Self> {
+        runtime.table("toggleterm")?;
+        Ok(Self { runtime })
     }
 
     fn table(&self) -> mlua::Result<Table> {
-        self.lua.registry_value(&self.plugin)
+        self.runtime.table("toggleterm")
     }
 
     pub fn active(&self) -> mlua::Result<Option<String>> {
         self.table()?.get::<Function>("active")?.call(())
     }
 
+    #[cfg(test)]
     pub fn binding(&self, key: &str) -> mlua::Result<Option<String>> {
         self.table()?.get::<Function>("binding")?.call(key)
     }
@@ -91,8 +88,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hot_reload_keeps_active_and_hidden_terminal_sessions() {
+        let root = std::env::current_dir().unwrap();
+        let runtime = LuaRuntime::new(&root).unwrap();
+        let plugin = ToggleTermPlugin::new(runtime.clone()).unwrap();
+        assert!(matches!(
+            plugin.toggle("shell", &root).unwrap(),
+            Action::Open { .. }
+        ));
+        runtime.reload("toggleterm").unwrap();
+        assert_eq!(plugin.active().unwrap().as_deref(), Some("shell"));
+        assert!(matches!(
+            plugin.toggle("shell", &root).unwrap(),
+            Action::Hide
+        ));
+        runtime.reload("toggleterm").unwrap();
+        assert!(matches!(
+            plugin.toggle("shell", &root).unwrap(),
+            Action::Show { .. }
+        ));
+        plugin.exited("shell").unwrap();
+        assert!(matches!(
+            plugin.toggle("shell", &root).unwrap(),
+            Action::Open { .. }
+        ));
+    }
+
+    #[test]
     fn lua_plugin_owns_keybindings_and_sessions() {
-        let plugin = ToggleTermPlugin::new().unwrap();
+        let plugin =
+            ToggleTermPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap())
+                .unwrap();
         assert_eq!(
             plugin.binding("space g").unwrap().as_deref(),
             Some("lazygit")

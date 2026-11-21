@@ -1,8 +1,8 @@
--- Remacs file explorer / fuzzy finder (first bundled Lua plugin).
+-- Remacs file explorer / fuzzy finder in the shared editor Lua runtime.
 -- Filesystem listing is provided by the Rust host. Tree and search state are
 -- managed in Lua; no filesystem writes or editor buffer mutations happen here.
 
-local tree = {
+local tree = remacs.state.tree or {
   root = ".",
   nodes = {},
   expanded = {},
@@ -17,6 +17,8 @@ local tree = {
   search_selected = 1,
   search_top = 1,
 }
+
+remacs.state.tree = tree
 
 local MAX_NODES = 10000
 local MAX_SEARCH_FILES = 20000
@@ -180,6 +182,8 @@ local function cancel_search()
 end
 
 function tree.setup(root)
+  if tree.initialized and tree.root == root then return end
+  tree.initialized = true
   tree.root = root
   tree.nodes = {}
   tree.expanded = {}
@@ -365,5 +369,10 @@ function tree.render(height)
     scanned = tree.files and #tree.files or 0,
   }
 end
+
+remacs.commands.add("tree", function() remacs.core("tree_toggle") end)
+remacs.keymap.set("global", "ctrl-n", "tree")
+remacs.keymap.set("normal", "space o p", "tree")
+remacs.keymap.set("normal", "space f t", "tree")
 
 return tree

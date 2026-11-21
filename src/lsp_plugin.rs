@@ -1,12 +1,14 @@
 //! A small Lua LSP configuration host: servers and keymaps belong to
 //! plugins/lsp.lua; Rust owns process management and JSON-RPC.
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
-use mlua::{Function, Lua, RegistryKey, Table};
+use mlua::{Function, Table};
+
+use crate::lua_runtime::LuaRuntime;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -16,40 +18,27 @@ pub struct ServerConfig {
 }
 
 pub struct LspPlugin {
-    lua: Lua,
-    plugin: RegistryKey,
+    runtime: LuaRuntime,
+    generation: Cell<u64>,
     configurations: RefCell<HashMap<(PathBuf, PathBuf), Option<ServerConfig>>>,
 }
 
 impl LspPlugin {
-    pub fn new() -> mlua::Result<Self> {
-        let lua = Lua::new();
-        // Load Mason's declarative Lua catalog once per LSP Lua VM. Both
-        // plugins use identical embedded source; no duplicated server lists.
-        let package: Table = lua.globals().get("package")?;
-        let preload: Table = package.get("preload")?;
-        let loader = lua.create_function(|lua, _: ()| {
-            lua.load(include_str!("../plugins/mason.lua"))
-                .set_name("plugins/mason.lua")
-                .eval::<Table>()
-        })?;
-        preload.set("remacs.mason", loader)?;
-        let plugin: Table = lua
-            .load(include_str!("../plugins/lsp.lua"))
-            .set_name("plugins/lsp.lua")
-            .eval()?;
-        let plugin = lua.create_registry_value(plugin)?;
+    pub fn new(runtime: LuaRuntime) -> mlua::Result<Self> {
+        runtime.table("lsp")?;
+        let generation = Cell::new(runtime.generation());
         Ok(Self {
-            lua,
-            plugin,
+            runtime,
+            generation,
             configurations: RefCell::new(HashMap::new()),
         })
     }
 
     fn table(&self) -> mlua::Result<Table> {
-        self.lua.registry_value(&self.plugin)
+        self.runtime.table("lsp")
     }
 
+    #[cfg(test)]
     pub fn binding(&self, keys: &str) -> mlua::Result<Option<String>> {
         self.table()?.get::<Function>("binding")?.call(keys)
     }
@@ -60,6 +49,11 @@ impl LspPlugin {
     }
 
     pub fn server_for(&self, path: &Path, cwd: &Path) -> mlua::Result<Option<ServerConfig>> {
+        let generation = self.runtime.generation();
+        if generation != self.generation.get() {
+            self.clear_cache();
+            self.generation.set(generation);
+        }
         let key = (path.to_path_buf(), cwd.to_path_buf());
         if let Some(configuration) = self.configurations.borrow().get(&key) {
             return Ok(configuration.clone());
@@ -132,7 +126,8 @@ mod tests {
 
     #[test]
     fn lua_config_maps_rust_analyzer_and_navigation_keys() {
-        let config = LspPlugin::new().unwrap();
+        let config =
+            LspPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap()).unwrap();
         assert_eq!(config.binding("gd").unwrap().as_deref(), Some("definition"));
         assert_eq!(config.binding("K").unwrap().as_deref(), Some("hover"));
         assert_eq!(config.binding("gg").unwrap(), None);
@@ -152,8 +147,9 @@ mod tests {
 
     #[test]
     fn lsp_reads_same_enabled_servers_as_mason_lua_plugin() {
-        let plugin = LspPlugin::new().unwrap();
-        let mason = crate::mason_plugin::MasonPlugin::new().unwrap();
+        let plugin =
+            LspPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap()).unwrap();
+        let mason = crate::mason_plugin::MasonPlugin::new(plugin.runtime.clone()).unwrap();
         let tools = mason.tools().unwrap();
         let cwd = std::env::current_dir().unwrap();
         for (extension, language) in [
@@ -177,8 +173,45 @@ mod tests {
     }
 
     #[test]
+    fn shared_catalog_and_hot_reload_invalidate_negative_lsp_cache() {
+        let cwd = std::env::current_dir().unwrap();
+        let runtime = LuaRuntime::new(&cwd).unwrap();
+        let lsp = LspPlugin::new(runtime.clone()).unwrap();
+        let mason = crate::mason_plugin::MasonPlugin::new(runtime.clone()).unwrap();
+        runtime
+            .eval("require('remacs.mason').ensure_installed = { 'gopls' }")
+            .unwrap();
+        assert_eq!(mason.tools().unwrap().len(), 1);
+        assert_eq!(mason.tools().unwrap()[0].id, "gopls");
+        assert!(lsp
+            .server_for(Path::new("main.rs"), &cwd)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            lsp.server_for(Path::new("main.go"), &cwd)
+                .unwrap()
+                .unwrap()
+                .language,
+            "go"
+        );
+
+        // Reload replaces the module in the same VM. The existing adapters
+        // must observe it, including previously cached unsupported files.
+        runtime.reload("mason").unwrap();
+        assert!(mason.tools().unwrap().len() > 1);
+        assert_eq!(
+            lsp.server_for(Path::new("main.rs"), &cwd)
+                .unwrap()
+                .unwrap()
+                .language,
+            "rust"
+        );
+    }
+
+    #[test]
     fn server_configuration_is_cached_and_can_be_invalidated() {
-        let plugin = LspPlugin::new().unwrap();
+        let plugin =
+            LspPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap()).unwrap();
         let cwd = std::env::current_dir().unwrap();
         let rust = Path::new("src/main.rs");
         let markdown = Path::new("README.md");
@@ -193,7 +226,8 @@ mod tests {
             .set(
                 "server_for",
                 plugin
-                    .lua
+                    .runtime
+                    .lua()
                     .create_function(|_, _: String| {
                         Err::<Option<Table>, _>(mlua::Error::external("cache miss"))
                     })
@@ -218,7 +252,7 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("src/nested")).unwrap();
         std::fs::write(root.join(".git"), "gitdir: /tmp/fixture\n").unwrap();
-        let spec = LspPlugin::new()
+        let spec = LspPlugin::new(LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap())
             .unwrap()
             .server_for(Path::new("src/nested/lib.rs"), &root)
             .unwrap()

@@ -131,4 +131,9 @@ function M.server_for(extension)
   end
 end
 
+remacs.commands.add("mason", function(args)
+  remacs.core("mason", { args = args })
+end)
+remacs.keymap.set("normal", "space l m", "mason")
+
 return M

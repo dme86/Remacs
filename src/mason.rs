@@ -23,6 +23,9 @@ struct Task {
 
 struct Active {
     task: Task,
+    // The running job keeps its original metadata even if Lua removes or
+    // changes this server while the installer process is still running.
+    language: String,
     child: Child,
 }
 
@@ -121,6 +124,16 @@ impl Manager {
             failures: HashMap::new(),
             history,
         })
+    }
+
+    /// Refresh policy without interrupting installers or discarding history.
+    /// Parse before mutating so an invalid catalog leaves the manager intact.
+    pub fn reload_catalog(&mut self, plugin: &MasonPlugin) -> mlua::Result<()> {
+        let tools = plugin.tools()?;
+        self.pending
+            .retain(|task| tools.iter().any(|tool| tool.id == task.id));
+        self.tools = tools;
+        Ok(())
     }
 
     pub fn tools(&self) -> &[Tool] {
@@ -362,7 +375,11 @@ impl Manager {
                         task.id,
                         self.log_path().display()
                     )));
-                    self.active = Some(Active { task, child });
+                    self.active = Some(Active {
+                        task,
+                        language: tool.language.clone(),
+                        child,
+                    });
                     break;
                 }
                 Err(error) => {
@@ -384,13 +401,11 @@ impl Manager {
                     let finished = self.active.take().expect("completed job");
                     let id = finished.task.id;
                     if status.success() {
-                        if let Some(tool) = self.tools.iter().find(|tool| tool.id == id) {
-                            events.push(Event::Done {
-                                id: id.clone(),
-                                language: tool.language.clone(),
-                                updated: finished.task.update,
-                            });
-                        }
+                        events.push(Event::Done {
+                            id: id.clone(),
+                            language: finished.language,
+                            updated: finished.task.update,
+                        });
                         self.history.updated_at.insert(id, now_secs());
                         let _ = self.persist_history();
                     } else {
@@ -454,7 +469,10 @@ mod tests {
     use std::ffi::OsStr;
 
     fn fixture() -> Manager {
-        let plugin = MasonPlugin::new().unwrap();
+        let plugin = MasonPlugin::new(
+            crate::lua_runtime::LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap(),
+        )
+        .unwrap();
         let mut manager = Manager::new(&plugin).unwrap();
         manager.root = std::env::temp_dir().join(format!(
             "remacs-mason-test-{}-{}",
@@ -469,7 +487,10 @@ mod tests {
 
     #[test]
     fn no_downloads_or_updates_without_explicit_opt_in() {
-        let plugin = MasonPlugin::new().unwrap();
+        let plugin = MasonPlugin::new(
+            crate::lua_runtime::LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap(),
+        )
+        .unwrap();
         let mut manager = fixture();
         assert!(manager.pending.is_empty());
         manager.auto_queue(&plugin).unwrap();
@@ -529,6 +550,7 @@ mod tests {
                 id: "gopls".into(),
                 update: false,
             },
+            language: "go".into(),
             child,
         });
         let mut completed = false;
@@ -565,6 +587,7 @@ mod tests {
                 id: "gopls".into(),
                 update: true,
             },
+            language: "go".into(),
             child,
         });
         for _ in 0..50 {
@@ -579,6 +602,88 @@ mod tests {
         assert!(manager
             .status(manager.tools.iter().find(|t| t.id == "gopls").unwrap())
             .contains("failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_reload_preserves_running_installer_and_history() {
+        let root = std::env::current_dir().unwrap();
+        let runtime = crate::lua_runtime::LuaRuntime::new(&root).unwrap();
+        let plugin = MasonPlugin::new(runtime.clone()).unwrap();
+        let mut manager = fixture();
+        fs::create_dir_all(&manager.root).unwrap();
+        manager
+            .history
+            .updated_at
+            .insert("rust_analyzer".into(), 123);
+        manager.pending.push_back(Task {
+            id: "jsonls".into(),
+            update: true,
+        });
+        manager.pending.push_back(Task {
+            id: "yamlls".into(),
+            update: true,
+        });
+        manager.active = Some(Active {
+            task: Task {
+                id: "gopls".into(),
+                update: false,
+            },
+            language: "go".into(),
+            child: Command::new("/usr/bin/true").spawn().unwrap(),
+        });
+        let pid = manager.active.as_ref().unwrap().child.id();
+        runtime
+            .eval("require('remacs.mason').ensure_installed = { 'jsonls' }")
+            .unwrap();
+        manager.reload_catalog(&plugin).unwrap();
+        assert_eq!(manager.tools.len(), 1);
+        assert_eq!(manager.tools[0].id, "jsonls");
+        assert_eq!(manager.active.as_ref().unwrap().child.id(), pid);
+        assert_eq!(manager.pending.len(), 1);
+        assert_eq!(manager.pending[0].id, "jsonls");
+        assert_eq!(manager.history.updated_at["rust_analyzer"], 123);
+        // Prevent the queued, real installer from starting in this test.
+        manager.pending.clear();
+        let mut completed = false;
+        for _ in 0..50 {
+            for event in manager.poll() {
+                if let Event::Done { id, language, .. } = event {
+                    assert_eq!(id, "gopls");
+                    assert_eq!(language, "go");
+                    completed = true;
+                }
+            }
+            if completed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            completed,
+            "removed active server must still report completion"
+        );
+        assert!(manager.history.updated_at.contains_key("gopls"));
+        fs::remove_dir_all(&manager.root).unwrap();
+    }
+
+    #[test]
+    fn invalid_catalog_reload_keeps_current_tools_and_queue() {
+        let runtime =
+            crate::lua_runtime::LuaRuntime::new(&std::env::current_dir().unwrap()).unwrap();
+        let plugin = MasonPlugin::new(runtime.clone()).unwrap();
+        let mut manager = fixture();
+        manager.pending.push_back(Task {
+            id: "jsonls".into(),
+            update: true,
+        });
+        let count = manager.tools.len();
+        runtime
+            .eval("require('remacs.mason').ensure_installed = { 'unknown' }")
+            .unwrap();
+        assert!(manager.reload_catalog(&plugin).is_err());
+        assert_eq!(manager.tools.len(), count);
+        assert_eq!(manager.pending[0].id, "jsonls");
     }
 
     #[test]
