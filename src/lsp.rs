@@ -811,6 +811,15 @@ impl Manager {
             server.cancel_requests(|request| request.kind == RequestKind::Completion);
         }
     }
+
+    /// A navigation response belongs to the view that requested it. Focus
+    /// changes cancel that work without restarting servers or closing documents.
+    pub fn cancel_navigation(&mut self) {
+        for server in self.servers.values_mut() {
+            server.cancel_requests(|request| request.kind != RequestKind::Completion);
+        }
+    }
+
     /// Initialization is asynchronous; documents must be retried until ready.
     pub fn has_starting_servers(&self) -> bool {
         self.servers
@@ -1217,6 +1226,70 @@ mod tests {
         assert!(server
             .handle_message(json!({"id":completion_payload["id"],"result":[{"label":"stale"}]}))
             .is_empty());
+    }
+
+    #[test]
+    fn navigation_cancellation_discards_late_results_and_preserves_completion_and_documents() {
+        let (mut server, outgoing) = test_server(16);
+        let definition = requested(0);
+        let mut hover = definition.clone();
+        hover.kind = RequestKind::Hover;
+        let mut completion = definition.clone();
+        completion.kind = RequestKind::Completion;
+        open_request_document(&mut server, &definition);
+        server.waiting.insert(7, definition.clone());
+        server.waiting.insert(8, hover.clone());
+        server.waiting.insert(9, completion.clone());
+        server
+            .deferred
+            .extend([definition.clone(), hover, completion]);
+        let pid = server.child.id();
+        let (mut manager, _) = manager_with_server(server);
+
+        manager.cancel_navigation();
+
+        let mut cancelled: Vec<_> = outgoing
+            .try_iter()
+            .map(|message| {
+                assert_eq!(message["method"], "$/cancelRequest");
+                message["params"]["id"].as_i64().unwrap()
+            })
+            .collect();
+        cancelled.sort_unstable();
+        assert_eq!(cancelled, [7, 8]);
+        let server = manager.servers.values_mut().next().unwrap();
+        assert_eq!(server.child.id(), pid);
+        assert!(server.documents.contains_key(&definition.origin));
+        assert_eq!(server.waiting.len(), 1);
+        assert!(server.waiting.contains_key(&9));
+        assert_eq!(server.deferred.len(), 1);
+        assert_eq!(server.deferred[0].kind, RequestKind::Completion);
+
+        assert!(server
+            .handle_message(json!({
+                "id":7,"result":{"uri":uri(&definition.origin).unwrap(),"range":{
+                    "start":{"line":0,"character":0},"end":{"line":0,"character":1}
+                }}
+            }))
+            .is_empty());
+        assert!(server
+            .handle_message(json!({
+                "id":8,"result":{"contents":"stale documentation"}
+            }))
+            .is_empty());
+        assert!(server
+            .handle_message(json!({
+                "id":7,"error":{"code":-32801,"message":"Content modified"}
+            }))
+            .is_empty());
+        assert_eq!(
+            server.deferred.len(),
+            1,
+            "cancelled navigation cannot requeue a retry"
+        );
+        let events = server.handle_message(json!({"id":9,"result":[{"label":"kept"}]}));
+        assert!(matches!(&events[..], [Event::Completion { list, .. }]
+            if list.items.len() == 1 && list.items[0].label == "kept"));
     }
 
     #[test]

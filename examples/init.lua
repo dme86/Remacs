@@ -32,3 +32,13 @@ end)
 remacs.keymap.set("normal", "space S", function()
   remacs.commands.run("save_all", "")
 end)
+
+
+-- Window management uses the same public API as the bundled defaults.
+-- SPC w v / h / l / c / o remain available; this adds a custom split shortcut.
+remacs.keymap.set("normal", "space V", function()
+  remacs.window.split()
+end)
+remacs.hooks.add("window_change", "example.windows", function(event)
+  remacs.state.example.window_count = event.count
+end)

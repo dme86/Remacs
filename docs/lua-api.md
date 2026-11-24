@@ -100,6 +100,7 @@ actual character, such as `A`; shifted special keys use names like
 terminal's keyboard protocol.
 
 The context contains `mode`, `current` (the active buffer ID), `buffers`,
+`window` (the focused window ID), `windows`,
 `page_height` and an optional `count`. For example, `5j` supplies `count = 5` to
 the `j` binding; an uncounted motion leaves `count` absent. Prefix sequences are
 held in Lua's keymap dispatcher until complete. `Esc` and `Ctrl+G` cancel them.
@@ -155,6 +156,50 @@ previous contents. Build a local table if you need to inspect intermediate
 edits, or observe the resulting `buffer_change` event. Lazy line reads avoid
 copying every open document on each keystroke.
 
+## Windows
+
+A window is a view onto a buffer with its own cursor and scrolling. Text,
+modified state and undo history belong to the buffer, so two windows can show
+the same document without copying it.
+
+```lua
+local current = remacs.window.current()
+local windows = remacs.window.list()
+
+remacs.window.split()                  -- same buffer, focus new right-hand view
+remacs.window.split("notes.txt")       -- open a file in the new view
+remacs.window.focus(current)           -- focus a stable window ID
+remacs.window.close(current)           -- close one view, retain its buffer
+remacs.window.only()                   -- keep only the focused view
+remacs.window.resize(5)                -- grow focused view by five columns
+remacs.window.resize(-5)               -- shrink focused view by five columns
+remacs.window.equalize()               -- restore equal widths
+```
+
+These operations use the same deferred action queue as buffer writes. Reading
+`window.current()` or `window.list()` immediately after `split()` in one
+callback still returns the pre-split snapshot. `close(id)` and `only(id)` accept
+an optional stable window ID; omitted IDs mean the current window. Closing an
+inactive window preserves focus and the active view's mode and position.
+Closing the last window is protected. Window IDs are never reused during the
+session.
+
+List entries contain `id`, `buffer`, `active`, `row`, `col`, `scroll_row`,
+`scroll_col` and `weight`. Cursor and scrolling coordinates are one-based.
+Cursor columns count Unicode scalar values; horizontal scrolling counts terminal
+cells, accounting for wide characters and expanded tabs. `weight` is the
+relative layout weight, rather than a fixed pixel width. Terminal resizing
+preserves views and shows the focused window when space is limited.
+
+The default commands are `window_split`, `window_next`, `window_previous`,
+`window_left`, `window_right`, `window_close`, `window_only`, `window_grow`,
+`window_shrink` and `window_equalize`. They are bound under `space w` and
+`ctrl-w` in Normal mode. Global Emacs-style aliases are `ctrl-x 3`, `ctrl-x o`,
+`ctrl-x 0` and `ctrl-x 1`. The command aliases `vsplit` / `vs` accept an optional
+file; `close`, `only` and `wincmd` expose the same operations. Existing `q`,
+`q!` and `wq` retain their whole-editor behavior. `Ctrl+W` and `Ctrl+X`
+window prefixes also work while the file tree has focus.
+
 ## Hooks and editor events
 
 ```lua
@@ -180,6 +225,7 @@ IDs so your hooks remain easy to identify. Available editor events are:
 | `buffer_saved` | A document is successfully written. |
 | `cursor_move` | The active cursor moves. |
 | `mode_changed` | Normal, Insert or Visual mode changes. |
+| `window_change` | Window layout, focused window or buffer assignment changes; includes `id`, `current`, `previous` and `count`. |
 | `resize` | Terminal dimensions change; includes `width` and `height`. |
 
 Plugins can also emit their own events with
@@ -248,7 +294,8 @@ Rust continues to own the services and existing PTY sessions.
 
 ## Architecture and validation
 
-`src/lua_runtime.rs` owns the interpreter and runtime loading, while
+`src/windows.rs` owns window view state and layout; the renderer paints shared
+buffer contents into those views. `src/lua_runtime.rs` owns the interpreter and runtime loading, while
 `lua/api.lua` implements registrations, dispatch and ownership. The four plugin
 adapters convert Lua module results into typed Rust data. `lua/defaults.lua`
 contains editor commands and bindings. The editor publishes small metadata

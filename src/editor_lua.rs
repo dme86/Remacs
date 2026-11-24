@@ -66,6 +66,43 @@ impl Editor {
             buffers.set(index + 1, buffer)?;
         }
         context.set("buffers", buffers)?;
+        context.set("window", self.active_window_id())?;
+        let windows = lua.create_table()?;
+        for (index, window) in self.windows.iter().enumerate() {
+            let active = index == self.active_window;
+            let metadata = lua.create_table()?;
+            metadata.set("id", window.id)?;
+            metadata.set(
+                "buffer",
+                if active {
+                    self.buffer_ids[self.active_slot]
+                } else {
+                    window.buffer_id
+                },
+            )?;
+            metadata.set("active", active)?;
+            metadata.set("row", if active { self.doc.row } else { window.row } + 1)?;
+            metadata.set("col", if active { self.doc.col } else { window.col } + 1)?;
+            metadata.set(
+                "scroll_row",
+                if active {
+                    self.scroll_row
+                } else {
+                    window.scroll_row
+                } + 1,
+            )?;
+            metadata.set(
+                "scroll_col",
+                if active {
+                    self.scroll_col
+                } else {
+                    window.scroll_col
+                } + 1,
+            )?;
+            metadata.set("weight", window.weight)?;
+            windows.set(index + 1, metadata)?;
+        }
+        context.set("windows", windows)?;
         Ok(context)
     }
 
@@ -220,6 +257,39 @@ impl Editor {
                     .ok_or_else(|| mlua::Error::external("buffer no longer exists"))?;
                 self.switch_buffer(index);
             }
+            "window" => {
+                let op: String = action.get("op")?;
+                match op.as_str() {
+                    "split" => {
+                        let path: Option<String> = action.get("path")?;
+                        if self.window_split() {
+                            if let Some(path) = path {
+                                self.open(path);
+                            }
+                        }
+                    }
+                    "focus" | "close" | "only" => {
+                        let id: u64 = action.get("id")?;
+                        if !self.windows.iter().any(|window| window.id == id) {
+                            return Err(mlua::Error::external("window no longer exists"));
+                        }
+                        match op.as_str() {
+                            "focus" => {
+                                self.window_focus(id);
+                            }
+                            "close" => {
+                                self.window_close_id(id);
+                            }
+                            _ => {
+                                self.window_only_id(id);
+                            }
+                        }
+                    }
+                    "resize" => self.window_resize(action.get("delta")?),
+                    "equalize" => self.window_equalize(),
+                    _ => return Err(mlua::Error::external("unknown window operation")),
+                }
+            }
             "close" => {
                 let id: u64 = action.get("id")?;
                 let index = self
@@ -248,6 +318,7 @@ impl Editor {
                             Some(if last > index { last - 1 } else { last })
                         }
                     });
+                    self.repair_window_buffers();
                     self.message = "Buffer closed".into();
                 }
             }
@@ -363,6 +434,29 @@ impl Editor {
             "buffer_close" => {
                 self.close_buffer(args.get::<Option<bool>>("force")?.unwrap_or(false))
             }
+            "window_split" => {
+                let path: Option<String> = args.get("path")?;
+                if self.window_split() {
+                    if let Some(path) = path {
+                        self.open(path);
+                    }
+                }
+            }
+            "window_next" => self.window_cycle(true),
+            "window_previous" => self.window_cycle(false),
+            "window_left" => self.window_direction(false),
+            "window_right" => self.window_direction(true),
+            "window_close" => {
+                self.window_close();
+            }
+            "window_only" => self.window_only(),
+            "window_grow" => {
+                self.window_resize(explicit.unwrap_or(5).min(isize::MAX as usize) as isize)
+            }
+            "window_shrink" => {
+                self.window_resize(-(explicit.unwrap_or(5).min(isize::MAX as usize) as isize))
+            }
+            "window_equalize" => self.window_equalize(),
             "tree.toggle" | "tree_toggle" => self.toggle_tree(),
             "terminal" | "terminal.toggle" => self.toggle_terminal(&args.get::<String>("kind")?),
             "lsp" => self.lsp_action(&args.get::<String>("action")?),
@@ -617,6 +711,16 @@ impl Editor {
         // Hooks may edit text or switch buffers. Publish the next generation
         // after applying queued actions, with a fixed bound on recursive hooks.
         for _ in 0..16 {
+            self.repair_window_buffers();
+            let window_snapshot: Vec<_> = self
+                .windows
+                .iter()
+                .map(|window| (window.id, window.buffer_id, window.weight))
+                .collect();
+            let window_changed = self.lua_windows != window_snapshot
+                || self.lua_window != Some(self.active_window_id());
+            let previous_window = self.lua_window.replace(self.active_window_id());
+            self.lua_windows = window_snapshot;
             let observed: HashMap<_, _> = self
                 .buffer_ids
                 .iter()
@@ -714,6 +818,17 @@ impl Editor {
             if mode_changed {
                 let mode = self.mode_name();
                 self.emit_lua("mode_changed", |data| data.set("mode", mode));
+                emitted = true;
+            }
+            if window_changed {
+                let current = self.active_window_id();
+                let count = self.windows.len();
+                self.emit_lua("window_change", |data| {
+                    data.set("id", current)?;
+                    data.set("current", current)?;
+                    data.set("previous", previous_window)?;
+                    data.set("count", count)
+                });
                 emitted = true;
             }
             self.drain_lua_actions();
@@ -1193,5 +1308,166 @@ mod tests {
         assert_eq!((editor.doc.row, editor.doc.col), (0, 4));
         assert_eq!(editor.doc.lsp_text(), "text");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lua_window_metadata_and_operations_use_deferred_stable_views() {
+        let mut editor = editor("hello\nworld");
+        editor.screen.size = Some((120, 24));
+        eval(
+            &mut editor,
+            r#"
+            remacs.state.original_window = remacs.window.current()
+            local windows = remacs.window.list()
+            assert(#windows == 1 and windows[1].active)
+            assert(windows[1].buffer == remacs.buffer.current())
+            assert(windows[1].row == 1 and windows[1].col == 1)
+            windows[1].weight = 999999
+            remacs.window.split()
+            assert(#remacs.window.list() == 1, "writes are deferred")
+        "#,
+        );
+        assert_eq!(editor.windows.len(), 2);
+        assert_eq!(
+            editor.buffer_ids.len(),
+            1,
+            "views must share buffer storage"
+        );
+        eval(
+            &mut editor,
+            r#"
+            local windows = remacs.window.list()
+            assert(#windows == 2 and windows[2].active)
+            assert(windows[1].id ~= windows[2].id)
+            assert(windows[1].buffer == windows[2].buffer)
+            assert(windows[1].weight ~= 999999)
+            remacs.window.focus(remacs.state.original_window)
+        "#,
+        );
+        assert_eq!(editor.active_window, 0);
+        eval(
+            &mut editor,
+            "assert(remacs.window.current() == remacs.state.original_window)",
+        );
+    }
+
+    #[test]
+    fn split_views_share_lua_edits_and_buffer_undo() {
+        let mut editor = editor("original");
+        editor.screen.size = Some((120, 24));
+        let first = editor.active_window_id();
+        editor.command("vsplit");
+        eval(&mut editor, "remacs.buffer.insert(nil, 'new ')");
+        assert_eq!(editor.doc.lsp_text(), "new original");
+        assert!(editor.window_focus(first));
+        assert_eq!(editor.doc.lsp_text(), "new original");
+        editor.command("undo");
+        assert_eq!(editor.doc.lsp_text(), "original");
+        assert_eq!(editor.windows.len(), 2);
+        assert_eq!(editor.buffer_ids.len(), 1);
+    }
+
+    #[test]
+    fn split_file_and_close_window_keep_modified_buffer_and_quit_protection() {
+        let project = Project::new();
+        let first = project.file("one.txt", "first");
+        let second = project.file("two.txt", "second");
+        let mut editor = Editor::new(Document::open(first).unwrap());
+        editor.screen.size = Some((120, 24));
+        editor.command(&format!("vs {}", second.display()));
+        assert_eq!(editor.windows.len(), 2);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.txt"));
+        eval(&mut editor, "remacs.buffer.insert(nil, 'changed ')");
+        editor.command("close");
+        assert_eq!(editor.windows.len(), 1);
+        assert_eq!(editor.buffer_ids.len(), 2);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("one.txt"));
+        assert_eq!(editor.dirty_buffers(), 1);
+        editor.command("q");
+        assert!(matches!(editor.prompt, Some(Prompt::Quit)));
+        assert!(editor.running);
+    }
+
+    #[test]
+    fn window_api_inactive_close_preserves_insert_mode_and_active_view() {
+        let mut editor = editor("hello");
+        editor.screen.size = Some((120, 24));
+        let first = editor.active_window_id();
+        assert!(editor.window_split());
+        let active = editor.active_window_id();
+        editor.begin_insert();
+        editor.doc.col = 3;
+        editor.command(&format!("lua remacs.window.close({first})"));
+        assert_eq!(editor.windows.len(), 1);
+        assert_eq!(editor.active_window_id(), active);
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!((editor.doc.row, editor.doc.col), (0, 3));
+        editor.command("close");
+        assert_eq!(editor.windows.len(), 1, "last view stays open");
+        assert!(editor.running);
+    }
+
+    #[test]
+    fn window_commands_bindings_and_change_hooks_use_public_lua_registry() {
+        let mut editor = editor("hello");
+        editor.screen.size = Some((140, 24));
+        eval(
+            &mut editor,
+            r#"
+            remacs.state.window_events = {}
+            remacs.hooks.add("window_change", "test.windows", function(event)
+                assert(event.current == remacs.window.current())
+                assert(event.count == #remacs.window.list())
+                table.insert(remacs.state.window_events, event.count)
+            end)
+        "#,
+        );
+        for key in [' ', 'w', 'v'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        assert_eq!(editor.windows.len(), 2);
+        let right = editor.active_window_id();
+        editor.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), 10);
+        press(&mut editor, KeyCode::Char('o'));
+        assert_ne!(editor.active_window_id(), right);
+        editor.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), 10);
+        press(&mut editor, KeyCode::Char('l'));
+        assert_eq!(editor.active_window_id(), right);
+        editor.command("wincmd v");
+        assert_eq!(editor.windows.len(), 3);
+        editor.command("only");
+        assert_eq!(editor.windows.len(), 1);
+        editor.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), 10);
+        press(&mut editor, KeyCode::Char('3'));
+        assert_eq!(editor.windows.len(), 2);
+        editor.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), 10);
+        editor.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 10);
+        assert!(
+            matches!(editor.prompt, Some(Prompt::Open(_))),
+            "legacy C-x C-f remains intact"
+        );
+        editor.prompt = None;
+        eval(&mut editor, "assert(#remacs.state.window_events >= 5)");
+    }
+
+    #[test]
+    fn failing_lua_window_command_discards_queued_split_and_invalid_id_is_safe() {
+        let mut editor = editor("hello");
+        editor.screen.size = Some((120, 24));
+        eval(
+            &mut editor,
+            r#"
+            remacs.commands.add("bad-window", function()
+                remacs.window.split()
+                error("do not apply")
+            end)
+        "#,
+        );
+        editor.command("bad-window");
+        assert_eq!(editor.windows.len(), 1);
+        assert!(editor.message.contains("do not apply"));
+        editor.command("lua remacs.window.focus(999999)");
+        assert_eq!(editor.windows.len(), 1);
+        assert!(editor.message.contains("window no longer exists"));
     }
 }

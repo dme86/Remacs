@@ -143,9 +143,11 @@ end
 function r._dispatch_key(mode, key)
   if prefix_mode ~= mode then r._cancel_keys() end
   if key == "esc" or key == "ctrl-g" then r._cancel_keys() end
-  -- Direct modified shortcuts historically preempted a pending leader/go
-  -- sequence. A prefix-only mapping such as Ctrl+X must not preempt it.
-  if prefix ~= "" and (key:match("^ctrl%-") or key:match("^alt%-"))
+  -- A complete sequence wins, including C-x C-f despite standalone C-f.
+  -- Otherwise direct modified shortcuts preempt an unrelated pending leader.
+  local complete, continuing
+  if prefix ~= "" then complete, continuing = lookup(mode, prefix .. " " .. key) end
+  if prefix ~= "" and not complete and not continuing and (key:match("^ctrl%-") or key:match("^alt%-"))
       and (current(mappings, mode .. ":" .. key) or current(mappings, "global:" .. key)) then
     r._cancel_keys()
   end
@@ -241,6 +243,32 @@ function r.buffer.open(path)
 end
 function r.buffer.switch(id) queue({ kind = "switch", id = id }) end
 function r.buffer.close(id, force) queue({ kind = "close", id = id or r.buffer.current(), force = force == true }) end
+-- Windows are views onto buffers, not copies of their text or undo history.
+r.window = {}
+function r.window.current() return r._context.window end
+function r.window.list()
+  local result = {}
+  for _, window in ipairs(r._context.windows or {}) do result[#result + 1] = copy(window) end
+  return result
+end
+local function window_id(id)
+  id = id or r.window.current()
+  assert(type(id) == "number" and id >= 1 and id % 1 == 0, "window id must be a positive integer")
+  return id
+end
+function r.window.split(path)
+  assert(path == nil or (type(path) == "string" and path ~= ""), "path must be nonempty")
+  queue({ kind = "window", op = "split", path = path })
+end
+function r.window.focus(id) queue({ kind = "window", op = "focus", id = window_id(id) }) end
+function r.window.close(id) queue({ kind = "window", op = "close", id = window_id(id) }) end
+function r.window.only(id) queue({ kind = "window", op = "only", id = window_id(id) }) end
+function r.window.resize(delta)
+  assert(type(delta) == "number" and delta % 1 == 0, "resize delta must be an integer")
+  queue({ kind = "window", op = "resize", delta = delta })
+end
+function r.window.equalize() queue({ kind = "window", op = "equalize" }) end
+
 function r.message(text) queue({ kind = "message", text = tostring(text) }) end
 function r.core(name, args)
   assert(type(name) == "string", "core operation name must be a string")

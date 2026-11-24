@@ -16,6 +16,10 @@ mod plugins;
 mod popup_terminal;
 mod syntax;
 mod toggleterm_plugin;
+mod window_render;
+#[cfg(test)]
+mod window_tests;
+mod windows;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -54,6 +58,7 @@ use popup_terminal::{
 use syntax::{Span, SyntaxEngine};
 use toggleterm_plugin::{Action as TerminalAction, ToggleTermPlugin};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use windows::Window;
 
 const TAB_WIDTH: usize = 4;
 const MAX_UNDO: usize = 100;
@@ -173,6 +178,9 @@ struct ScreenCache {
     syntax_enabled: Option<bool>,
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
+    window_layout: Vec<(u64, usize, usize, bool)>,
+    window_render: window_render::Cache,
+    window_dividers: Vec<bool>,
     finder: FinderCache,
     completion: completion_ui::Cache,
     terminal: TerminalPopupCache,
@@ -273,6 +281,10 @@ struct Editor {
     slots: Vec<Option<StoredBuffer>>,
     buffer_ids: Vec<u64>,
     next_buffer_id: u64,
+    windows: Vec<Window>,
+    active_window: usize,
+    next_window_id: u64,
+    suppress_window_sync: bool,
     active_slot: usize,
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
@@ -288,6 +300,8 @@ struct Editor {
     lua_current: Option<u64>,
     lua_mode: Option<Mode>,
     lua_saved: Vec<u64>,
+    lua_windows: Vec<(u64, u64, u32)>,
+    lua_window: Option<u64>,
     lsp_plugin: LspPlugin,
     lsp: LspManager,
     lsp_document_versions: Option<Vec<(PathBuf, u64)>>,
@@ -327,6 +341,10 @@ impl Editor {
             slots: vec![None],
             buffer_ids: vec![1],
             next_buffer_id: 2,
+            windows: vec![Window::initial(1)],
+            active_window: 0,
+            next_window_id: 2,
+            suppress_window_sync: false,
             active_slot: 0,
             last_slot: None,
             buffer_picker: None,
@@ -341,6 +359,8 @@ impl Editor {
             lua_current: None,
             lua_mode: None,
             lua_saved: Vec::new(),
+            lua_windows: Vec::new(),
+            lua_window: None,
             lsp_plugin: LspPlugin::new(lua.clone()).expect("bundled plugins/lsp.lua"),
             lsp: LspManager::default(),
             lsp_document_versions: None,
@@ -1249,6 +1269,7 @@ impl Editor {
     }
 
     fn take_current(&mut self) -> StoredBuffer {
+        self.save_active_window();
         StoredBuffer {
             // An empty placeholder is replaced, never cloned or displayed.
             doc: std::mem::replace(&mut self.doc, Document::empty()),
@@ -1290,6 +1311,7 @@ impl Editor {
             self.slots.len(),
             self.active_name()
         );
+        self.save_active_window();
     }
 
     fn switch_buffer(&mut self, index: usize) {
@@ -1518,6 +1540,7 @@ impl Editor {
             }
             self.screen.status = None;
             self.message = "Empty buffer".into();
+            self.repair_window_buffers();
             return;
         }
         let closed = self.active_slot;
@@ -1530,6 +1553,7 @@ impl Editor {
         self.last_slot = None;
         self.activate(replacement, adjusted_next);
         self.message = "Buffer closed".into();
+        self.repair_window_buffers();
     }
 
     fn remember(&mut self) {
@@ -2230,6 +2254,16 @@ impl Editor {
         {
             return;
         }
+        // Window prefixes may leave a focused sidebar. Ordinary tree/search
+        // text still belongs to the plugin; prompts and PTYs were handled above.
+        if self.tree.as_ref().is_some_and(|tree| tree.focused)
+            && ((key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('w' | 'x')))
+                || self.lua.key_pending())
+            && self.dispatch_lua_key(key, page_height)
+        {
+            return;
+        }
         if self.tree.as_ref().is_some_and(|tree| tree.focused) {
             self.tree_key(key);
             return;
@@ -2418,22 +2452,46 @@ impl Editor {
         let height = rows.saturating_sub(2) as usize;
         let sidebar_width =
             tree_sidebar_width(width, self.tree.as_ref().is_some_and(|tree| tree.visible));
-        let editor_width = width - sidebar_width;
-        let gutter_width = gutter_width(editor_width, self.doc.lines.len());
-        let text_width = editor_width - gutter_width;
+        let layout = self.window_layout(width, sidebar_width);
+        let active_rect = layout
+            .iter()
+            .find(|rect| rect.window == self.active_window)
+            .expect("focused window is always visible");
+        let pane_x = active_rect.x;
+        let pane_width = active_rect.width;
+        let gutter_width = gutter_width(pane_width, self.doc.lines.len());
+        let text_width = pane_width.saturating_sub(gutter_width);
+        let window_layout: Vec<_> = layout
+            .iter()
+            .map(|rect| {
+                (
+                    self.windows[rect.window].id,
+                    rect.x,
+                    rect.width,
+                    rect.window == self.active_window,
+                )
+            })
+            .collect();
+        let layout_changed = self.screen.window_layout != window_layout;
+        let has_splits = self.windows.len() > 1;
         self.ensure_visible(text_width, height);
+        self.save_active_window();
 
         let size_changed = self.screen.size != Some((cols, rows));
         let viewport_changed = self.screen.origin != Some((self.scroll_row, self.scroll_col));
         let syntax_changed = self.screen.syntax_enabled != Some(self.syntax.enabled());
         let sidebar_changed = self.screen.sidebar_width != sidebar_width;
-        let repaint_all = size_changed || viewport_changed || syntax_changed || sidebar_changed;
+        let repaint_all =
+            size_changed || viewport_changed || syntax_changed || sidebar_changed || layout_changed;
 
         // Initial frame, resize or a changed split geometry requires a full repaint.
         // Normal navigation in either pane still only changes the affected rows.
-        if size_changed || sidebar_changed {
+        if size_changed || sidebar_changed || layout_changed {
             queue!(output, ResetColor, MoveTo(0, 0), Clear(ClearType::All))?;
+            let mut window_render = std::mem::take(&mut self.screen.window_render);
+            window_render.invalidate_all();
             self.screen = ScreenCache::default();
+            self.screen.window_render = window_render;
         }
         self.screen.lines.resize_with(height, || None);
 
@@ -2476,6 +2534,10 @@ impl Editor {
                 if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
                     *line = None;
                 }
+                self.screen.window_render.invalidate_rows(y, 1);
+                if let Some(painted) = self.screen.window_dividers.get_mut(y) {
+                    *painted = false;
+                }
             }
         }
 
@@ -2496,6 +2558,10 @@ impl Editor {
                 if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
                     *line = None;
                 }
+                self.screen.window_render.invalidate_rows(y, 1);
+                if let Some(painted) = self.screen.window_dividers.get_mut(y) {
+                    *painted = false;
+                }
                 self.screen
                     .finder
                     .invalidate_underpaint(old.x as usize, y, old.width as usize);
@@ -2506,17 +2572,20 @@ impl Editor {
             if finder_rect.is_none() && popup_rect.is_none() && self.completion_eligible() {
                 self.completion_menu.as_ref().and_then(|menu| {
                     completion_ui::rect_for(
-                        cols,
+                        pane_width as u16,
                         height,
                         (
-                            sidebar_width
-                                + gutter_width
+                            gutter_width
                                 + visual_column(&self.doc.line()[..self.doc.col])
                                     .saturating_sub(self.scroll_col),
                             self.doc.row.saturating_sub(self.scroll_row),
                         ),
                         &menu.labels,
                     )
+                    .map(|mut rect| {
+                        rect.x += pane_x as u16;
+                        rect
+                    })
                 })
             } else {
                 None
@@ -2532,6 +2601,10 @@ impl Editor {
                 }
                 if let Some(line) = self.screen.sidebar_lines.get_mut(y) {
                     *line = None;
+                }
+                self.screen.window_render.invalidate_rows(y, 1);
+                if let Some(painted) = self.screen.window_dividers.get_mut(y) {
+                    *painted = false;
                 }
             }
         }
@@ -2651,7 +2724,7 @@ impl Editor {
             if gutter_width > 0 && (paint_text || gutter_changed) {
                 queue!(
                     output,
-                    MoveTo(sidebar_width as u16, y as u16),
+                    MoveTo(pane_x as u16, y as u16),
                     SetBackgroundColor(GUTTER_BG),
                     SetForegroundColor(if active { CURRENT_NUMBER_FG } else { GUTTER_FG }),
                     Print(&number),
@@ -2659,18 +2732,18 @@ impl Editor {
                 )?;
                 self.screen
                     .finder
-                    .invalidate_underpaint(sidebar_width, y, gutter_width);
+                    .invalidate_underpaint(pane_x, y, gutter_width);
                 self.screen
                     .terminal
-                    .invalidate_underpaint(sidebar_width, y, gutter_width);
+                    .invalidate_underpaint(pane_x, y, gutter_width);
                 self.screen
                     .completion
-                    .invalidate_underpaint(sidebar_width, y, gutter_width);
+                    .invalidate_underpaint(pane_x, y, gutter_width);
             }
             if paint_text {
                 queue!(
                     output,
-                    MoveTo((sidebar_width + gutter_width) as u16, y as u16),
+                    MoveTo((pane_x + gutter_width) as u16, y as u16),
                     ResetColor
                 )?;
                 if active {
@@ -2727,23 +2800,25 @@ impl Editor {
                     )?;
                 } else {
                     // Remove any tail left by a previously longer line.
-                    queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
+                    if has_splits {
+                        queue!(
+                            output,
+                            ResetColor,
+                            Print(" ".repeat(text_width.saturating_sub(visible_width)))
+                        )?;
+                    } else {
+                        queue!(output, ResetColor, Clear(ClearType::UntilNewLine))?;
+                    }
                 }
-                self.screen.finder.invalidate_underpaint(
-                    sidebar_width + gutter_width,
-                    y,
-                    text_width,
-                );
-                self.screen.terminal.invalidate_underpaint(
-                    sidebar_width + gutter_width,
-                    y,
-                    text_width,
-                );
-                self.screen.completion.invalidate_underpaint(
-                    sidebar_width + gutter_width,
-                    y,
-                    text_width,
-                );
+                self.screen
+                    .finder
+                    .invalidate_underpaint(pane_x + gutter_width, y, text_width);
+                self.screen
+                    .terminal
+                    .invalidate_underpaint(pane_x + gutter_width, y, text_width);
+                self.screen
+                    .completion
+                    .invalidate_underpaint(pane_x + gutter_width, y, text_width);
             }
             self.screen.lines[y] = Some(PaintedLine {
                 index,
@@ -2752,6 +2827,54 @@ impl Editor {
                 active,
                 selected,
             });
+        }
+
+        self.draw_other_windows(
+            output,
+            &layout,
+            height,
+            rows,
+            size_changed || sidebar_changed || layout_changed || syntax_changed,
+        )?;
+        self.screen
+            .window_dividers
+            .resize(rows.saturating_sub(1) as usize, false);
+        for y in 0..rows.saturating_sub(1) as usize {
+            if !self.screen.window_dividers[y] {
+                for rect in layout.iter().take(layout.len().saturating_sub(1)) {
+                    let x = rect.x + rect.width;
+                    queue!(
+                        output,
+                        MoveTo(x as u16, y as u16),
+                        ResetColor,
+                        SetForegroundColor(Color::Rgb {
+                            r: 82,
+                            g: 84,
+                            b: 96
+                        }),
+                        Print("│"),
+                        ResetColor
+                    )?;
+                    self.screen.finder.invalidate_underpaint(x, y, 1);
+                    self.screen.terminal.invalidate_underpaint(x, y, 1);
+                    self.screen.completion.invalidate_underpaint(x, y, 1);
+                }
+                self.screen.window_dividers[y] = true;
+            }
+        }
+        if (layout_changed || size_changed || sidebar_changed)
+            && has_splits
+            && rows >= 2
+            && sidebar_width > 0
+        {
+            queue!(
+                output,
+                MoveTo(0, rows - 2),
+                SetBackgroundColor(Color::DarkGrey),
+                SetForegroundColor(Color::White),
+                Print(fit_cells(" FILES", sidebar_width)),
+                ResetColor
+            )?;
         }
 
         if rows >= 2 {
@@ -2786,11 +2909,31 @@ impl Editor {
                 self.active_slot + 1, self.slots.len(),
                 self.doc.row + 1, self.doc.col + 1
             );
-            let status = fit_cells(&status, width);
+            let status = if has_splits {
+                let filename = self
+                    .doc
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".into());
+                fit_cells(
+                    &format!(
+                        " ▶ W{} {}{filename} [{mode}] | Ln {}, Col {} ",
+                        self.windows[self.active_window].id,
+                        if self.doc.dirty { "● " } else { "" },
+                        self.doc.row + 1,
+                        self.doc.col + 1
+                    ),
+                    pane_width,
+                )
+            } else {
+                fit_cells(&status, width)
+            };
             if self.screen.status.as_deref() != Some(status.as_str()) {
                 queue!(
                     output,
-                    MoveTo(0, rows - 2),
+                    MoveTo(if has_splits { pane_x as u16 } else { 0 }, rows - 2),
                     SetBackgroundColor(Color::DarkGrey),
                     SetForegroundColor(Color::White),
                     Print(&status),
@@ -2909,7 +3052,7 @@ impl Editor {
                 },
             ),
             None => (
-                sidebar_width
+                pane_x
                     + gutter_width
                     + visual_column(&self.doc.line()[..self.doc.col])
                         .saturating_sub(self.scroll_col),
@@ -2927,6 +3070,7 @@ impl Editor {
         self.screen.origin = Some((self.scroll_row, self.scroll_col));
         self.screen.syntax_enabled = Some(self.syntax.enabled());
         self.screen.sidebar_width = sidebar_width;
+        self.screen.window_layout = window_layout;
         output.flush()
     }
 }

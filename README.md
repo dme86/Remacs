@@ -66,6 +66,11 @@ shows incomplete sequences.
 | Next / previous buffer | **`Alt+j`** / **`Alt+k`**, or **`Ctrl+PageDown`** / **`Ctrl+PageUp`**; `SPC b n/p` still work |
 | Toggle last buffer | **`SPC b l`** |
 | Close current buffer (only if saved) | **`SPC b d`** |
+| Split vertically (side by side) | **`SPC w v`**, **`Ctrl+W v`** or **`Ctrl+X 3`** |
+| Focus left / right window | **`SPC w h` / `SPC w l`**, or **`Ctrl+W h` / `Ctrl+W l`** |
+| Next / previous window | **`SPC w w` / `SPC w W`**, **`Ctrl+W w` / `Ctrl+W W`**; **`Ctrl+X o`** cycles |
+| Close window / keep only this window | **`SPC w c` / `SPC w o`**, **`Ctrl+W c` / `Ctrl+W o`**, or **`Ctrl+X 0` / `Ctrl+X 1`** |
+| Grow / shrink window; equal widths | **`SPC w >` / `SPC w <`**; **`SPC w =`** (also **`Ctrl+W`** variants) |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
 | Floating LazyGit (Lua toggleterm plugin) | **`SPC g`** |
 | Floating project shell | **`Ctrl+T`** or **`SPC t`** |
@@ -410,6 +415,37 @@ history to **100 steps or roughly 32 MiB per buffer**, whichever is smaller.
 For very large files, at least one undo snapshot is preserved even if it
 exceeds the limit. Incremental/delta-based undo is planned later.
 
+## Vertical split windows
+
+Use **`SPC w v`**, **`Ctrl+W v`** or **`Ctrl+X 3`** to split the current
+window into two side-by-side views. The new window starts with the same buffer
+and takes focus. Use **`SPC w h/l`** to move left/right, **`SPC w w`** to cycle
+forward, or **`SPC w W`** to cycle backward. The active window is marked in its
+status line. Existing file-open and buffer-picker commands change the buffer
+in the focused window.
+
+Each window keeps its own cursor and scroll position. Two windows displaying
+the same buffer share text, dirty state and undo history, so edits appear in
+both without creating duplicate files or conflicting copies. Several vertical
+windows can be opened. Small terminal sizes temporarily show fewer views while
+keeping the window layout and buffers available.
+
+**`SPC w >` / `SPC w <`** grow or shrink the focused window by five columns;
+a Normal-mode count such as **`10 SPC w >`** changes ten columns. **`SPC w =`**
+restores equal widths. **`SPC w c`** closes the current view, and **`SPC w o`**
+keeps only that view. Closing a window retains its buffer, including unsaved
+edits; closing the final window is protected.
+
+The command minibuffer accepts **`:vsplit`** / **`:vs`**, optionally followed
+by a filename, plus **`:close`**, **`:only`** and **`:wincmd h|l|w|W|v|c|o|>|<|=`**.
+The existing **`:q`**, **`:q!`**, **`:wq`** and **`SPC q q`** still operate on
+the whole editor and retain their buffer-protection behavior. Prompts and active
+terminal popups retain their own input handling.
+
+Window commands and all default bindings live in Lua and can be replaced in
+`init.lua`. The [window API](docs/lua-api.md#windows) exposes stable window IDs,
+layout operations and window-change hooks to plugins.
+
 ## Line numbers and cursor line
 
 **Enabled by default:** a narrow left gutter displays *hybrid relative line numbers*:
@@ -516,12 +552,12 @@ The embedded grammars have their own third-party licenses; see
 **Included in v0.1:** opening, editing, and saving text; Vim-style Normal/Insert
 modes, basic motions, line yank/delete/paste, snapshot-based undo/redo,
 Doom-inspired leader shortcuts, hybrid relative line numbers, current-line highlighting,
-built-in syntax highlighting, multiple buffers, persistent jumps and marks,
+built-in syntax highlighting, multiple buffers, vertical split windows, persistent jumps and marks,
 native clipboard integration, asynchronous LSP definition/hover/completion, a Lua server
 manager, a file finder, floating terminals, status line, and minibuffer.
 
 **Not yet included:** in-buffer text search, LSP diagnostics/refactoring,
-tabs, splits, mouse support, or menus. This release is not
+tabs, horizontal splits, mouse support, or menus. This release is not
 intended to replace a full-featured editor yet. Undo currently keeps up to 100 in-memory whole-document snapshots;
 some complex Unicode grapheme clusters and control sequences need more work.
 

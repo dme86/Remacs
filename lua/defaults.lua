@@ -27,6 +27,8 @@ for _, name in ipairs({
   "visual_yank", "visual_delete", "scroll_down_half", "scroll_up_half",
   "scroll_down_page", "scroll_up_page", "jump_back", "jump_forward",
   "change_back", "change_forward", "cancel", "normal_mode", "jumps", "changes",
+  "window_split", "window_next", "window_previous", "window_left", "window_right",
+  "window_close", "window_only", "window_grow", "window_shrink", "window_equalize",
 }) do
   command(name)
 end
@@ -55,11 +57,32 @@ remacs.commands.add("bd", function() remacs.core("buffer_close", { force = false
 remacs.commands.add("bd!", function() remacs.core("buffer_close", { force = true }) end)
 remacs.commands.add("syntax", function(args) remacs.core("syntax", { args = args }) end)
 
+for _, name in ipairs({ "vsplit", "vs" }) do
+  remacs.commands.add(name, function(args)
+    remacs.core("window_split", { path = args ~= "" and args or nil })
+  end)
+end
+command("only", "window_only")
+command("close", "window_close")
+remacs.commands.add("wincmd", function(args, context)
+  local operation = {
+    v = "window_split", w = "window_next", W = "window_previous",
+    h = "window_left", l = "window_right", c = "window_close", o = "window_only",
+    [">"] = "window_grow", ["<"] = "window_shrink", ["="] = "window_equalize",
+  }
+  local action = operation[args]
+  if action then remacs.core(action, context)
+  else remacs.message("Usage: wincmd v|w|W|h|l|c|o|>|<|=") end
+end)
+
+
 -- Global shortcuts retain their old availability in Insert and Visual modes.
 for keys, name in pairs({
   ["ctrl-x ctrl-f"] = "open_prompt",
   ["ctrl-x ctrl-s"] = "save",
   ["ctrl-x ctrl-c"] = "quit",
+  ["ctrl-x 3"] = "window_split", ["ctrl-x o"] = "window_next",
+  ["ctrl-x 0"] = "window_close", ["ctrl-x 1"] = "window_only",
   ["ctrl-p"] = "buffer_picker",
   ["ctrl-g"] = "cancel",
   ["esc"] = "normal_mode",
@@ -85,6 +108,17 @@ for keys, name in pairs({
   ["d d"] = "delete_line", ["y y"] = "yank_line",
   ["x"] = "delete_char", ["p"] = "paste", [":"] = "command_prompt",
 }) do bind("normal", keys, name) end
+
+-- Doom-style window leader and Vim's Ctrl+W use the same Lua commands.
+for keys, name in pairs({
+  v = "window_split", w = "window_next", W = "window_previous",
+  h = "window_left", l = "window_right", c = "window_close", o = "window_only",
+  [">"] = "window_grow", ["<"] = "window_shrink", ["="] = "window_equalize",
+}) do
+  bind("normal", "space w " .. keys, name)
+  bind("normal", "ctrl-w " .. keys, name)
+end
+bind("normal", "ctrl-w ctrl-w", "window_next")
 
 for _, mode in ipairs({ "normal", "visual" }) do
   for keys, name in pairs({
