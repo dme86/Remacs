@@ -182,13 +182,13 @@ fn paint_pane(
     let revision_changed = cache.revision != Some(doc.revision);
     cache.lines.resize_with(height, || None);
     let mut touched = Vec::new();
-    for y in 0..height {
+    for (y, cached_line) in cache.lines.iter_mut().enumerate() {
         let index = y + scroll_row;
         let line = doc.lines.get(index);
         let content = line.map(Vec::as_slice);
         let active = index == cursor_row && line.is_some();
         let number = gutter_number(index, cursor_row, doc.lines.len(), gutter);
-        let old = cache.lines[y].as_ref();
+        let old = cached_line.as_ref();
         let paint = full
             || revision_changed
             || old.is_none_or(|old| {
@@ -238,7 +238,7 @@ fn paint_pane(
                 ResetColor
             )?;
         }
-        cache.lines[y] = Some(PaintedLine {
+        *cached_line = Some(PaintedLine {
             index,
             content: line.cloned(),
             gutter: number,
