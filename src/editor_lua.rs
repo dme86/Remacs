@@ -103,6 +103,7 @@ impl Editor {
             windows.set(index + 1, metadata)?;
         }
         context.set("windows", windows)?;
+        context.set("plugins", self.plugin_context()?)?;
         Ok(context)
     }
 
@@ -247,6 +248,7 @@ impl Editor {
                 self.native_command(&name, args)?;
             }
             "message" => self.message = action.get("text")?,
+            "plugin" => self.plugin_lua_action(action)?,
             "open" => self.open(action.get("path")?),
             "switch" => {
                 let id: u64 = action.get("id")?;
@@ -463,6 +465,9 @@ impl Editor {
             "lsp.definition" => self.lsp_action("definition"),
             "lsp.hover" => self.lsp_action("hover"),
             "mason" => self.mason_command(&args.get::<Option<String>>("args")?.unwrap_or_default()),
+            "plugins" => {
+                self.plugins_command(&args.get::<Option<String>>("args")?.unwrap_or_default())
+            }
             "select_function" => self.select_function(),
             "undo" => self.undo(),
             "redo" => self.redo(),
@@ -841,6 +846,7 @@ impl Editor {
     }
 
     pub(super) fn load_lua_config(&mut self) {
+        self.load_managed_plugins();
         let config_name = self.lua.config_dir().join("init.lua").display().to_string();
         if let Ok(errors) = self.lua.startup_errors() {
             if !errors.is_empty() {
@@ -856,6 +862,7 @@ impl Editor {
             }
         }
         if !cfg!(test) {
+            self.managed_plugins.check_all();
             // User init.lua can opt into Mason's existing startup policy.
             let result = MasonPlugin::new(self.lua.clone())
                 .and_then(|plugin| self.mason.auto_queue(&plugin));

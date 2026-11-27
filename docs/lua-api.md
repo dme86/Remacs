@@ -8,7 +8,8 @@ and edit buffers, and react to editor events without recompiling Rust.
 
 ## Configuration and interactive development
 
-Configuration runs after the bundled plugins and default keymaps. See
+Configuration runs after bundled plugins, default keymaps and installed Git
+plugins. See
 [`examples/init.lua`](../examples/init.lua) for a working starting point.
 
 The configuration directory is the first applicable location:
@@ -64,6 +65,101 @@ load code you would not run as your own user. Editor callbacks run on the editor
 thread: keep them short, especially hooks. Rust continues to handle PTY sessions,
 asynchronous language servers and installers, filesystem I/O, text storage,
 syntax parsing and incremental terminal rendering.
+
+## Managed Git plugins
+
+The **`:plugins`** manager installs external Remacs plugins from Git repositories.
+It uses the same Lua interpreter and public API as local modules. Installed
+entries load in stable alphabetical order after bundled plugins/defaults and
+before `init.lua`. User configuration therefore keeps the final say over
+commands, mappings and hooks.
+
+Register and install a plugin with:
+
+```text
+:plugins add NAME REPO [BRANCH] [ENTRY]
+```
+
+`NAME` identifies the registration; `REPO` is the Git repository URL. Defaults
+are branch `main` and entry `plugin.lua` relative to the repository root. For
+example, **replace this placeholder URL** before running:
+
+```text
+:plugins add notes https://example.com/you/remacs-notes.git main plugin.lua
+```
+
+`add` explicitly queues installation. `:plugins install NAME` installs an
+already registered plugin; `:plugins sync` installs missing registrations only.
+`:plugins update NAME` updates one installed plugin; `:plugins update` updates
+all installed plugins, even if their last check did not report an update.
+`:plugins check` compares remote branch hashes asynchronously. The same check
+runs in the background at startup; availability produces a notification and
+badge, without automatically updating installed code.
+
+The popup accepts typing to filter, arrows/Tab to choose, Enter to install,
+Ctrl+U to update the selected plugin, Ctrl+R to check, Ctrl+S to install missing
+plugins, Ctrl+L to clear the filter and Esc to close.
+
+Installation metadata and immutable Git commit snapshots live under the
+absolute `REMACS_PLUGIN_HOME` override, or otherwise:
+
+- macOS: `~/Library/Application Support/Remacs/plugins`.
+- Linux: `$XDG_DATA_HOME/remacs/plugins`, falling back to
+  `~/.local/share/remacs/plugins`.
+
+Install/update selects code for the **next editor startup**; the current Lua
+session keeps running its loaded version. `:plugins remove NAME` removes the
+registration, unloads it on next startup and keeps cached snapshots. Local
+source-development loaders such as `:luafile` and `:reload` remain available
+as described above.
+
+The manager is also accessible from Lua:
+
+| API | Effect |
+| --- | --- |
+| `remacs.plugins.add({ name = NAME, repo = REPO, branch = "main", entry = "plugin.lua" })` | Register and queue installation; `branch` and `entry` are optional. |
+| `remacs.plugins.install(name)` | Queue installation of a registered plugin. |
+| `remacs.plugins.update(name)` | Queue an update of one installed plugin. |
+| `remacs.plugins.update()` | Queue updates for all installed plugins. |
+| `remacs.plugins.check()` | Queue remote hash checks. |
+| `remacs.plugins.remove(name)` | Remove a registration; the running plugin remains until restart. |
+| `remacs.plugins.list()` | Read registered plugin metadata from the editor snapshot. |
+
+Each list entry contains `name` and `status`, plus `startup_sha` for the
+snapshot selected at this startup and `load_error` if its entry failed.
+Git must be available on `PATH` for installation and remote update checks.
+
+Use the manager for explicit installation/update actions, rather than adding
+an unconditional install or update to `init.lua`.
+
+A minimal repository can contain:
+
+```text
+plugin.lua
+lua/notes/greeting.lua
+```
+
+For example, `lua/notes/greeting.lua`:
+
+```lua
+return function(name) return "Hello " .. name end
+```
+
+And the root `plugin.lua`:
+
+```lua
+local greeting = require("notes.greeting")
+remacs.commands.add("notes-hello", function(args)
+  remacs.message(greeting(args ~= "" and args or "Remacs"))
+end)
+```
+
+All installed snapshots' `lua/?.lua` and `lua/?/init.lua` paths are registered
+before the first entry runs. Configuration-directory Lua paths take priority.
+Namespace helpers by plugin, as above: every plugin shares `package.loaded`, so
+generic module names such as `util` can collide. Plugins must target Remacs'
+API; arbitrary Neovim plugins are not compatible merely because they use Lua.
+This first manager does not resolve dependencies or run build hooks.
 
 ## Commands and keys
 

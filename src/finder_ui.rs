@@ -108,6 +108,7 @@ pub enum PickerKind {
     Buffers,
     Hover,
     Mason,
+    Plugins,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +185,7 @@ impl Cache {
                     PickerKind::Buffers => "─ SWITCH BUFFER ",
                     PickerKind::Hover => "─ LSP HOVER ",
                     PickerKind::Mason => "─ MASON · LANGUAGE SERVERS ",
+                    PickerKind::Plugins => "─ PLUGINS ",
                 };
                 // Terminal geometry is measured in cells, not UTF-8 bytes.
                 let filler = rect.width.saturating_sub(2 + UnicodeWidthStr::width(title));
@@ -217,6 +219,10 @@ impl Cache {
                         finder.total_matches, finder.scanned
                     ),
                     PickerKind::Hover => "  Rust language server · Esc close".to_string(),
+                    PickerKind::Plugins => format!(
+                        "  {}/{} plugins · Enter install · Ctrl+U update · Esc close",
+                        finder.total_matches, finder.scanned
+                    ),
                     PickerKind::Mason => {
                         "  Enter install · Ctrl+U update · Ctrl+S sync · Ctrl+R update all"
                             .to_string()
@@ -239,6 +245,9 @@ impl Cache {
                             PickerKind::Buffers => "  No open buffers".to_string(),
                             PickerKind::Hover => "  No hover information".to_string(),
                             PickerKind::Mason => "  No configured language servers".to_string(),
+                            PickerKind::Plugins => {
+                                "  No plugins · :plugins add NAME REPO".to_string()
+                            }
                         }
                     }
                     None if row == 3 && finder.matches.is_empty() => {

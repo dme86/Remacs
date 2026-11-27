@@ -1,9 +1,9 @@
 //! One persistent Lua VM for the entire editor. Clones are handles to the same
 //! VM, not new interpreters. All editor writes cross a deferred action queue.
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -21,6 +21,7 @@ pub struct LuaRuntime {
     started: Rc<Cell<Instant>>,
     instructions: Rc<Cell<u64>>,
     config_dir: Rc<PathBuf>,
+    managed_plugin_paths: Rc<RefCell<Vec<String>>>,
 }
 
 impl LuaRuntime {
@@ -43,6 +44,7 @@ impl LuaRuntime {
             started: Rc::new(Cell::new(Instant::now())),
             instructions: Rc::new(Cell::new(0)),
             config_dir: Rc::new(config_dir),
+            managed_plugin_paths: Rc::new(RefCell::new(Vec::new())),
         };
         let started = runtime.started.clone();
         let instructions = runtime.instructions.clone();
@@ -200,6 +202,7 @@ impl LuaRuntime {
         let started = self.started.clone();
         let instructions = self.instructions.clone();
         let config_dir = self.config_dir.clone();
+        let managed_plugin_paths = self.managed_plugin_paths.clone();
         let load = self
             .lua
             .create_function(move |_, (name, reload): (String, bool)| {
@@ -209,6 +212,7 @@ impl LuaRuntime {
                     started: started.clone(),
                     instructions: instructions.clone(),
                     config_dir: config_dir.clone(),
+                    managed_plugin_paths: managed_plugin_paths.clone(),
                 };
                 if Path::new(&name).is_file() || name.ends_with(".lua") {
                     runtime.load_file(Path::new(&name))?;
@@ -222,6 +226,7 @@ impl LuaRuntime {
         let started = self.started.clone();
         let instructions = self.instructions.clone();
         let config_dir = self.config_dir.clone();
+        let managed_plugin_paths = self.managed_plugin_paths.clone();
         let config = self.lua.create_function(move |_, ()| {
             let runtime = Self {
                 lua: weak.upgrade(),
@@ -229,6 +234,7 @@ impl LuaRuntime {
                 started: started.clone(),
                 instructions: instructions.clone(),
                 config_dir: config_dir.clone(),
+                managed_plugin_paths: managed_plugin_paths.clone(),
             };
             runtime.load_config()
         })?;
@@ -298,6 +304,97 @@ impl LuaRuntime {
             .get::<Function>("_load_file")?
             .call::<mlua::Value>((path.to_string_lossy().into_owned(), source))?;
         self.generation.set(self.generation.get().wrapping_add(1));
+        Ok(())
+    }
+
+    /// Register installed snapshots in the chosen order before loading entries.
+    /// User modules retain precedence, followed by snapshots in registration order.
+    pub fn register_managed_plugin_path(&self, root: &Path) -> mlua::Result<()> {
+        let root = managed_plugin_root(root)?;
+        let root_text = root.to_str().ok_or_else(|| {
+            mlua::Error::RuntimeError("Managed plugin snapshot directory must be UTF-8".into())
+        })?;
+        let patterns = [
+            format!("{root_text}/lua/?.lua"),
+            format!("{root_text}/lua/?/init.lua"),
+            format!("{root_text}/?.lua"),
+            format!("{root_text}/?/init.lua"),
+        ];
+        let package: Table = self.lua.globals().get("package")?;
+        let previous: String = package.get("path")?;
+        let mut paths: Vec<_> = previous.split(';').map(str::to_owned).collect();
+        let config_lua = self.config_dir.join("lua");
+        let config_paths = [
+            format!("{}/?.lua", config_lua.display()),
+            format!("{}/?/init.lua", config_lua.display()),
+        ];
+        let mut managed = self.managed_plugin_paths.borrow_mut();
+        let mut insertion = paths
+            .iter()
+            .rposition(|path| config_paths.contains(path) || managed.contains(path))
+            .map_or(0, |index| index + 1);
+        for pattern in &patterns {
+            if !paths.contains(pattern) {
+                paths.insert(insertion, pattern.clone());
+                insertion += 1;
+            }
+        }
+        package.set("path", paths.join(";"))?;
+        for pattern in patterns {
+            if !managed.contains(&pattern) {
+                managed.push(pattern);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load an installed snapshot in this VM, before the user's configuration.
+    /// Successful snapshot paths remain available to deferred `require` calls.
+    pub fn load_managed_plugin(&self, name: &str, root: &Path, entry: &str) -> mlua::Result<()> {
+        let error = |reason: String| {
+            mlua::Error::RuntimeError(format!("Managed plugin '{name}': {reason}"))
+        };
+        let relative = Path::new(entry);
+        if entry.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(error(
+                "entry must be a relative file path without '..'".into(),
+            ));
+        }
+        let root = managed_plugin_root(root).map_err(|cause| error(cause.to_string()))?;
+        let path = root
+            .join(relative)
+            .canonicalize()
+            .map_err(|cause| error(format!("cannot resolve entry '{entry}': {cause}")))?;
+        if !path.starts_with(&root) {
+            return Err(error(format!(
+                "entry '{entry}' escapes the snapshot directory"
+            )));
+        }
+        if !path.is_file() {
+            return Err(error(format!("entry '{entry}' must be a file")));
+        }
+        if path.to_str().is_none() {
+            return Err(error("entry must resolve to a UTF-8 path".into()));
+        }
+
+        let package: Table = self.lua.globals().get("package")?;
+        let previous: String = package.get("path")?;
+        let previous_managed = self.managed_plugin_paths.borrow().clone();
+        self.register_managed_plugin_path(&root)
+            .map_err(|cause| error(cause.to_string()))?;
+        if let Err(cause) = self.load_file(&path) {
+            package.set("path", previous)?;
+            *self.managed_plugin_paths.borrow_mut() = previous_managed;
+            return Err(error(format!("cannot load entry '{entry}': {cause}")));
+        }
         Ok(())
     }
 
@@ -372,6 +469,27 @@ impl LuaRuntime {
     }
 }
 
+fn managed_plugin_root(root: &Path) -> mlua::Result<PathBuf> {
+    let error = |reason: String| {
+        mlua::Error::RuntimeError(format!("Managed plugin snapshot directory: {reason}"))
+    };
+    let root = root
+        .canonicalize()
+        .map_err(|cause| error(format!("cannot resolve path: {cause}")))?;
+    if !root.is_dir() {
+        return Err(error("must be a directory".into()));
+    }
+    let text = root
+        .to_str()
+        .ok_or_else(|| error("must be a UTF-8 path".into()))?;
+    if text.contains([';', '?']) {
+        return Err(error(
+            "cannot contain ';' or '?' in Lua module search paths".into(),
+        ));
+    }
+    Ok(root)
+}
+
 fn default_config_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("REMACS_CONFIG_DIR") {
         return PathBuf::from(path);
@@ -419,6 +537,345 @@ mod tests {
         let actions = runtime.take_actions().unwrap();
         assert_eq!(actions.len(), 1);
         actions[0].get("name").unwrap()
+    }
+
+    fn plugin_file(root: &Path, path: &str, source: &str) {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+
+    fn package_path(runtime: &LuaRuntime) -> String {
+        runtime
+            .lua()
+            .globals()
+            .get::<Table>("package")
+            .unwrap()
+            .get("path")
+            .unwrap()
+    }
+
+    #[test]
+    fn managed_snapshot_entry_and_deferred_helpers_share_the_runtime() {
+        let dir = TestDir::new();
+        let root = dir.0.join("snapshots/demo/commit");
+        for (path, value) in [
+            ("lua/managed_lua_file.lua", "lua file"),
+            ("lua/managed_lua_package/init.lua", "lua package"),
+            ("managed_root_file.lua", "root file"),
+            ("managed_root_package/init.lua", "root package"),
+            ("lua/managed_deferred.lua", "deferred helper"),
+        ] {
+            plugin_file(&root, path, &format!("return '{value}'"));
+        }
+        plugin_file(
+            &root,
+            "plugin.lua",
+            r#"
+                assert(remacs.api_version == 1)
+                assert(remacs.keymap.list()['normal:j'] == 'remacs.defaults')
+                local values = {
+                    require('managed_lua_file'), require('managed_lua_package'),
+                    require('managed_root_file'), (require('managed_root_package'))
+                }
+                remacs.state.managed_values = table.concat(values, ', ')
+                remacs.commands.add('managed-demo', function()
+                    remacs.message(remacs.state.managed_values)
+                end)
+                remacs.keymap.set('normal', 'f22', 'managed-demo')
+                remacs.hooks.add('managed-event', 'deferred', function()
+                    remacs.message(require('managed_deferred'))
+                end)
+            "#,
+        );
+        let runtime = dir.runtime();
+        let generation = runtime.generation();
+        runtime
+            .load_managed_plugin("demo", &root, "plugin.lua")
+            .unwrap();
+        assert_eq!(runtime.generation(), generation + 1);
+        runtime
+            .clone()
+            .eval("assert(remacs.state.managed_values == 'lua file, lua package, root file, root package')")
+            .unwrap();
+        assert!(runtime.dispatch_key("normal", "f22").unwrap());
+        assert_eq!(
+            runtime.take_actions().unwrap()[0]
+                .get::<String>("text")
+                .unwrap(),
+            "lua file, lua package, root file, root package"
+        );
+        let mappings: Table = runtime
+            .api()
+            .unwrap()
+            .get::<Table>("keymap")
+            .unwrap()
+            .get::<Function>("list")
+            .unwrap()
+            .call(())
+            .unwrap();
+        assert_eq!(
+            mappings.get::<String>("normal:f22").unwrap(),
+            format!(
+                "file:{}",
+                root.join("plugin.lua").canonicalize().unwrap().display()
+            )
+        );
+        runtime
+            .emit("managed-event", runtime.lua().create_table().unwrap())
+            .unwrap();
+        assert_eq!(
+            runtime.take_actions().unwrap()[0]
+                .get::<String>("text")
+                .unwrap(),
+            "deferred helper"
+        );
+    }
+
+    #[test]
+    fn managed_search_paths_are_idempotent_ordered_and_follow_user_modules() {
+        let dir = TestDir::new();
+        let alpha = dir.0.join("snapshots/alpha/commit");
+        let beta = dir.0.join("snapshots/beta/commit");
+        plugin_file(&dir.0, "lua/managed_priority.lua", "return 'user'");
+        for (root, value) in [(&alpha, "alpha"), (&beta, "beta")] {
+            plugin_file(
+                root,
+                "lua/managed_priority.lua",
+                &format!("return '{value}'"),
+            );
+            plugin_file(root, "lua/managed_order.lua", &format!("return '{value}'"));
+        }
+        plugin_file(&beta, "lua/managed_beta_helper.lua", "return 'beta helper'");
+        plugin_file(
+            &alpha,
+            "plugin.lua",
+            "assert(require('managed_priority') == 'user'); assert(require('managed_order') == 'alpha'); assert(require('managed_beta_helper') == 'beta helper')",
+        );
+        let runtime = dir.runtime();
+        runtime.register_managed_plugin_path(&alpha).unwrap();
+        runtime.register_managed_plugin_path(&beta).unwrap();
+        let registered = package_path(&runtime);
+        runtime
+            .clone()
+            .register_managed_plugin_path(&alpha)
+            .unwrap();
+        runtime
+            .load_managed_plugin("alpha", &alpha, "plugin.lua")
+            .unwrap();
+        assert_eq!(package_path(&runtime), registered);
+        let config = format!("{}/lua/?.lua", dir.0.display());
+        let alpha_path = format!("{}/lua/?.lua", alpha.canonicalize().unwrap().display());
+        let beta_path = format!("{}/lua/?.lua", beta.canonicalize().unwrap().display());
+        assert!(registered.find(&config).unwrap() < registered.find(&alpha_path).unwrap());
+        assert!(registered.find(&alpha_path).unwrap() < registered.find(&beta_path).unwrap());
+        for root in [&alpha, &beta] {
+            let root = root.canonicalize().unwrap();
+            for suffix in ["/lua/?.lua", "/lua/?/init.lua", "/?.lua", "/?/init.lua"] {
+                let pattern = format!("{}{suffix}", root.display());
+                assert_eq!(
+                    registered
+                        .split(';')
+                        .filter(|path| *path == pattern)
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_managed_entry_restores_paths_registrations_helpers_and_actions() {
+        let dir = TestDir::new();
+        let root = dir.0.join("snapshots/broken/commit");
+        plugin_file(
+            &root,
+            "lua/managed_failed_helper.lua",
+            "remacs.commands.add('managed-helper-leak', function() end); remacs.keymap.set('normal', 'f23', 'managed-helper-leak'); remacs.hooks.add('managed-failure', 'helper', function() remacs.message('leaked hook') end); return {}",
+        );
+        plugin_file(
+            &root,
+            "plugin.lua",
+            "remacs.commands.add('managed-shared', function() remacs.message('broken') end); remacs.commands.add('managed-entry-leak', function() end); remacs.keymap.set('normal', 'f22', 'managed-entry-leak'); require('managed_failed_helper'); remacs.message('discard'); error('entry failed')",
+        );
+        let runtime = dir.runtime();
+        runtime.eval("remacs.commands.add('managed-shared', function() remacs.message('original') end); remacs.keymap.set('normal', 'f22', 'managed-shared')").unwrap();
+        let previous = package_path(&runtime);
+        let generation = runtime.generation();
+        let error = runtime
+            .load_managed_plugin("broken", &root, "plugin.lua")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("broken") && error.contains("entry failed"),
+            "{error}"
+        );
+        assert_eq!(package_path(&runtime), previous);
+        assert_eq!(runtime.generation(), generation);
+        assert!(runtime.take_actions().unwrap().is_empty());
+        assert!(!runtime.execute("managed-entry-leak", "").unwrap());
+        assert!(!runtime.execute("managed-helper-leak", "").unwrap());
+        assert!(!runtime.has_key("normal", "f23").unwrap());
+        runtime
+            .emit("managed-failure", runtime.lua().create_table().unwrap())
+            .unwrap();
+        assert!(runtime.take_actions().unwrap().is_empty());
+        runtime
+            .eval("assert(package.loaded.managed_failed_helper == nil)")
+            .unwrap();
+        assert!(runtime.dispatch_key("normal", "f22").unwrap());
+        assert_eq!(
+            runtime.take_actions().unwrap()[0]
+                .get::<String>("text")
+                .unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn user_configuration_overrides_managed_registrations_and_file_reload_preserves_it() {
+        let dir = TestDir::new();
+        let root = dir.0.join("snapshots/demo/commit");
+        plugin_file(
+            &root,
+            "plugin.lua",
+            "remacs.commands.add('managed-choice', function() remacs.message('plugin') end); remacs.keymap.set('normal', 'j', 'managed-choice'); remacs.hooks.add('managed-choice', 'shared', function() remacs.message('plugin') end)",
+        );
+        plugin_file(
+            &dir.0,
+            "init.lua",
+            "remacs.commands.add('managed-choice', function() remacs.message('user') end); remacs.keymap.set('normal', 'j', 'managed-choice'); remacs.hooks.add('managed-choice', 'shared', function() remacs.message('user') end)",
+        );
+        let runtime = dir.runtime();
+        runtime
+            .load_managed_plugin("demo", &root, "plugin.lua")
+            .unwrap();
+        assert!(runtime.load_config().unwrap());
+        runtime.load_file(&root.join("plugin.lua")).unwrap();
+        for action in ["command", "key", "hook"] {
+            match action {
+                "command" => assert!(runtime.execute("managed-choice", "").unwrap()),
+                "key" => assert!(runtime.dispatch_key("normal", "j").unwrap()),
+                _ => runtime
+                    .emit("managed-choice", runtime.lua().create_table().unwrap())
+                    .unwrap(),
+            }
+            assert_eq!(
+                runtime.take_actions().unwrap()[0]
+                    .get::<String>("text")
+                    .unwrap(),
+                "user"
+            );
+        }
+        plugin_file(&dir.0, "init.lua", "-- removed user override");
+        runtime.load_config().unwrap();
+        assert!(runtime.dispatch_key("normal", "j").unwrap());
+        assert_eq!(
+            runtime.take_actions().unwrap()[0]
+                .get::<String>("text")
+                .unwrap(),
+            "plugin"
+        );
+    }
+
+    #[test]
+    fn managed_entries_require_relative_files_without_parent_components() {
+        let dir = TestDir::new();
+        let root = dir.0.join("snapshot");
+        plugin_file(&root, "plugin.lua", "remacs.message('loaded')");
+        fs::create_dir(root.join("nested")).unwrap();
+        let runtime = dir.runtime();
+        let previous = package_path(&runtime);
+        for entry in [
+            "",
+            "../plugin.lua",
+            "nested/../plugin.lua",
+            "nested/../../plugin.lua",
+            "nested",
+            "missing.lua",
+        ] {
+            let error = runtime
+                .load_managed_plugin("invalid-entry", &root, entry)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid-entry"), "{error}");
+            assert_eq!(package_path(&runtime), previous);
+        }
+        assert!(runtime
+            .load_managed_plugin(
+                "absolute-entry",
+                &root,
+                root.join("plugin.lua").to_str().unwrap()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("relative"));
+        for name in ["snapshot;ambiguous", "snapshot?ambiguous"] {
+            let ambiguous = dir.0.join(name);
+            plugin_file(&ambiguous, "plugin.lua", "remacs.message('loaded')");
+            assert!(runtime.register_managed_plugin_path(&ambiguous).is_err());
+        }
+        assert_eq!(package_path(&runtime), previous);
+        assert!(runtime.take_actions().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_entry_symlinks_cannot_escape_the_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let root = dir.0.join("snapshot");
+        plugin_file(&root, "plugin.lua", "remacs.message('inside')");
+        plugin_file(&dir.0, "outside/plugin.lua", "remacs.message('outside')");
+        symlink(dir.0.join("outside/plugin.lua"), root.join("escape.lua")).unwrap();
+        symlink(dir.0.join("outside"), root.join("escape-dir")).unwrap();
+        symlink(root.join("plugin.lua"), root.join("inside.lua")).unwrap();
+        let runtime = dir.runtime();
+        let previous = package_path(&runtime);
+        for entry in ["escape.lua", "escape-dir/plugin.lua"] {
+            let error = runtime
+                .load_managed_plugin("symlink", &root, entry)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("escapes"), "{error}");
+            assert_eq!(package_path(&runtime), previous);
+        }
+        assert!(runtime.take_actions().unwrap().is_empty());
+        runtime
+            .load_managed_plugin("symlink", &root, "inside.lua")
+            .unwrap();
+        assert_eq!(
+            runtime.take_actions().unwrap()[0]
+                .get::<String>("text")
+                .unwrap(),
+            "inside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_snapshot_paths_must_be_utf8() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let dir = TestDir::new();
+        let root = dir.0.join(OsString::from_vec(b"snapshot-\xff".to_vec()));
+        // Some filesystems, including common macOS volumes, reject filenames
+        // that are not UTF-8. Only exercise rejection when the fixture exists.
+        if let Err(error) = fs::create_dir(&root) {
+            eprintln!("Skipping non-UTF-8 path fixture unsupported by this filesystem: {error}");
+            return;
+        }
+        fs::write(root.join("plugin.lua"), "remacs.message('loaded')").unwrap();
+        let runtime = dir.runtime();
+        let previous = package_path(&runtime);
+        let error = runtime
+            .load_managed_plugin("non-utf8", &root, "plugin.lua")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UTF-8"), "{error}");
+        assert_eq!(package_path(&runtime), previous);
+        assert!(runtime.take_actions().unwrap().is_empty());
     }
 
     #[test]

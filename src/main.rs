@@ -12,6 +12,10 @@ mod lsp_plugin;
 mod lua_runtime;
 mod mason;
 mod mason_plugin;
+mod plugin_manager;
+#[cfg(test)]
+mod plugin_tests;
+mod plugin_ui;
 mod plugins;
 mod popup_terminal;
 mod syntax;
@@ -289,11 +293,15 @@ struct Editor {
     last_slot: Option<usize>,
     buffer_picker: Option<BufferPicker>,
     mason_picker: Option<BufferPicker>,
+    plugin_picker: Option<BufferPicker>,
     hover_popup: Option<String>,
     completion_menu: Option<CompletionMenu>,
     completion_pending: Option<PendingCompletion>,
     completion_due: Option<Instant>,
     mason: MasonManager,
+    managed_plugins: plugin_manager::Manager,
+    plugin_load_errors: HashMap<String, String>,
+    plugin_restart_required: bool,
     lua: LuaRuntime,
     lua_generation: u64,
     lua_observed: HashMap<u64, editor_lua::BufferObservation>,
@@ -330,9 +338,13 @@ struct Editor {
 
 impl Editor {
     fn new(doc: Document) -> Self {
-        let syntax = SyntaxEngine::new(&doc);
         let root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let lua = LuaRuntime::new(&root).expect("bundled Lua runtime");
+        Self::with_runtime(doc, lua)
+    }
+
+    fn with_runtime(doc: Document, lua: LuaRuntime) -> Self {
+        let syntax = SyntaxEngine::new(&doc);
         let mason_plugin = MasonPlugin::new(lua.clone()).expect("bundled plugins/mason.lua");
         let mason = MasonManager::new(&mason_plugin).expect("valid Mason Lua catalog");
         Self {
@@ -349,11 +361,19 @@ impl Editor {
             last_slot: None,
             buffer_picker: None,
             mason_picker: None,
+            plugin_picker: None,
             hover_popup: None,
             completion_menu: None,
             completion_pending: None,
             completion_due: None,
             mason,
+            managed_plugins: plugin_manager::Manager::new(if cfg!(test) {
+                env::temp_dir().join(format!("remacs-no-user-plugins-{}", std::process::id()))
+            } else {
+                plugin_manager::default_root()
+            }),
+            plugin_load_errors: HashMap::new(),
+            plugin_restart_required: false,
             lua_generation: lua.generation(),
             lua_observed: HashMap::new(),
             lua_current: None,
@@ -515,6 +535,7 @@ impl Editor {
             && self.prompt.is_none()
             && self.buffer_picker.is_none()
             && self.mason_picker.is_none()
+            && self.plugin_picker.is_none()
             && self.hover_popup.is_none()
             && !self.tree.as_ref().is_some_and(|tree| tree.focused)
             && self
@@ -896,6 +917,7 @@ impl Editor {
     }
 
     fn open_mason_picker(&mut self) {
+        self.plugin_picker = None;
         self.mason_picker = Some(BufferPicker::default());
         self.buffer_picker = None;
         self.hover_popup = None;
@@ -1374,6 +1396,7 @@ impl Editor {
     }
 
     fn open_buffer_picker(&mut self) {
+        self.plugin_picker = None;
         // Make the most recently visited buffer the initial selection.
         // Ctrl+P then Enter quickly jumps back without typing a filename.
         let selected = self
@@ -1785,7 +1808,12 @@ impl Editor {
             }
             return;
         }
-        if let Some(picker) = self.mason_picker.as_mut().or(self.buffer_picker.as_mut()) {
+        if let Some(picker) = self
+            .plugin_picker
+            .as_mut()
+            .or(self.mason_picker.as_mut())
+            .or(self.buffer_picker.as_mut())
+        {
             let remaining = 128usize.saturating_sub(picker.query.len());
             let mut used = 0;
             picker.query.extend(
@@ -2238,6 +2266,10 @@ impl Editor {
         {
             return;
         }
+        if self.plugin_picker.is_some() {
+            self.plugin_picker_key(key);
+            return;
+        }
         if self.mason_picker.is_some() {
             self.mason_picker_key(key);
             return;
@@ -2500,9 +2532,11 @@ impl Editor {
         };
         let buffer_view = self.buffer_picker_view();
         let mason_view = self.mason_view();
+        let plugin_view = self.plugin_view();
         let hover_view = self.hover_view();
         let finder_rect = if buffer_view.is_some()
             || mason_view.is_some()
+            || plugin_view.is_some()
             || hover_view.is_some()
             || tree_view
                 .as_ref()
@@ -2895,8 +2929,9 @@ impl Editor {
             // even on smaller terminals. The dirty count includes inactive files.
             let dirty = self.dirty_buffers();
             let save_hint = if dirty > 0 { "  SPC b s" } else { "" };
+            let plugin_hint = self.plugin_status_hint();
             let status = format!(
-                " {mark} Remacs [{mode}] | B {}/{}  ●{dirty}{save_hint} | {filename} | {language}{pane} | Ln {}, Col {} ",
+                " {mark} Remacs [{mode}] | B {}/{}  ●{dirty}{save_hint}{plugin_hint} | {filename} | {language}{pane} | Ln {}, Col {} ",
                 self.active_slot + 1, self.slots.len(),
                 self.doc.row + 1, self.doc.col + 1
             );
@@ -2910,7 +2945,7 @@ impl Editor {
                     .unwrap_or_else(|| "[No Name]".into());
                 fit_cells(
                     &format!(
-                        " ▶ W{} {}{filename} [{mode}] | Ln {}, Col {} ",
+                        " ▶ W{}{plugin_hint} {}{filename} [{mode}] | Ln {}, Col {} ",
                         self.windows[self.active_window].id,
                         if self.doc.dirty { "● " } else { "" },
                         self.doc.row + 1,
@@ -2977,7 +3012,11 @@ impl Editor {
         // Overlay the fully visible fzf-style picker after the normal editor
         // and sidebar have painted; only changed popup rows are output.
         if let Some(rect) = finder_rect {
-            if let Some(finder) = mason_view.as_ref() {
+            if let Some(finder) = plugin_view.as_ref() {
+                self.screen
+                    .finder
+                    .paint(output, rect, finder, PickerKind::Plugins)?;
+            } else if let Some(finder) = mason_view.as_ref() {
                 self.screen
                     .finder
                     .paint(output, rect, finder, PickerKind::Mason)?;
@@ -3026,8 +3065,9 @@ impl Editor {
             Some(Prompt::Quit) => (0, rows.saturating_sub(1)),
             None if finder_rect.is_some() => {
                 let rect = finder_rect.unwrap();
-                let query = mason_view
+                let query = plugin_view
                     .as_ref()
+                    .or(mason_view.as_ref())
                     .or(buffer_view.as_ref())
                     .or_else(|| tree_view.as_ref().and_then(|view| view.finder.as_ref()))
                     .map_or("", |finder| finder.query.as_str());
@@ -3396,6 +3436,7 @@ fn main() -> io::Result<()> {
         // ensures interactive TUI refreshes while keeping idle CPU low.
         editor.poll_terminals();
         editor.poll_mason();
+        editor.poll_plugins();
         editor.poll_lsp();
         editor.sync_lua_events();
         editor.draw(&mut stdout)?;

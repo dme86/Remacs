@@ -104,6 +104,7 @@ impl Editor {
         let _ = self.lua.cancel_keys();
         self.buffer_picker = None;
         self.mason_picker = None;
+        self.plugin_picker = None;
         self.return_to_editor_after_switch();
     }
 

@@ -56,6 +56,7 @@ shows incomplete sequences.
 | LSP definition and hover (rust-analyzer) | **`gd`** and **`K`** |
 | Code completion (Insert mode) | Automatic, or **Ctrl+Space**; **↑/↓** choose, **Tab** accept |
 | Language-server manager | **`:mason`** or **`SPC l m`** |
+| Git plugin manager | **`:plugins`** |
 | Visual selection | **`v`**, then **`hjkl`**, **`w`**, **`b`**; **`Esc`** cancels |
 | Yank / delete selection | **`y` / `d`** in VISUAL mode (also copies to OS clipboard) |
 | Delete character / line | **`x` / `dd`** |
@@ -156,6 +157,55 @@ multi-key mappings, buffers, editor events and reload behavior.
 [examples/init.lua](examples/init.lua) is a usable configuration example;
 [lua/defaults.lua](lua/defaults.lua) contains the existing default editor policy.
 Embedded Lua files remain available as installation fallbacks.
+
+## Git plugin manager
+
+Open **`:plugins`** to search and manage external Remacs Lua plugins. Git must
+be available on PATH. To add one, replace this example's placeholder URL with
+a repository you trust:
+
+```text
+:plugins add notes https://example.com/you/remacs-notes.git
+```
+
+**`add` registers and installs the plugin explicitly.** Optional arguments select
+the branch and repository-relative entry file:
+`:plugins add NAME REPO [BRANCH] [ENTRY]` (defaults: `main`, `plugin.lua`).
+Installations and updates run in the background and become active **after
+restarting Remacs**. They do not reload the running plugin.
+
+| Action | Command / popup keys |
+| --- | --- |
+| Open searchable manager | **`:plugins`** |
+| Install a registered plugin | **`:plugins install NAME`** or **Enter** on its row |
+| Install missing registered plugins | **`:plugins sync`** or **Ctrl+S** |
+| Update one installed plugin | **`:plugins update NAME`** or **Ctrl+U** on its row |
+| Update all installed plugins | **`:plugins update`** |
+| Check remote branch hashes | **`:plugins check`** or **Ctrl+R** |
+| Remove a registration | **`:plugins remove NAME`** |
+
+Type to filter; arrows or Tab select a row, **Ctrl+L** clears the filter, and
+**Esc** closes the popup. Update availability appears as a badge and a
+notification. Remacs also checks remote branch hashes asynchronously at startup;
+checks do not install updates. `update` without a name updates all installed
+plugins regardless of a previous check result. `sync` installs only missing
+plugins. Removal takes effect after restart and retains cached snapshots.
+
+Installed code is stored as immutable Git commit snapshots with a manifest:
+
+- macOS: `~/Library/Application Support/Remacs/plugins`.
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/remacs/plugins`.
+- Set **`REMACS_PLUGIN_HOME`** to an absolute directory to override that location.
+
+At startup, installed entries load alphabetically in the shared Lua interpreter,
+after bundled plugins/defaults and before `init.lua`, so user configuration can
+override them. A repository's `plugin.lua` must use the **Remacs Lua API**;
+Neovim plugins are not automatically compatible. Namespaced helper modules can
+live under `lua/`, for example `lua/notes/helpers.lua` loaded with
+`require("notes.helpers")`. Configuration-directory Lua modules have priority.
+This version does not manage plugin dependencies or build hooks. See the
+[managed plugin API and repository layout](docs/lua-api.md#managed-git-plugins)
+for authoring details.
 
 ## Mason-like language-server manager (Lua plugin)
 

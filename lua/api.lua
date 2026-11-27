@@ -388,5 +388,31 @@ end
 r.plugins = {}
 function r.plugins.load(name) return r._host_load(name, false) end
 function r.plugins.reload(name) return r._host_load(name, true) end
+function r.plugins.list()
+  local result = {}
+  for _, plugin in ipairs(r._context.plugins or {}) do result[#result + 1] = copy(plugin) end
+  return result
+end
+function r.plugins.add(spec)
+  assert(type(spec) == "table", "plugin spec must be a table")
+  assert(type(spec.name) == "string" and type(spec.repo) == "string", "plugin name and repo are required")
+  assert(spec.branch == nil or type(spec.branch) == "string", "plugin branch must be a string")
+  assert(spec.entry == nil or type(spec.entry) == "string", "plugin entry must be a string")
+  queue({ kind = "plugin", op = "add", name = spec.name, repo = spec.repo,
+    branch = spec.branch or "main", entry = spec.entry or "plugin.lua" })
+end
+function r.plugins.install(name)
+  assert(type(name) == "string", "plugin name must be a string")
+  queue({ kind = "plugin", op = "install", name = name })
+end
+function r.plugins.update(name)
+  assert(name == nil or type(name) == "string", "plugin name must be a string")
+  queue({ kind = "plugin", op = "update", name = name })
+end
+function r.plugins.check() queue({ kind = "plugin", op = "check" }) end
+function r.plugins.remove(name)
+  assert(type(name) == "string", "plugin name must be a string")
+  queue({ kind = "plugin", op = "remove", name = name })
+end
 r.config = {}
 function r.config.reload() return r._host_config() end

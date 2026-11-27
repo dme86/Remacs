@@ -16,6 +16,10 @@ local function bind(mode, keys, name)
   remacs.keymap.set(mode, keys, name)
 end
 
+remacs.commands.add("plugins", function(args)
+  remacs.core("plugins", { args = args })
+end)
+
 for _, name in ipairs({
   "save", "save_all", "quit", "open_prompt", "command_prompt",
   "buffer_picker", "buffer_next", "buffer_previous", "buffer_last",
