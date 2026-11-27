@@ -178,7 +178,7 @@ struct ScreenCache {
     syntax_enabled: Option<bool>,
     sidebar_width: usize,
     sidebar_lines: Vec<Option<SidebarPaint>>,
-    window_layout: Vec<(u64, usize, usize, bool)>,
+    window_layout: Vec<(usize, usize)>,
     window_render: window_render::Cache,
     window_dividers: Vec<bool>,
     finder: FinderCache,
@@ -2460,14 +2460,8 @@ impl Editor {
         let text_width = pane_width.saturating_sub(gutter_width);
         let window_layout: Vec<_> = layout
             .iter()
-            .map(|rect| {
-                (
-                    self.windows[rect.window].id,
-                    rect.x,
-                    rect.width,
-                    rect.window == self.active_window,
-                )
-            })
+            // Focus and pane identity do not change the screen geometry.
+            .map(|rect| (rect.x, rect.width))
             .collect();
         let layout_changed = self.screen.window_layout != window_layout;
         let has_splits = self.windows.len() > 1;

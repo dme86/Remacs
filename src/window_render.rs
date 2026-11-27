@@ -50,6 +50,9 @@ impl Editor {
         repaint_all: bool,
     ) -> io::Result<()> {
         let mut cache = std::mem::take(&mut self.screen.window_render);
+        // The focused pane is painted through ScreenCache, so its inactive
+        // cache cannot describe the screen until it is painted here again.
+        cache.panes.remove(&self.active_window_id());
         let enabled = self.syntax.enabled();
         cache.syntax.retain(|id, _| self.buffer_ids.contains(id));
         cache
@@ -348,6 +351,152 @@ mod tests {
             editor.windows[0].row, 0,
             "painting must not move another view's cursor"
         );
+    }
+
+    #[test]
+    fn repeated_tab_focus_preserves_split_screen_without_full_clear() {
+        let root = env::temp_dir().join(format!(
+            "remacs-tab-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let left_path = root.join("left.txt");
+        let right_path = root.join("right.txt");
+        for (path, name) in [(&left_path, "LEFT"), (&right_path, "RIGHT")] {
+            let text = (0..60)
+                .map(|row| format!("prefix {name} row {row:03}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, text).unwrap();
+        }
+        let mut editor = Editor::new(Document::open(left_path).unwrap());
+        editor.doc.row = 18;
+        editor.doc.col = 8;
+        editor.scroll_row = 15;
+        editor.scroll_col = 2;
+        frame(&mut editor, 120, 18);
+        let left = editor.active_window_id();
+        assert!(editor.window_split());
+        let right = editor.active_window_id();
+        editor.open(right_path.to_string_lossy().into_owned());
+        editor.doc.row = 31;
+        editor.doc.col = 10;
+        editor.scroll_row = 27;
+        editor.scroll_col = 4;
+        assert!(editor.tree.is_none());
+        let layout = editor.window_layout(120, 0);
+        let mut parser = terminal(120, 18);
+        parser.process(&frame(&mut editor, 120, 18));
+
+        for focused in [left, right, left, right, left, right] {
+            editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 16);
+            assert_eq!(editor.active_window_id(), focused);
+            let bytes = frame(&mut editor, 120, 18);
+            let rendered = String::from_utf8_lossy(&bytes);
+            assert!(
+                !rendered.contains("\x1b[2J"),
+                "changing focus must not clear the entire terminal"
+            );
+            for chunk in bytes.chunks(13) {
+                parser.process(chunk);
+            }
+            for (index, name, top, row, col, horizontal) in
+                [(0, "LEFT", 15, 18, 8, 2), (1, "RIGHT", 27, 31, 10, 4)]
+            {
+                let pane = layout[index];
+                let lines: Vec<_> = parser
+                    .screen()
+                    .rows(pane.x as u16, pane.width as u16)
+                    .collect();
+                for (y, line) in lines.iter().take(16).enumerate() {
+                    assert!(
+                        line.contains(&format!("{name} row {:03}", top + y)),
+                        "window {index}, row {y} has stale or missing text: {line}"
+                    );
+                }
+                let status = &lines[16];
+                assert!(status.contains(if index == 0 { "left.txt" } else { "right.txt" }));
+                assert!(status.contains(&format!("Ln {}, Col {}", row + 1, col + 1)));
+                let active = editor.windows[index].id == focused;
+                assert_eq!(
+                    status.contains('▶'),
+                    active,
+                    "incorrect pane status: {status}"
+                );
+                if active {
+                    assert_eq!(
+                        (
+                            editor.doc.row,
+                            editor.doc.col,
+                            editor.scroll_row,
+                            editor.scroll_col
+                        ),
+                        (row, col, top, horizontal)
+                    );
+                    assert_eq!(
+                        parser.screen().cursor_position(),
+                        (
+                            (row - top) as u16,
+                            (pane.x + gutter_width(pane.width, 60) + col - horizontal) as u16
+                        )
+                    );
+                }
+            }
+            for y in 0..17 {
+                assert_eq!(
+                    parser
+                        .screen()
+                        .cell(y, layout[0].width as u16)
+                        .unwrap()
+                        .contents(),
+                    "│"
+                );
+            }
+            let before_idle = parser.screen().contents();
+            let cursor = parser.screen().cursor_position();
+            let idle = frame(&mut editor, 120, 18);
+            assert!(idle.len() < 100, "an idle frame must stay compact");
+            let idle_text = String::from_utf8_lossy(&idle);
+            assert!(!idle_text.contains("\x1b[2J"));
+            assert!(!idle_text.contains("LEFT") && !idle_text.contains("RIGHT"));
+            assert!(!idle_text.contains('│'));
+            parser.process(&idle);
+            assert_eq!(parser.screen().contents(), before_idle);
+            assert_eq!(parser.screen().cursor_position(), cursor);
+        }
+        // Resizing may clear the screen, but focus changes at the same narrow
+        // geometry must replace the selected view without another full clear.
+        let mut narrow = terminal(30, 8);
+        narrow.process(&frame(&mut editor, 30, 8));
+        for focused in [left, right, left, right] {
+            editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 6);
+            let bytes = frame(&mut editor, 30, 8);
+            assert!(!String::from_utf8_lossy(&bytes).contains("\x1b[2J"));
+            narrow.process(&bytes);
+            let (name, filename, top) = if focused == left {
+                ("LEFT", "left.txt", 15)
+            } else {
+                ("RIGHT", "right.txt", 27)
+            };
+            assert_eq!(editor.active_window_id(), focused);
+            let lines: Vec<_> = narrow.screen().rows(0, 30).collect();
+            assert!(lines[0].contains(&format!("{name} row {top:03}")));
+            assert!(lines[6].contains(filename) && lines[6].contains('▶'));
+            assert!(!narrow.screen().contents().contains('│'));
+            assert_eq!(
+                narrow.screen().cursor_position(),
+                (
+                    (editor.doc.row - editor.scroll_row) as u16,
+                    (gutter_width(30, 60) + editor.doc.col - editor.scroll_col) as u16
+                )
+            );
+            assert!(frame(&mut editor, 30, 8).len() < 100);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
