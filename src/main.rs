@@ -2268,31 +2268,18 @@ impl Editor {
             self.tree_key(key);
             return;
         }
-        // With the sidebar hidden, Tab belongs to window navigation. This also
-        // takes precedence over legacy Ctrl+I, which shares Tab's input byte.
-        if self.mode == Mode::Normal
-            && self.windows.len() > 1
-            && !self.tree.as_ref().is_some_and(|tree| tree.visible)
-            && key.code == KeyCode::Tab
-            && key.modifiers.is_empty()
-        {
-            self.window_cycle(true);
-            return;
-        }
-        // Otherwise retain legacy Ctrl+I's jumplist-before-tree-focus rule.
-        if self.mode == Mode::Normal
-            && key.code == KeyCode::Tab
-            && key.modifiers == KeyModifiers::NONE
-        {
-            if self.jumps.can_forward() {
-                self.jump_forward();
-                return;
-            }
+        // Tab only changes focus, including the indistinguishable Ctrl+I byte
+        // from legacy terminals. Explicit Ctrl+I and Alt+Right still use Lua.
+        if self.mode == Mode::Normal && key.code == KeyCode::Tab && key.modifiers.is_empty() {
             if let Some(tree) = &mut self.tree {
                 if tree.visible {
                     tree.focus();
                     return;
                 }
+            }
+            if self.windows.len() > 1 {
+                self.window_cycle(true);
+                return;
             }
         }
         if key.code == KeyCode::Esc {
@@ -3692,7 +3679,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_i_legacy_tab_retraces_entire_jumplist_even_with_tree_visible() {
+    fn tab_focuses_tree_without_traversing_forward_history() {
         let root = temporary_buffer_project();
         std::fs::write(root.join("three.rs"), "three\nfour\n").unwrap();
         let mut editor = Editor::new(Document::open(root.join("one.rs")).unwrap());
@@ -3713,24 +3700,25 @@ mod tests {
         assert!(editor.doc.path.as_ref().unwrap().ends_with("one.rs"));
         assert_eq!((editor.doc.row, editor.doc.col), (2, 1));
 
-        // In legacy PTY input Ctrl+I arrives as KeyCode::Tab *without*
-        // a Control modifier. It must go forward, not focus the tree.
-        let legacy_ctrl_i = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        editor.key(legacy_ctrl_i, 12);
-        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        // Even with forward history, the Tab/legacy Ctrl+I byte changes focus.
+        let origin = editor.current_location().unwrap();
+        let history = editor.jumps.entries().to_vec();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        editor.key(tab, 12);
+        assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
+        editor.key(tab, 12);
         assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
-        editor.key(legacy_ctrl_i, 12);
+        assert_eq!(editor.current_location(), Some(origin));
+        assert_eq!(editor.jumps.entries(), history);
+        assert!(editor.jumps.can_forward());
+
+        // The unambiguous shortcut still retraces every newer jump.
+        let forward = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        editor.key(forward, 12);
+        assert!(editor.doc.path.as_ref().unwrap().ends_with("two.md"));
+        editor.key(forward, 12);
         assert!(editor.doc.path.as_ref().unwrap().ends_with("three.rs"));
         assert!(!editor.jumps.can_forward());
-
-        // At the newest location ordinary Tab resumes its original
-        // editor-to-tree focus behavior.
-        editor.key(legacy_ctrl_i, 12);
-        assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
-
-        // Tab with focus in tree still returns to the editor.
-        editor.key(legacy_ctrl_i, 12);
-        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
         let _ = std::fs::remove_dir_all(root);
     }
 

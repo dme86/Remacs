@@ -500,7 +500,7 @@ fn plain_tab_wraps_across_three_windows_without_changing_shift_tab() {
 }
 
 #[test]
-fn closed_tree_tabs_cycle_windows_before_legacy_forward_history() {
+fn closed_tree_tabs_cycle_windows_without_traversing_forward_history() {
     let project = Project::new();
     let target = project.file("jump-target.txt", "zero\none\ntarget position");
     let (mut editor, views) = tab_windows(&project, 2);
@@ -541,54 +541,56 @@ fn explicit_control_i_and_alt_right_keep_forward_jump_with_hidden_tree_and_split
 }
 
 #[test]
-fn visible_tree_keeps_legacy_forward_jump_then_editor_tree_focus_with_splits() {
+fn visible_tree_tabs_return_to_the_last_window_without_traversing_forward_history() {
     let project = Project::new();
     let target = project.file("visible-tree-jump.txt", "zero\none\ntarget position");
     let (mut editor, views) = tab_windows(&project, 2);
     editor.toggle_tree();
     editor.tree.as_mut().unwrap().leave();
     arm_tab_forward_history(&mut editor, &target);
-    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
-    assert_eq!(editor.active_window_id(), views[1].id);
-    assert_eq!(
-        path_identity(editor.doc.path.as_ref().unwrap()),
-        path_identity(&target)
-    );
-    assert!(!editor.jumps.can_forward());
-    assert!(editor
-        .tree
-        .as_ref()
-        .is_some_and(|tree| tree.visible && !tree.focused));
-    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
-    assert_eq!(editor.active_window_id(), views[1].id);
-    assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
-    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
-    assert_eq!(editor.active_window_id(), views[1].id);
-    assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
-    editor.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 10);
-    assert_eq!(editor.active_window_id(), views[1].id);
+    let history = editor.jumps.entries().to_vec();
+    for view in &views {
+        assert!(editor.window_focus(view.id));
+        editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+        assert_tab_window(&editor, view);
+        assert!(editor
+            .tree
+            .as_ref()
+            .is_some_and(|tree| tree.visible && tree.focused));
+        assert_eq!(editor.jumps.entries(), history.as_slice());
+        assert!(editor.jumps.can_forward());
+        editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+        assert_tab_window(&editor, view);
+        assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+        assert_eq!(editor.jumps.entries(), history.as_slice());
+        assert!(editor.jumps.can_forward());
+    }
+    assert_eq!(editor.slots.len(), 2, "Tab must not open the jump target");
 }
 
 #[test]
-fn one_window_retains_legacy_tab_forward_jump_and_no_window_cycle() {
-    let project = Project::new();
-    let target = project.file("one-window-jump.txt", "zero\none\ntarget position");
-    let (mut editor, views) = tab_windows(&project, 1);
-    arm_tab_forward_history(&mut editor, &target);
-    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
-    assert_eq!(editor.active_window_id(), views[0].id);
-    assert_eq!(
-        path_identity(editor.doc.path.as_ref().unwrap()),
-        path_identity(&target)
-    );
-    assert!(!editor.jumps.can_forward());
-    for key in [
-        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-    ] {
-        editor.key(key, 10);
-        assert_eq!(editor.active_window_id(), views[0].id);
-        assert_eq!((editor.doc.row, editor.doc.col), (2, 3));
+fn one_window_tab_without_a_visible_tree_never_traverses_forward_history() {
+    for closed_tree in [false, true] {
+        let project = Project::new();
+        let target = project.file("one-window-jump.txt", "zero\none\ntarget position");
+        let (mut editor, views) = tab_windows(&project, 1);
+        if closed_tree {
+            editor.toggle_tree();
+            editor.toggle_tree();
+        }
+        arm_tab_forward_history(&mut editor, &target);
+        let history = editor.jumps.entries().to_vec();
+        for key in [
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        ] {
+            editor.key(key, 10);
+            assert_tab_window(&editor, &views[0]);
+            assert_eq!(editor.jumps.entries(), history.as_slice());
+            assert!(editor.jumps.can_forward());
+        }
+        assert_eq!(editor.slots.len(), 1, "Tab must not open the jump target");
     }
 }
 

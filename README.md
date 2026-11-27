@@ -358,13 +358,10 @@ created.
 
 **Difference from Vim:** Vim's changelist is traditionally per buffer and
 its jumplist per window; Remacs deliberately uses a global edit history.
-In legacy PTY mode **Ctrl+I and Tab send the exact same character**. In
-Normal mode with multiple windows and the file tree hidden, **Tab cycles
-windows forward** even when newer jumps exist. With one window or a visible
-tree, Tab still follows newer jump history first, then focuses the visible
-tree. Tab in the focused tree returns to the editor.
-An explicitly reported **Ctrl+I** and **Alt+Right** (Option+Right in rst)
-remain forward-jump shortcuts; use Alt+Right when your terminal cannot
+**Tab changes focus and never traverses jump history.** In legacy PTY mode,
+Ctrl+I and Tab send the same character, so Ctrl+I also performs Tab's focus
+action there. An explicitly reported **Ctrl+I** and **Alt+Right** (Option+Right
+in rst) remain forward-jump shortcuts. Use Alt+Right when your terminal cannot
 distinguish Ctrl+I from Tab. Like Vim's simple location marks, these
 coordinates cannot yet follow arbitrary insertions after a file has
 been closed and reopened. Concurrent processes can overwrite one another's
@@ -426,12 +423,12 @@ forward, or **`SPC w W`** to cycle backward. The active window is marked in its
 status line. Existing file-open and buffer-picker commands change the buffer
 in the focused window.
 
-In Normal mode, **Tab** cycles forward through two or more windows when the
-file tree is hidden, including after closing it. From the last window, Tab
-returns to the first. This takes priority over legacy Tab/Ctrl+I jump history.
-A visible tree and a single window retain their existing Tab behavior;
-Insert/Visual mode, prompts, pickers and terminal popups retain their own
-input handling.
+In Normal mode, **Tab** focuses the visible file tree; Tab there returns to
+the last active window. With the tree hidden, including after closing it,
+Tab cycles forward through two or more windows and wraps from last to first.
+With one window and no visible tree, Tab leaves the view unchanged. These
+focus actions never follow jump history. Insert/Visual mode, prompts, pickers
+and terminal popups retain their own input handling.
 
 Each window keeps its own cursor and scroll position. Two windows displaying
 the same buffer share text, dirty state and undo history, so edits appear in

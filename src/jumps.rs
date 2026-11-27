@@ -119,8 +119,8 @@ impl JumpManager {
     pub fn entries(&self) -> &[Location] {
         &self.saved.history
     }
-    /// Whether a forward jump is possible after Ctrl+O. This is also used
-    /// to interpret the ambiguous Tab/Ctrl+I byte in legacy terminals.
+    /// Whether a forward jump is possible after Ctrl+O.
+    #[cfg(test)]
     pub fn can_forward(&self) -> bool {
         self.saved
             .cursor
