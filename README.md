@@ -68,7 +68,7 @@ shows incomplete sequences.
 | Close current buffer (only if saved) | **`SPC b d`** |
 | Split vertically (side by side) | **`SPC w v`**, **`Ctrl+W v`** or **`Ctrl+X 3`** |
 | Focus left / right window | **`SPC w h` / `SPC w l`**, or **`Ctrl+W h` / `Ctrl+W l`** |
-| Next / previous window | **`SPC w w` / `SPC w W`**, **`Ctrl+W w` / `Ctrl+W W`**; **`Ctrl+X o`** cycles |
+| Next / previous window | **Tab** cycles forward when the tree is hidden; **`SPC w w` / `SPC w W`**, **`Ctrl+W w` / `Ctrl+W W`**; **`Ctrl+X o`** cycles |
 | Close window / keep only this window | **`SPC w c` / `SPC w o`**, **`Ctrl+W c` / `Ctrl+W o`**, or **`Ctrl+X 0` / `Ctrl+X 1`** |
 | Grow / shrink window; equal widths | **`SPC w >` / `SPC w <`**; **`SPC w =`** (also **`Ctrl+W`** variants) |
 | Toggle project file tree | **`SPC o p`**, **`SPC f t`** or **`Ctrl+N`** |
@@ -358,12 +358,14 @@ created.
 
 **Difference from Vim:** Vim's changelist is traditionally per buffer and
 its jumplist per window; Remacs deliberately uses a global edit history.
-In legacy PTY mode **Ctrl+I and Tab send the exact same character**. Remacs
-interprets Tab as **forward jump** in Normal mode if the jump history has
-a newer entry; otherwise Tab keeps its original editor-to-tree focus
-behavior. While the file tree itself has focus, Tab still returns to the
-editor. If you always want an unambiguous jump shortcut, use **Alt+Right**
-(Option+Right in rst) instead. Like Vim's simple location marks, these
+In legacy PTY mode **Ctrl+I and Tab send the exact same character**. In
+Normal mode with multiple windows and the file tree hidden, **Tab cycles
+windows forward** even when newer jumps exist. With one window or a visible
+tree, Tab still follows newer jump history first, then focuses the visible
+tree. Tab in the focused tree returns to the editor.
+An explicitly reported **Ctrl+I** and **Alt+Right** (Option+Right in rst)
+remain forward-jump shortcuts; use Alt+Right when your terminal cannot
+distinguish Ctrl+I from Tab. Like Vim's simple location marks, these
 coordinates cannot yet follow arbitrary insertions after a file has
 been closed and reopened. Concurrent processes can overwrite one another's
 history; this is a first lightweight persistent version.
@@ -423,6 +425,13 @@ and takes focus. Use **`SPC w h/l`** to move left/right, **`SPC w w`** to cycle
 forward, or **`SPC w W`** to cycle backward. The active window is marked in its
 status line. Existing file-open and buffer-picker commands change the buffer
 in the focused window.
+
+In Normal mode, **Tab** cycles forward through two or more windows when the
+file tree is hidden, including after closing it. From the last window, Tab
+returns to the first. This takes priority over legacy Tab/Ctrl+I jump history.
+A visible tree and a single window retain their existing Tab behavior;
+Insert/Visual mode, prompts, pickers and terminal popups retain their own
+input handling.
 
 Each window keeps its own cursor and scroll position. Two windows displaying
 the same buffer share text, dirty state and undo history, so edits appear in

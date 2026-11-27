@@ -2268,8 +2268,18 @@ impl Editor {
             self.tree_key(key);
             return;
         }
-        // Legacy terminals encode Ctrl+I and Tab identically. Preserve the
-        // jumplist-before-tree-focus rule without hiding this ambiguity in Lua.
+        // With the sidebar hidden, Tab belongs to window navigation. This also
+        // takes precedence over legacy Ctrl+I, which shares Tab's input byte.
+        if self.mode == Mode::Normal
+            && self.windows.len() > 1
+            && !self.tree.as_ref().is_some_and(|tree| tree.visible)
+            && key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+        {
+            self.window_cycle(true);
+            return;
+        }
+        // Otherwise retain legacy Ctrl+I's jumplist-before-tree-focus rule.
         if self.mode == Mode::Normal
             && key.code == KeyCode::Tab
             && key.modifiers == KeyModifiers::NONE

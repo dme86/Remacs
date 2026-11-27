@@ -399,3 +399,243 @@ fn window_prefixes_leave_the_focused_tree_without_closing_it() {
     assert_ne!(editor.active_window_id(), right);
     assert!(!editor.tree.as_ref().unwrap().focused);
 }
+
+struct TabWindow {
+    id: u64,
+    path: PathBuf,
+    row: usize,
+    col: usize,
+}
+
+fn tab_windows(project: &Project, count: usize) -> (Editor, Vec<TabWindow>) {
+    let first = project.file(
+        "tab-0.txt",
+        "first line\nsecond line\nthird line\nfourth line",
+    );
+    let mut editor = Editor::new(Document::open(first.clone()).unwrap());
+    editor.screen.size = Some((160, 30));
+    let mut views = Vec::new();
+    for index in 0..count {
+        let path = if index == 0 {
+            first.clone()
+        } else {
+            assert!(editor.window_split());
+            let path = project.file(
+                &format!("tab-{index}.txt"),
+                "another first\nanother second\nanother third\nanother fourth",
+            );
+            editor.open(path.to_string_lossy().into_owned());
+            path
+        };
+        editor.doc.row = index;
+        editor.doc.col = index + 1;
+        views.push(TabWindow {
+            id: editor.active_window_id(),
+            path,
+            row: index,
+            col: index + 1,
+        });
+    }
+    (editor, views)
+}
+
+fn assert_tab_window(editor: &Editor, view: &TabWindow) {
+    assert_eq!(editor.active_window_id(), view.id);
+    assert_eq!(editor.doc.path.as_ref(), Some(&view.path));
+    assert_eq!((editor.doc.row, editor.doc.col), (view.row, view.col));
+}
+
+fn arm_tab_forward_history(editor: &mut Editor, target: &Path) {
+    let origin = editor.current_location().unwrap();
+    editor.jumps = JumpManager::memory_only();
+    editor.jumps.remember(origin.clone()).unwrap();
+    editor
+        .jumps
+        .remember(Location {
+            path: path_identity(target),
+            row: 2,
+            col: 3,
+        })
+        .unwrap();
+    assert_eq!(editor.jumps.back(None).unwrap(), Some(origin));
+    assert!(editor.jumps.can_forward());
+}
+
+#[test]
+fn tab_cycles_two_file_windows_and_restores_each_cursor() {
+    let project = Project::new();
+    let (mut editor, views) = tab_windows(&project, 2);
+    assert!(editor.tree.is_none());
+    assert_tab_window(&editor, &views[1]);
+    for index in [0, 1, 0, 1] {
+        editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+        assert_tab_window(&editor, &views[index]);
+    }
+    assert_eq!(editor.slots.len(), 2);
+    assert!(editor
+        .slots
+        .iter()
+        .flatten()
+        .all(|buffer| !buffer.doc.dirty));
+    assert!(!editor.doc.dirty);
+}
+
+#[test]
+fn plain_tab_wraps_across_three_windows_without_changing_shift_tab() {
+    let project = Project::new();
+    let (mut editor, views) = tab_windows(&project, 3);
+    for index in [0, 1, 2, 0, 1, 2] {
+        editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+        assert_tab_window(&editor, &views[index]);
+    }
+    for (code, modifiers) in [
+        (KeyCode::BackTab, KeyModifiers::SHIFT),
+        (KeyCode::Tab, KeyModifiers::SHIFT),
+        (KeyCode::BackTab, KeyModifiers::NONE),
+    ] {
+        editor.key(KeyEvent::new(code, modifiers), 10);
+        assert_tab_window(&editor, &views[2]);
+    }
+    assert_eq!(editor.slots.len(), 3);
+}
+
+#[test]
+fn closed_tree_tabs_cycle_windows_before_legacy_forward_history() {
+    let project = Project::new();
+    let target = project.file("jump-target.txt", "zero\none\ntarget position");
+    let (mut editor, views) = tab_windows(&project, 2);
+    editor.toggle_tree();
+    editor.toggle_tree();
+    assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible));
+    arm_tab_forward_history(&mut editor, &target);
+    let history = editor.jumps.entries().to_vec();
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_tab_window(&editor, &views[0]);
+    assert!(editor.jumps.can_forward());
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_tab_window(&editor, &views[1]);
+    assert_eq!(editor.jumps.entries(), history.as_slice());
+    assert!(editor.jumps.can_forward());
+    assert!(editor.tree.as_ref().is_some_and(|tree| !tree.visible));
+}
+
+#[test]
+fn explicit_control_i_and_alt_right_keep_forward_jump_with_hidden_tree_and_splits() {
+    for key in [
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+    ] {
+        let project = Project::new();
+        let target = project.file("explicit-jump.txt", "zero\none\ntarget position");
+        let (mut editor, views) = tab_windows(&project, 2);
+        arm_tab_forward_history(&mut editor, &target);
+        editor.key(key, 10);
+        assert_eq!(editor.active_window_id(), views[1].id);
+        assert_eq!(
+            path_identity(editor.doc.path.as_ref().unwrap()),
+            path_identity(&target)
+        );
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 3));
+        assert!(!editor.jumps.can_forward());
+    }
+}
+
+#[test]
+fn visible_tree_keeps_legacy_forward_jump_then_editor_tree_focus_with_splits() {
+    let project = Project::new();
+    let target = project.file("visible-tree-jump.txt", "zero\none\ntarget position");
+    let (mut editor, views) = tab_windows(&project, 2);
+    editor.toggle_tree();
+    editor.tree.as_mut().unwrap().leave();
+    arm_tab_forward_history(&mut editor, &target);
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), views[1].id);
+    assert_eq!(
+        path_identity(editor.doc.path.as_ref().unwrap()),
+        path_identity(&target)
+    );
+    assert!(!editor.jumps.can_forward());
+    assert!(editor
+        .tree
+        .as_ref()
+        .is_some_and(|tree| tree.visible && !tree.focused));
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), views[1].id);
+    assert!(editor.tree.as_ref().is_some_and(|tree| tree.focused));
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), views[1].id);
+    assert!(editor.tree.as_ref().is_some_and(|tree| !tree.focused));
+    editor.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 10);
+    assert_eq!(editor.active_window_id(), views[1].id);
+}
+
+#[test]
+fn one_window_retains_legacy_tab_forward_jump_and_no_window_cycle() {
+    let project = Project::new();
+    let target = project.file("one-window-jump.txt", "zero\none\ntarget position");
+    let (mut editor, views) = tab_windows(&project, 1);
+    arm_tab_forward_history(&mut editor, &target);
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), views[0].id);
+    assert_eq!(
+        path_identity(editor.doc.path.as_ref().unwrap()),
+        path_identity(&target)
+    );
+    assert!(!editor.jumps.can_forward());
+    for key in [
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    ] {
+        editor.key(key, 10);
+        assert_eq!(editor.active_window_id(), views[0].id);
+        assert_eq!((editor.doc.row, editor.doc.col), (2, 3));
+    }
+}
+
+#[test]
+fn split_tab_shortcut_leaves_insert_visual_prompt_picker_and_terminal_input_alone() {
+    let project = Project::new();
+    let (mut editor, views) = tab_windows(&project, 2);
+    let window = views[1].id;
+    editor.begin_insert();
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), window);
+    assert_eq!(editor.mode, Mode::Insert);
+    assert_eq!(editor.doc.line()[2], '\t');
+    editor.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10);
+    editor.enter_visual();
+    let selection = editor.selection;
+    for key in [
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    ] {
+        editor.key(key, 10);
+        assert_eq!(editor.active_window_id(), window);
+        assert_eq!(editor.mode, Mode::Visual);
+        assert_eq!(editor.selection, selection);
+    }
+    editor.leave_visual();
+    editor.prompt = Some(Prompt::Command("buffers".into()));
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), window);
+    assert!(matches!(&editor.prompt, Some(Prompt::Command(value)) if value == "buffers"));
+    editor.prompt = None;
+    editor.open_buffer_picker();
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    assert_eq!(editor.active_window_id(), window);
+    assert!(editor.buffer_picker.is_some());
+    assert_eq!(editor.buffer_picker.as_ref().unwrap().selected, 1);
+    editor.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 10);
+    assert_eq!(editor.buffer_picker.as_ref().unwrap().selected, 0);
+    editor.buffer_picker = None;
+    // Mark a terminal as focused without spawning a child: the routing guard
+    // must consume its keys even before a PTY session has been attached.
+    editor.command("lua remacs.state.toggleterm.active = 'shell'");
+    editor.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10);
+    editor.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 10);
+    assert_eq!(editor.active_window_id(), window);
+    assert_eq!(
+        editor.toggleterm.active().unwrap().as_deref(),
+        Some("shell")
+    );
+}
