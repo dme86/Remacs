@@ -5392,12 +5392,14 @@ mod tests {
             assert_eq!(editor.mode, Mode::Insert);
             editor.undo();
             assert_eq!(editor.doc.lsp_text(), text);
-            // Once indexed, a normal edit must invoke completion through
-            // the debounce timer without another manual request.
+            // Every attempt must come from a normal edit and the debounce
+            // timer, without another manual completion request. A prior
+            // nonempty result does not guarantee indexing is finished.
             press(&mut editor, KeyCode::Backspace);
             press(&mut editor, KeyCode::Char('d'));
             assert!(editor.completion_due.is_some());
-            let automatic_deadline = Instant::now() + Duration::from_secs(5);
+            let automatic_deadline = Instant::now() + Duration::from_secs(30);
+            let mut automatic_retry = Instant::now() + Duration::from_millis(400);
             let mut automatic = false;
             while Instant::now() < automatic_deadline {
                 editor.poll_lsp();
@@ -5411,6 +5413,19 @@ mod tests {
                         automatic = true;
                         break;
                     }
+                }
+                if editor.completion_menu.is_none()
+                    && editor.completion_pending.is_none()
+                    && editor.completion_due.is_none()
+                    && Instant::now() >= automatic_retry
+                {
+                    // An empty result while indexing is valid. Continue
+                    // typing only after that attempt finishes; do not
+                    // cancel a pending request or bypass auto scheduling.
+                    press(&mut editor, KeyCode::Backspace);
+                    press(&mut editor, KeyCode::Char('d'));
+                    assert!(editor.completion_due.is_some());
+                    automatic_retry = Instant::now() + Duration::from_millis(400);
                 }
                 std::thread::sleep(Duration::from_millis(24));
             }
